@@ -24,7 +24,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnResolvedOptionsChanged,
     const TArray<FResolvedInteractionOption>&, Options);
 
 // Fires on the SERVER after all validation passes.
-// Game systems bind here to execute the interaction (open shop, grant resource, start dialogue).
+// Intended for PLAYER-SIDE systems that need to react to the confirmation (e.g. trigger
+// animation, deduct stamina, update quest state on the player). For reacting on the
+// interactable side (open shop, grant resource, start dialogue), bind to
+// UInteractionComponent::OnInteractionExecuted on the interactable actor instead.
 // Source: the UInteractionComponent that was interacted with.
 // EntryIndex: the flat entry index within that component.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnInteractionConfirmed,
@@ -138,7 +141,9 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "Interaction")
     FOnResolvedOptionsChanged OnResolvedOptionsChanged;
 
-    // SERVER only. Bind here to execute the interaction (open shop, grant loot, etc.).
+    // SERVER only. Fires after validation for player-side systems (animations, quest tracking,
+    // stamina costs on the instigator). For execution on the interactable actor itself,
+    // bind to UInteractionComponent::OnInteractionExecuted instead.
     UPROPERTY(BlueprintAssignable, Category = "Interaction")
     FOnInteractionConfirmed OnInteractionConfirmed;
 
@@ -196,10 +201,8 @@ private:
 ```
 
 > **Exists on server pawns, but scanning is suppressed.** `BeginPlay` guards all scanning behaviour behind `IsLocallyControlled()`. On the server the component is inert as a scanner — no timer, no tick, no overlap queries. It exists on the server solely so that `ServerRequestInteract` and the Client RPCs declared here have the correct net connection to route through.
-> 
 
-> **`OnInteractionConfirmed` is the single outcome delegate for game systems.** It fires on the server after all validation passes and carries both the `UInteractionComponent` source and the entry index. Game systems that need to react to a specific object bind to this delegate on the manager component of the relevant pawn, or filter by `Source` if listening globally.
-> 
+> **Execution flows through the interactable, not the pawn.** After validation passes, `ComponentRef->ExecuteEntry()` is called first — this dispatches `OnInteractionExecuted` on the interactable actor. Game systems (resource, shop, dialogue) bind there. `OnInteractionConfirmed` on the manager then fires for player-side reactions (animations, quest state, stamina costs on the instigator pawn).
 
 ---
 
@@ -267,7 +270,6 @@ void UInteractionManagerComponent::RefreshCachedTagInterface()
 ```
 
 > **`PrimaryComponentTick.bCanEverTick = true` must be set in the constructor** alongside `bStartWithTickEnabled = false`. Without `bCanEverTick`, calling `SetComponentTickEnabled(true)` during a hold has no effect and the hold state machine never runs.
-> 
 
 ---
 
@@ -655,6 +657,11 @@ void UInteractionManagerComponent::ServerRequestInteract_Implementation(
     }
 
     // [9] All checks passed — execute.
+    // First: dispatch to the interactable component so it can notify bound game systems
+    // (resource system, shop system, dialogue system, etc.) via OnInteractionExecuted.
+    ComponentRef->ExecuteEntry(EntryIndex, InstigatorPawn);
+
+    // Second: notify player-side systems (animation, quest, UI) via the manager delegate.
     OnInteractionConfirmed.Broadcast(ComponentRef, EntryIndex);
     ClientRPC_OnInteractionConfirmed(ComponentRef, EntryIndex);
 }
@@ -675,10 +682,8 @@ void UInteractionManagerComponent::ClientRPC_OnInteractionRejected_Implementatio
 ```
 
 > **Validation lives entirely on this component.** `UInteractionComponent` is never called during validation — only its data is read (`GetConfigAtIndex`, `GetNetStateAtIndex`, `MaxInteractionDistance`). The component has no awareness that validation is happening.
-> 
 
 > **`ComponentRef` is validated via null check only.** UE's RPC system resolves replicated object references server-side — a client cannot fabricate an arbitrary pointer to an actor the server doesn't know about. If the object is not replicated to the server or has been destroyed, the reference arrives as null and the early return handles it. The distance check at step [4] then provides the authoritative proximity gate.
-> 
 
 ---
 
