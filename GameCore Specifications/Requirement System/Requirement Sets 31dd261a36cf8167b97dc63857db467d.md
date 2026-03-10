@@ -2,137 +2,105 @@
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-Requirement Sets are the grouping layer between individual `URequirement` instances and the consuming systems that use them. A set is a `UObject` that owns an array of requirements and knows how to evaluate them as a unit. Consuming systems hold a `TObjectPtr<URequirementSet>` (marked `Instanced`) rather than a raw `TArray<TObjectPtr<URequirement>>`.
+`URequirementList` is the sole concrete requirement set class. It is a `UPrimaryDataAsset` that owns an array of requirements and evaluates them as a unit using a configurable operator (AND or OR). Consuming systems hold a `TObjectPtr<URequirementList>` asset reference. Because it is a Data Asset, a single asset can be referenced by any number of consuming systems with zero duplication — the canonical pattern for shared prerequisites such as ore nodes, crafting recipes, and quest gates.
 
-**File:** `Requirements/RequirementSet.h / .cpp`
+`URequirementSet` has been removed. `URequirementList` directly inherits `UPrimaryDataAsset` and owns the full evaluation interface. There is no abstract base — if a second set type is ever needed, introduce a shared base at that time.
 
----
-
-# Why a Set Layer?
-
-Without a set layer, every consuming system that needs grouping logic either hardcodes it or manages raw requirement arrays manually. The set layer standardises this:
-
-- **`URequirementList`** — AND-all, the common case. Cheaper to author and evaluate. Supports OR/NOT logic inline via `URequirement_Composite` children.
-
-Consuming systems and the Watcher System always hold a `TObjectPtr<URequirementSet>` — they never care which concrete type is underneath.
+**File:** `Requirements/RequirementList.h / .cpp`
 
 ---
 
-# `URequirementSet` — Abstract Base
+# `URequirementList`
 
 ```cpp
-// Abstract base. Never instantiated directly.
-// EditInlineNew: allows class picker when held as an Instanced UPROPERTY.
-UCLASS(Abstract, EditInlineNew, CollapseCategories, BlueprintType)
-class GAMECORE_API URequirementSet : public UObject
+// Concrete requirement set asset. Create one asset per unique requirement configuration.
+// Multiple systems (ore nodes, recipes, interactions) may reference the same asset.
+//
+// Operator controls top-level evaluation:
+//   AND — all requirements must pass (default, most common).
+//   OR  — any single requirement passing is sufficient.
+//
+// Any boolean expression is achievable by nesting URequirement_Composite children
+// within the Requirements array. For example, (A AND B) OR (C AND D):
+//   Operator = OR
+//   Requirements[0] = URequirement_Composite(AND) { A, B }
+//   Requirements[1] = URequirement_Composite(AND) { C, D }
+UCLASS(BlueprintType, DisplayName = "Requirement List")
+class GAMECORE_API URequirementList : public UPrimaryDataAsset
 {
     GENERATED_BODY()
 public:
-    // Synchronous evaluation of the full set.
-    UFUNCTION(BlueprintCallable, Category = "Requirements")
-    virtual FRequirementResult Evaluate(const FRequirementContext& Context) const PURE_VIRTUAL(URequirementSet::Evaluate, return FRequirementResult::Fail(););
+    // Top-level evaluation operator.
+    // AND: all requirements must pass. Short-circuits on first failure.
+    // OR:  any requirement passing is sufficient. Short-circuits on first pass.
+    // Array order is evaluation order — place cheap checks first.
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Requirements")
+    ERequirementListOperator Operator = ERequirementListOperator::AND;
 
-    // Returns true if any requirement in the set requires async evaluation.
-    virtual bool IsAsync() const PURE_VIRTUAL(URequirementSet::IsAsync, return false;);
-
-    // Async evaluation. Fires OnComplete on the game thread once all requirements resolve.
-    virtual void EvaluateAsync(const FRequirementContext& Context,
-                               TFunction<void(FRequirementResult)> OnComplete) const;
-
-    // Populates OutEvents with the union of all requirements' watched events.
-    // Called by URequirementWatcherComponent during set registration.
-    virtual void CollectWatchedEvents(FGameplayTagContainer& OutEvents) const PURE_VIRTUAL(URequirementSet::CollectWatchedEvents,);
-
-    // Returns all requirements in the set (flat, for cache array sizing).
-    virtual TArray<URequirement*> GetAllRequirements() const PURE_VIRTUAL(URequirementSet::GetAllRequirements, return {};);
-};
-```
-
----
-
-# `URequirementList` — AND-All
-
-The default and simplest set type. Every requirement must pass. Evaluation short-circuits on first failure.
-
-```cpp
-UCLASS(DisplayName = "Requirement List (AND-all)")
-class GAMECORE_API URequirementList : public URequirementSet
-{
-    GENERATED_BODY()
-public:
-    // All requirements in this list must pass.
-    // Array order is evaluation order — cheap sync checks first, async last.
+    // The requirements evaluated by this list.
+    // URequirement_Composite is a valid element — use it for nested AND/OR/NOT logic.
     UPROPERTY(EditDefaultsOnly, Instanced, BlueprintReadOnly, Category = "Requirements")
     TArray<TObjectPtr<URequirement>> Requirements;
 
-    virtual FRequirementResult Evaluate(const FRequirementContext& Context) const override;
-    virtual bool IsAsync() const override;
-    virtual void EvaluateAsync(const FRequirementContext& Context,
-                               TFunction<void(FRequirementResult)> OnComplete) const override;
-    virtual void CollectWatchedEvents(FGameplayTagContainer& OutEvents) const override;
-    virtual TArray<URequirement*> GetAllRequirements() const override;
-};
-```
-
-`Evaluate` delegates to `URequirementLibrary::EvaluateAll`. `EvaluateAsync` delegates to `URequirementLibrary::EvaluateAllAsync`. No new evaluation logic is introduced here.
-
----
-
----
-
-# `FRequirementSetRuntime` — Per-Player Cache
-
-The Watcher System maintains one `FRequirementSetRuntime` per registered set per player. This struct holds the per-player evaluation cache — it is never part of the shared `URequirementSet` asset.
-
-```cpp
-// Uniquely identifies a registered requirement set within a player's watcher component.
-// Issued by URequirementWatcherComponent::RegisterSet.
-struct FRequirementSetHandle
-{
-    uint32 Id = 0;
-    bool IsValid() const { return Id != 0; }
-};
-
-// Per-player runtime state for one registered URequirementSet.
-// Lives in URequirementWatcherComponent. Never replicated.
-USTRUCT()
-struct FRequirementSetRuntime
-{
-    GENERATED_BODY()
-
-    // The shared set asset. Not per-player — many players may reference the same asset.
-    UPROPERTY()
-    TObjectPtr<URequirementSet> Asset;
-
-    // Parallel to Asset->GetAllRequirements().
-    // Indexed by requirement position in the flat list.
-    // CachedTrue entries for monotonic requirements are never re-evaluated.
-    TArray<ERequirementCacheState> CachedResults;
-
-    // Authority mode for this set. Determined by the owning system at registration.
+    // Network authority for this asset. Declared once by the designer.
+    // Consuming systems do not pass or override authority at call sites.
+    // If two systems need different authority for the same conditions, use two assets.
+    // Defined in RequirementList.h alongside URequirementList.
+    UPROPERTY(EditDefaultsOnly, Category = "Network")
     ERequirementEvalAuthority Authority = ERequirementEvalAuthority::ServerOnly;
 
-    // Unique handle for this registration.
-    FRequirementSetHandle Handle;
-};
+    // ── Evaluation — primary public API ──────────────────────────────────────
+    // Consuming systems call these directly. Never call URequirementLibrary externally.
 
-// Three-state cache entry.
-UENUM()
-enum class ERequirementCacheState : uint8
-{
-    Uncached,     // Not yet evaluated.
-    CachedFalse,  // Last result was Fail. Will be re-evaluated on next dirty flush.
-    CachedTrue,   // Last result was Pass. If bIsMonotonic, this is permanent.
+    UFUNCTION(BlueprintCallable, Category = "Requirements")
+    FRequirementResult Evaluate(const FRequirementContext& Context) const;
+
+    bool IsAsync() const;
+
+    void EvaluateAsync(const FRequirementContext& Context,
+                       TFunction<void(FRequirementResult)> OnComplete) const;
+
+    // Called by URequirementWatcherComponent at RegisterSet time.
+    void CollectWatchedEvents(FGameplayTagContainer& OutEvents) const;
+
+    // Returns all requirements flat (for cache array sizing in the Watcher System).
+    TArray<URequirement*> GetAllRequirements() const;
 };
 ```
 
-**Memory note.** Cache arrays are sized to `GetAllRequirements().Num()` at registration time. With average 5 requirements per set and a reasonable number of active sets per player, total memory per player is in the low kilobytes — negligible.
+> **Authoring rule.** One `URequirement` subclass per behaviour — vary configuration via properties, not subclasses. Never create a separate Blueprint subclass of a requirement just to hardcode a different item tag or level threshold. Those are properties on the requirement instance inside the asset.
+> 
+
+`Evaluate` and `EvaluateAsync` use `URequirementLibrary` internally as a helper. `URequirementLibrary` is not a public API for consuming systems — always call `List->Evaluate(Context)`.
 
 ---
 
-# `ERequirementEvalAuthority` — Per-Set Network Authority
+# `ERequirementListOperator`
 
-Authority is a property of the **set registration**, not of individual requirements. The same `URequirement_HasItem` can be `ServerOnly` in a world event and `ClientValidated` in a quest unlock — the requirement asset is unchanged; only the set's authority differs.
+Defined in `RequirementList.h`.
+
+```cpp
+UENUM(BlueprintType)
+enum class ERequirementListOperator : uint8
+{
+    // All requirements must pass. Short-circuits on first failure.
+    // Use for prerequisite gates: level AND tool equipped AND quest complete.
+    AND UMETA(DisplayName = "All Must Pass (AND)"),
+
+    // Any single requirement passing is sufficient. Short-circuits on first pass.
+    // Use for alternative unlock paths: guild member OR reputation threshold.
+    OR  UMETA(DisplayName = "Any Must Pass (OR)"),
+};
+```
+
+---
+
+# `ERequirementEvalAuthority`
+
+Defined in `RequirementList.h` alongside `URequirementList`. Authority is declared on the asset by the designer — not passed by call sites. `RegisterSet` reads `List->Authority` directly. If two systems need different authority for the same logical conditions, they reference two separate assets.
+
+> **Design rule.** Never add an authority override parameter to `RegisterSet`. If you feel the need to override, create a second asset.
+> 
 
 ```cpp
 UENUM(BlueprintType)
@@ -153,33 +121,84 @@ enum class ERequirementEvalAuthority : uint8
 };
 ```
 
-**Security note on `ClientValidated`.** The server RPC must trigger a full server-side re-evaluation using `URequirementLibrary::EvaluateAll` with a server-constructed `FRequirementContext`. The client RPC is only a hint — it cannot bypass the server check.
+**Security note on `ClientValidated`.** The server RPC must trigger a full server-side re-evaluation using a server-constructed `FRequirementContext`. The client result is a hint only — it cannot bypass the server check.
+
+---
+
+# `FRequirementSetRuntime` — Per-Player Cache
+
+The Watcher System maintains one `FRequirementSetRuntime` per registered list per player. This struct holds the per-player evaluation cache — it is never part of the shared `URequirementList` asset.
+
+```cpp
+// Uniquely identifies a registered requirement list within a player's watcher component.
+// Issued by URequirementWatcherComponent::RegisterSet.
+struct FRequirementSetHandle
+{
+    uint32 Id = 0;
+    bool IsValid() const { return Id != 0; }
+};
+
+// Per-player runtime state for one registered URequirementList.
+// Lives in URequirementWatcherComponent. Never replicated.
+USTRUCT()
+struct FRequirementSetRuntime
+{
+    GENERATED_BODY()
+
+    // The shared list asset. Not per-player — many players may reference the same asset.
+    UPROPERTY()
+    TObjectPtr<URequirementList> Asset;
+
+    // Parallel to Asset->GetAllRequirements().
+    // Indexed by requirement position in the flat list.
+    // CachedTrue entries for monotonic requirements are never re-evaluated.
+    TArray<ERequirementCacheState> CachedResults;
+
+    // Authority read from Asset->Authority at registration time.
+    ERequirementEvalAuthority Authority = ERequirementEvalAuthority::ServerOnly;
+
+    // Unique handle for this registration.
+    FRequirementSetHandle Handle;
+};
+
+// Three-state cache entry.
+UENUM()
+enum class ERequirementCacheState : uint8
+{
+    Uncached,     // Not yet evaluated.
+    CachedFalse,  // Last result was Fail. Will be re-evaluated on next dirty flush.
+    CachedTrue,   // Last result was Pass. If bIsMonotonic, this is permanent.
+};
+```
+
+**Memory note.** Cache arrays are sized to `GetAllRequirements().Num()` at registration time. With average 5 requirements per set and a reasonable number of active sets per player, total memory per player is in the low kilobytes — negligible.
 
 ---
 
 # Consuming Systems — Integration Pattern
 
 ```cpp
-// In a Data Asset (e.g. UQuestDefinition):
-UPROPERTY(EditDefaultsOnly, Instanced, Category = "Requirements")
-TObjectPtr<URequirementSet> UnlockRequirements;
+// In a Data Asset (e.g. UOreNodeDefinition, UQuestDefinition):
+// No Instanced specifier — URequirementList is a UPrimaryDataAsset referenced by pointer.
+UPROPERTY(EditDefaultsOnly, Category = "Requirements")
+TObjectPtr<URequirementList> Requirements;
 
-// One-shot server-side check (e.g. confirming an action RPC):
+// One-shot server-side check (e.g. confirming a mine action RPC):
 FRequirementContext Ctx;
 Ctx.PlayerState = PS;
-Ctx.World = GetWorld();
-FRequirementResult Result = UnlockRequirements->Evaluate(Ctx);
+Ctx.World       = GetWorld();
+Ctx.Instigator  = GetPawn();
+FRequirementResult Result = OreNodeDef->Requirements->Evaluate(Ctx);
 
-// Watched registration (e.g. quest system tracking available quests):
+// Watched registration — authority is read from List->Authority, no parameter needed:
 URequirementWatcherComponent* Watcher = PS->GetComponentByClass<URequirementWatcherComponent>();
 FRequirementSetHandle Handle = Watcher->RegisterSet(
-    QuestDef->UnlockRequirements,
-    ERequirementEvalAuthority::ClientValidated,
-    FOnRequirementSetDirty::CreateUObject(this, &UQuestComponent::OnQuestRequirementsDirty)
+    QuestDef->Requirements,
+    FOnRequirementSetDirty::CreateUObject(this, &UQuestComponent::OnRequirementsDirty)
 );
 ```
 
-Store the `FRequirementSetHandle`. Call `Watcher->UnregisterSet(Handle)` when the quest is accepted, completed, or abandoned to prevent leaking subscriptions.
+Store the `FRequirementSetHandle`. Call `Watcher->UnregisterSet(Handle)` when the system no longer needs to track this list to prevent leaking subscriptions.
 
 ---
 

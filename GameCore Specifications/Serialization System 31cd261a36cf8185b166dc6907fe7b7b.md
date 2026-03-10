@@ -48,7 +48,7 @@ A server crash loses at most `SaveInterval` seconds of data. Setting `PartialSav
 - Serialize actor component state into `FEntityPersistencePayload` binary blobs
 - Stamp every payload as `EPayloadType::Partial` or `EPayloadType::Full`
 - Track dirty actors via a `DirtySet`, process within per-tick budget on partial cycles
-- On full cycles, serialize **all** registered actors regardless of dirty state
+- On full cycles, snapshot all registered actors and serialize across ticks using the same per-tick budget
 - Preserve serialized data for actors that die before flush via a `SaveQueue`
 - Automatically call `Migrate()` when a saved schema version mismatches the current version
 - Broadcast payloads via **tag-keyed delegates** — transport is external and tag-routed
@@ -131,7 +131,7 @@ A server crash loses at most `SaveInterval` seconds of data. Setting `PartialSav
     ├─ bFullSave = (SaveCounter % (PartialSavesBetweenFullSave + 1) == 0)
     │
     ├─ Partial: iterate DirtySet, N actors per tick budget
-    └─ Full:    iterate ALL RegisteredEntities
+    └─ Full:    snapshot RegisteredEntities, spread N actors per tick via FullCycleTickTimer
     │
     ▼
 [BuildPayload(bFullSave)] per actor → stamp EPayloadType
@@ -162,8 +162,9 @@ A server crash loses at most `SaveInterval` seconds of data. Setting `PartialSav
     ▼
 [BuildPayload(Full) → EPayloadType::Full → MoveToSaveQueue]
     │
-    ├─ Reason == Logout or ServerShutdown → FlushSaveQueue() immediately
-    └─ else → wait for DBFlushTimer
+    ├─ Reason == Logout or ServerShutdown → PrioritySaveQueue → FlushSaveQueue() immediately
+    ├─ Reason == ZoneTransfer              → PrioritySaveQueue → wait for DBFlushTimer
+    └─ else                                → SaveQueue → wait for DBFlushTimer
 ```
 
 ### Server Shutdown
@@ -236,6 +237,4 @@ Games register tags and bind delegates at startup. The subsystem routes with no 
 ## ⚠ Known Gaps & Future Work
 
 - **Critical event trigger component** — a collision/overlap component to fire `RequestFullSave` on specific gameplay events is not yet specified
-- **Per-tick budget on full saves** — `ActorsPerFlushTick` does not apply during full cycles; large servers may spike. Consider spreading full saves across multiple ticks
-- **Load error path** — `OnComplete(false)` is never currently called; transport failure leaves `LoadCallbacks` entries dangling
 - **Per-tag budget control** — all tags share a single `ActorsPerFlushTick`; high-priority tags (players) may be starved by lower-priority actors

@@ -2,7 +2,7 @@
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-The Watcher System provides event-driven reactive evaluation for requirement sets. It eliminates polling by inverting control: instead of systems asking "are requirements met?" on a timer, requirements declare which events invalidate them. When those events fire, only affected sets are re-evaluated.
+The Watcher System provides event-driven reactive evaluation for requirement lists. It eliminates polling by inverting control: instead of systems asking "are requirements met?" on a timer, requirements declare which events invalidate them. When those events fire, only affected sets are re-evaluated.
 
 **Files:** `Requirements/RequirementWatcher.h / .cpp`
 
@@ -79,13 +79,13 @@ class GAMECORE_API URequirementWatcherComponent : public UActorComponent
 public:
     // ── Registration ─────────────────────────────────────────────────────────
 
-    // Registers a requirement set for reactive tracking.
-    // Collects watched events from all requirements in the set.
+    // Registers a requirement list for reactive tracking.
+    // Collects watched events from all requirements in the list.
     // Allocates a FRequirementSetRuntime with a parallel cache array.
+    // Authority is read from List->Authority — no override parameter exists by design.
     // Returns a handle the owning system must store to unregister later.
     FRequirementSetHandle RegisterSet(
-        URequirementSet* Set,
-        ERequirementEvalAuthority Authority,
+        URequirementList* List,
         FOnRequirementSetDirty OnDirty);
 
     // Removes all subscriptions and cache for this set.

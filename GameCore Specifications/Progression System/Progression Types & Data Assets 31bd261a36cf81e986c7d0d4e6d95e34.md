@@ -204,6 +204,13 @@ public:
     // Soft cap — can be raised per patch without code changes.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Level")
     int32 MaxLevel = 100;
+    // If true, negative XP can cause the level to decrease when XP drops below
+    // the floor of the current level. Level is clamped at 1 — never below.
+    // Default false: reputation tracks where rank is permanent (ESO, GW2 model).
+    // Set true for progressions where demotion is intended (pirate faction rank,
+    // PvP rating, bounty tier).
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Level")
+    bool bAllowLevelDecrement = false;
 
     // --- XP Curve ---
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "XP Curve")
@@ -252,14 +259,22 @@ private:
 
 ## Serialization Contract
 
-For persistence, both components expose:
+Both `ULevelingComponent` and `UPointPoolComponent` implement `IPersistableComponent` from the GameCore Serialization System. This unifies persistence under the same binary `FArchive` path used by all other persistable actors — no JSON, no fat payloads.
 
 ```cpp
-// Returns a JSON-serializable snapshot of all progression/pool state.
-FString SerializeToString() const;
+// Both components implement this interface:
+class IPersistableComponent
+{
+public:
+    // Serialize current state into the provided archive (binary write).
+    virtual void SerializeForSave(FArchive& Ar) = 0;
 
-// Restores state from a saved snapshot. Server-only.
-void DeserializeFromString(const FString& Data);
+    // Restore state from the archive (binary read). Server-only.
+    virtual void DeserializeFromSave(FArchive& Ar) = 0;
+};
 ```
 
-The game layer (not GameCore) is responsible for calling these at save/load time and forwarding data to/from the backend.
+The Serialization System calls these automatically at snapshot and restore time — the game layer does not need to manage them manually.
+
+> **JSON helpers retained for tooling only.** `SerializeToString()` / `DeserializeFromString()` remain as `BlueprintAuthorityOnly` utilities for GM console commands, debug inspection, and live-ops tooling. They are never called on the save path.
+>

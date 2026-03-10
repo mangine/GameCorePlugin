@@ -21,7 +21,6 @@ Game systems that need to react to an interaction (open a shop, start dialogue, 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnInteractionStateChanged,
     UInteractionComponent*, Component,
     uint8,                  EntryIndex);
-
 // Fires on the SERVER when an interaction is confirmed and executed on this component.
 // Instigator: the pawn that performed the interaction.
 // EntryIndex: the flat entry index that was executed.
@@ -136,27 +135,12 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Interaction")
     int32 GetTotalEntryCount() const { return Entries.Num() + InlineEntries.Num(); }
 
-    // ── Delegates ─────────────────────────────────────────────────────────────
+    // ── Delegate ──────────────────────────────────────────────────────────────
 
     // ALL machines. Fires when any entry's replicated state or bServerEnabled changes.
     // UInteractionManagerComponent binds here to re-resolve options without a full rescan.
     UPROPERTY(BlueprintAssignable, Category = "Interaction")
     FOnInteractionStateChanged OnEntryStateChanged;
-
-    // SERVER only. Fires when this component's interaction is confirmed and executed.
-    // Bind here on the interactable actor to react to the interaction without needing
-    // a reference to the player pawn's UInteractionManagerComponent.
-    // Carries the instigating pawn and the flat entry index.
-    UPROPERTY(BlueprintAssignable, Category = "Interaction")
-    FOnInteractionExecuted OnInteractionExecuted;
-
-    // ── Execution API (server-side, called by UInteractionManagerComponent) ────
-
-    // Called by UInteractionManagerComponent after all server validation passes.
-    // Broadcasts OnInteractionExecuted with the instigating pawn and entry index.
-    // BlueprintAuthorityOnly — never call from client code.
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Interaction")
-    void ExecuteEntry(uint8 EntryIndex, APawn* Instigator);
 
 private:
     UFUNCTION()
@@ -165,8 +149,10 @@ private:
 ```
 
 > **No RPCs, no validation logic.** This component does not perform distance checks or requirement evaluation — that is `UInteractionManagerComponent`'s responsibility. What it *does* own is the execution dispatch: once the manager confirms the interaction server-side, it calls `ExecuteEntry` here, which broadcasts `OnInteractionExecuted` to any bound game system listeners on this actor.
+> 
 
 > **`SetAllEntriesState` / `SetAllEntriesServerEnabled` use a single `MarkArrayDirty` call.** Looping `SetEntryState` across N entries generates N `MarkItemDirty` calls and N separate replication deltas. The bulk variants mutate all items then call `MarkArrayDirty()` once — one packet regardless of entry count.
+> 
 
 ---
 
@@ -288,6 +274,7 @@ void UInteractionComponent::SetAllEntriesServerEnabled(bool bEnabled)
 ```
 
 > **`MarkItemDirty` vs `MarkArrayDirty`.** `MarkItemDirty` sends only the changed item in the next delta. `MarkArrayDirty` evaluates all items in one pass — use for bulk mutations where multiple items change simultaneously.
+> 
 
 ---
 
@@ -345,24 +332,6 @@ ResolveOptions(SourceActor, TargetActor, Mode, OUT OutOptions):
             (if all Locked → show highest OptionPriority Locked entry greyed-out)
       All:  all candidates sorted by (GroupTag asc, OptionPriority desc)
 ```
-
----
-
-# ExecuteEntry Implementation
-
-```cpp
-void UInteractionComponent::ExecuteEntry(uint8 EntryIndex, APawn* Instigator)
-{
-    if (!HasAuthority()) return;
-
-    // Defensive: entry must exist. Manager already validated this, but guard anyway.
-    if (static_cast<int32>(EntryIndex) >= GetTotalEntryCount()) return;
-
-    OnInteractionExecuted.Broadcast(Instigator, EntryIndex);
-}
-```
-
-> **`ExecuteEntry` is the only call game systems need to respond to.** Bind `OnInteractionExecuted` on the interactable actor at `BeginPlay`. The delegate carries the instigating `APawn*` and the `EntryIndex` so the handler can resolve which action was triggered and who triggered it. Example: an ore node binds its `OnMine` handler here; a shop NPC binds `OnOpenShop`; a chest binds `OnOpen`.
 
 ---
 
@@ -483,6 +452,25 @@ void UInteractionComponent::ValidateDataAssetEntries()
 }
 #endif
 ```
+
+---
+
+# ExecuteEntry Implementation
+
+```cpp
+void UInteractionComponent::ExecuteEntry(uint8 EntryIndex, APawn* Instigator)
+{
+    if (!HasAuthority()) return;
+
+    // Defensive: entry must exist. Manager already validated this, but guard anyway.
+    if (static_cast<int32>(EntryIndex) >= GetTotalEntryCount()) return;
+
+    OnInteractionExecuted.Broadcast(Instigator, EntryIndex);
+}
+```
+
+> **`ExecuteEntry` is the only call game systems need to respond to.** Bind `OnInteractionExecuted` on the interactable actor at `BeginPlay`. The delegate carries the instigating `APawn*` and the `EntryIndex` so the handler can resolve which action was triggered and who triggered it. Example: an ore node binds its `OnMine` handler here; a shop NPC binds `OnOpenShop`; a chest binds `OnOpen`.
+> 
 
 ---
 

@@ -2,7 +2,10 @@
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-`URequirementLibrary` is the sole entry point for evaluating requirements from consuming systems. It handles both synchronous and asynchronous evaluation, short-circuit logic, and composite tree traversal. Consuming systems never call `Evaluate` or `EvaluateAsync` directly on individual requirements — they always go through this library.
+`URequirementLibrary` is an **internal helper** for `URequirementSet` subclasses. It handles synchronous and asynchronous evaluation, short-circuit logic, and composite tree traversal.
+
+> **Consuming systems must not call this library directly.** Always call `Set->Evaluate(Context)` or `Set->EvaluateAsync(Context, OnComplete)` on the `URequirementSet` asset. `URequirementLibrary` is not a public API — it is an implementation detail of `URequirementList` and other set types. The only exception is `ValidateRequirements`, which remains a development/editor utility callable by any system at setup time.
+> 
 
 **File:** `Requirements/RequirementLibrary.h / .cpp`
 

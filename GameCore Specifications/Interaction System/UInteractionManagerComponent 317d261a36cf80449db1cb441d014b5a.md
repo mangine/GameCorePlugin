@@ -201,8 +201,10 @@ private:
 ```
 
 > **Exists on server pawns, but scanning is suppressed.** `BeginPlay` guards all scanning behaviour behind `IsLocallyControlled()`. On the server the component is inert as a scanner — no timer, no tick, no overlap queries. It exists on the server solely so that `ServerRequestInteract` and the Client RPCs declared here have the correct net connection to route through.
+> 
 
 > **Execution flows through the interactable, not the pawn.** After validation passes, `ComponentRef->ExecuteEntry()` is called first — this dispatches `OnInteractionExecuted` on the interactable actor. Game systems (resource, shop, dialogue) bind there. `OnInteractionConfirmed` on the manager then fires for player-side reactions (animations, quest state, stamina costs on the instigator pawn).
+> 
 
 ---
 
@@ -270,6 +272,7 @@ void UInteractionManagerComponent::RefreshCachedTagInterface()
 ```
 
 > **`PrimaryComponentTick.bCanEverTick = true` must be set in the constructor** alongside `bStartWithTickEnabled = false`. Without `bCanEverTick`, calling `SetComponentTickEnabled(true)` during a hold has no effect and the hold state machine never runs.
+> 
 
 ---
 
@@ -660,7 +663,6 @@ void UInteractionManagerComponent::ServerRequestInteract_Implementation(
     // First: dispatch to the interactable component so it can notify bound game systems
     // (resource system, shop system, dialogue system, etc.) via OnInteractionExecuted.
     ComponentRef->ExecuteEntry(EntryIndex, InstigatorPawn);
-
     // Second: notify player-side systems (animation, quest, UI) via the manager delegate.
     OnInteractionConfirmed.Broadcast(ComponentRef, EntryIndex);
     ClientRPC_OnInteractionConfirmed(ComponentRef, EntryIndex);
@@ -682,8 +684,10 @@ void UInteractionManagerComponent::ClientRPC_OnInteractionRejected_Implementatio
 ```
 
 > **Validation lives entirely on this component.** `UInteractionComponent` is never called during validation — only its data is read (`GetConfigAtIndex`, `GetNetStateAtIndex`, `MaxInteractionDistance`). The component has no awareness that validation is happening.
+> 
 
 > **`ComponentRef` is validated via null check only.** UE's RPC system resolves replicated object references server-side — a client cannot fabricate an arbitrary pointer to an actor the server doesn't know about. If the object is not replicated to the server or has been destroyed, the reference arrives as null and the early return handles it. The distance check at step [4] then provides the authoritative proximity gate.
+> 
 
 ---
 

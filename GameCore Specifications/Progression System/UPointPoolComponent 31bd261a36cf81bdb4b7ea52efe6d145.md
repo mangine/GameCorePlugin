@@ -21,7 +21,7 @@ GameCore/Source/GameCore/Progression/
 
 ## Dependencies
 
-None. `UPointPoolComponent` is a leaf module — it does not depend on `ULevelingComponent` or any other GameCore system.
+- `IPersistableComponent` — implemented for binary save/load via the Serialization System.
 
 ---
 
@@ -29,7 +29,7 @@ None. `UPointPoolComponent` is a leaf module — it does not depend on `ULevelin
 
 ```cpp
 UCLASS(ClassGroup = (GameCore), meta = (BlueprintSpawnableComponent))
-class GAMECORE_API UPointPoolComponent : public UActorComponent
+class GAMECORE_API UPointPoolComponent : public UActorComponent, public IPersistableComponent
 {
     GENERATED_BODY()
 
@@ -94,13 +94,20 @@ public:
     bool IsPoolRegistered(FGameplayTag PoolTag) const;
 
     // -------------------------------------------------------------------------
-    // Persistence
+    // Persistence  (IPersistableComponent)
     // -------------------------------------------------------------------------
 
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence")
+    // Binary serialization — called by the Serialization System at snapshot time.
+    virtual void SerializeForSave(FArchive& Ar) override;
+
+    // Binary deserialization — called by the Serialization System at restore time. Server-only.
+    virtual void DeserializeFromSave(FArchive& Ar) override;
+
+    // JSON helpers — GM tooling and debug inspection only. Never called on the save path.
+    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence|Debug")
     FString SerializeToString() const;
 
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence")
+    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence|Debug")
     void DeserializeFromString(const FString& Data);
 
     // -------------------------------------------------------------------------
@@ -202,7 +209,7 @@ Pool tags are project-defined — GameCore ships no tag values, only the infrast
 
 ```cpp
 // Setup (server, BeginPlay)
-PoolComp->RegisterPool(FGameplayTag::RequestGameplayTag("Points.Skill"), 0);    // No cap
+PoolComp->RegisterPool(FGameplayTag::RequestGameplayTag("Points.Skill"), 0);     // No cap
 PoolComp->RegisterPool(FGameplayTag::RequestGameplayTag("Points.Attribute"), 50); // Max 50 unspent
 
 // Spending (server, from skill tree system)

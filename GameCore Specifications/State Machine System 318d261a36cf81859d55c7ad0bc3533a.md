@@ -133,6 +133,12 @@ public:
     // Applied on OnEnter, removed on OnExit. Requires ITaggedInterface on the owner.
     UPROPERTY(EditDefaultsOnly, Category = "State")
     FGameplayTagContainer GrantedTags;
+    // If true, no transition can interrupt this state once entered — including RequestTransition.
+    // OnTransitionBlocked fires for any rejected attempt.
+    // Use for irreversible or safety-critical states: Sinking, Boarding, Cutscene, Death.
+    // AnyStateTransitions with bCanBypassNonInterruptible = true still fire (for hard resets).
+    UPROPERTY(EditDefaultsOnly, Category = "State")
+    bool bNonInterruptible = false;
 
     // Called when the machine enters this state.
     // Component is the UStateMachineComponent driving this machine.
@@ -227,6 +233,11 @@ struct GAMECORE_API FStateTransition
     // Priority. Higher values are evaluated first within the same FromState.
     UPROPERTY(EditDefaultsOnly, Category = "Transition")
     int32 Priority = 0;
+    // If true, this transition can fire even when the current state has bNonInterruptible = true.
+    // Use sparingly — only for hard resets (e.g. AnyState → Destroyed, AnyState → ForceReset).
+    // Has no effect when the current state is interruptible.
+    UPROPERTY(EditDefaultsOnly, Category = "Transition")
+    bool bCanBypassNonInterruptible = false;
 
     // Evaluate all rules against the current component and context.
     bool Evaluate(UStateMachineComponent* Component, UObject* Context) const;
@@ -315,8 +326,11 @@ public:
 
     // ── Runtime API ───────────────────────────────────────────────────────────
 
-    // Force a transition to TargetState, bypassing all rules.
-    // Safe to call from Blueprint. Respects AuthorityMode — no-ops on wrong authority.
+    // Force a transition to TargetState, bypassing all transition rules.
+    // Respects AuthorityMode — no-ops on the wrong authority side.
+    // Blocked if the current state has bNonInterruptible = true, unless the matching
+    // FStateTransition has bCanBypassNonInterruptible = true.
+    // Fires OnTransitionBlocked when rejected (no valid edge OR non-interruptible guard).
     UFUNCTION(BlueprintCallable, Category = "State Machine")
     void RequestTransition(FGameplayTag TargetStateTag);
 
@@ -361,6 +375,9 @@ private:
 
     void EnterState(const FGameplayTag& NewStateTag);
     bool CanExecuteLocally() const;
+    // Returns true if the transition to TargetStateTag is permitted given the current state's
+    // bNonInterruptible flag and the transition's bCanBypassNonInterruptible flag.
+    bool IsTransitionPermitted(const FGameplayTag& TargetStateTag) const;
 };
 ```
 
@@ -440,9 +457,9 @@ The component has no RPC methods. It is a pure local evaluator with a single rep
 
 # Known Limitations
 
-**No cancellation or interrupt priority system.** `RequestTransition` always succeeds if called on the correct authority. There is no concept of a non-interruptible state. Owning systems must guard against unwanted interruptions by checking `IsInState` before calling `RequestTransition`.
+**Non-interruptible state contract.** When `bNonInterruptible = true` on `UStateNodeBase`, both `RequestTransition` and `EvaluateTransitions` will reject any transition attempt and fire `OnTransitionBlocked`. The only exception is a matching `FStateTransition` with `bCanBypassNonInterruptible = true` — reserved for hard resets (AnyState → Destroyed). Owning systems should no longer manually guard with `IsInState` checks for this purpose; the machine enforces it.
 
-**`Both` mode has no rollback.** Client prediction fires `OnEnter`/`OnExit` immediately. If the server transitions to a different state, `OnRep_CurrentStateTag` will fire the correct `OnEnter`/`OnExit` on the client, but any side effects from the mispredicted transition (VFX, sound, animation) are the owning system's responsibility to clean up.
+**`Both` mode misprediction rollback contract.** When the server transitions to a different state than the client predicted, `OnRep_CurrentStateTag` fires `EnterState` on the client with the correct server state. This calls `OnExit` on the mispredicted state and `OnEnter` on the corrected state. **The owning system is responsible for all side-effect cleanup** — VFX, sounds, animation state, and any gameplay data mutated during the mispredicted `OnEnter` must be undone in that state's `OnExit` implementation. The recommended pattern is: keep `OnEnter` side effects idempotent or tag-gated, and implement `OnExit` defensively to always clean up regardless of whether the state completed normally or was rolled back.
 
 **History is not replicated.** Clients in `ServerOnly` and `Both` modes only receive the current state. If a client needs history (e.g., for UI "previous step" display), it must reconstruct it locally from `OnStateChanged` events.
 

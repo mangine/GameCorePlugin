@@ -33,13 +33,13 @@ These principles are the constraints everything else is built around. When in do
 
 # How the Pieces Connect
 
-**Authoring.** A designer opens a Data Asset that holds a `TObjectPtr<URequirementSet>` (or a `TArray<TObjectPtr<URequirement>>` for simpler systems). Each `URequirementSet` is a `URequirementList` (AND-all). OR/NOT sub-conditions are expressed inline using `URequirement_Composite` children. Requirements inside are instanced UObjects with class pickers.
+**Authoring.** A designer creates a `URequirementList` Data Asset, sets the `Operator` (AND or OR), adds `URequirement` instances via the Details panel class picker, and sets their properties. Other assets (ore definitions, quest definitions, crafting recipes) hold a `TObjectPtr<URequirementList>` pointing to that asset. Complex expressions use `URequirement_Composite` children inline within the array.
 
-**Evaluation (on-demand).** The consuming system constructs an `FRequirementContext` and calls `URequirementLibrary::EvaluateAll` or `EvaluateAllAsync`. This is unchanged from the original design and remains the path for one-shot checks (e.g. confirming a crafting action server-side).
+**Evaluation (on-demand).** The consuming system constructs an `FRequirementContext` and calls `Set->Evaluate(Context)` or `Set->EvaluateAsync(Context, OnComplete)`. `URequirementLibrary` is an internal helper used by `URequirementSet` subclasses — consuming systems never call it directly.
 
 **Evaluation (watched).** For systems that need to reactively track availability (quest unlock, ability visibility), the owning system registers a `FRequirementSetRuntime` handle with `URequirementWatcherComponent`. Each `URequirement` in the set declares which `FGameplayTag` events invalidate it via `GetWatchedEvents`. When a `RequirementEvent.*` tag fires through `URequirementWatcherManager`, only sets watching that tag are dirtied. A coalescing timer flushes dirty sets in batches. The owning system receives `OnSetDirty` and re-evaluates.
 
-**Network.** Server is authoritative. Requirement sets may carry an `ERequirementEvalAuthority` flag. `ClientOnly` sets are evaluated on the owning client only (UI, cosmetics). `ClientValidated` sets are evaluated on the client for responsiveness and re-evaluated authoritatively on the server via RPC. `ServerOnly` sets never leave the server.
+**Network.** Server is authoritative. Each `URequirementSet` asset carries an `Authority` property (`ERequirementEvalAuthority`, defined in `RequirementSet.h`) set by the designer. `ClientOnly` sets are evaluated on the owning client only (UI, cosmetics). `ClientValidated` sets are evaluated on the client for responsiveness and re-evaluated authoritatively on the server via RPC. `ServerOnly` sets never leave the server. Call sites do not pass or override authority — if two systems need different authority for the same conditions, they reference two separate assets.
 
 ---
 
@@ -134,11 +134,9 @@ Full class definition, statelessness contract, and subclassing checklist: see su
 
 # Requirement Sets (Summary)
 
-`URequirementSet` is an abstract UObject grouping layer. Consuming systems hold a `TObjectPtr<URequirementSet>` (instanced) instead of a raw `TArray`. Two concrete types:
+`URequirementList` is a `UPrimaryDataAsset` with a configurable `Operator` (AND or OR) and an array of `URequirement` children. `URequirementSet` has been removed — `URequirementList` is the sole class. Any boolean expression is achievable by nesting `URequirement_Composite` elements in the array.
 
-- **`URequirementList`** — flat AND-all. Simple, fast. The only concrete set type. Use `URequirement_Composite` as a child for OR/NOT sub-conditions.
-
-Full specification: see sub-page **Requirement Sets**.
+Full specification: see sub-page **Requirement List**.
 
 ---
 

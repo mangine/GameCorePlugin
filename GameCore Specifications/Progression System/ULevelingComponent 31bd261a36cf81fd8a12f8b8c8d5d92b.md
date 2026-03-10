@@ -23,6 +23,7 @@ GameCore/Source/GameCore/Progression/
 - `URequirement` — for advanced prerequisite evaluation.
 - `ISourceIDInterface` — for XP audit source identification.
 - `ULevelProgressionDefinition` — data asset defining each progression.
+- `IPersistableComponent` — implemented for binary save/load via the Serialization System.
 
 ---
 
@@ -30,7 +31,7 @@ GameCore/Source/GameCore/Progression/
 
 ```cpp
 UCLASS(ClassGroup = (GameCore), meta = (BlueprintSpawnableComponent))
-class GAMECORE_API ULevelingComponent : public UActorComponent
+class GAMECORE_API ULevelingComponent : public UActorComponent, public IPersistableComponent
 {
     GENERATED_BODY()
 
@@ -65,8 +66,11 @@ public:
     // -------------------------------------------------------------------------
 
     /**
-     * Adds XP to a progression. Negative values reduce XP but never below
-     * the base XP floor of the current level (reputation safe).
+     * Adds XP to a progression. Negative values reduce XP.
+     * If bAllowLevelDecrement is false on the definition, XP is clamped at the
+     * base of the current level — level never decreases.
+     * If bAllowLevelDecrement is true, XP can drop below 0 causing level to
+     * decrement. Level is always clamped at 1 minimum.
      * Server-only.
      *
      * @param ProgressionTag  Which progression receives the XP.
@@ -97,20 +101,27 @@ public:
     bool IsProgressionRegistered(FGameplayTag ProgressionTag) const;
 
     // -------------------------------------------------------------------------
-    // Persistence
+    // Persistence  (IPersistableComponent)
     // -------------------------------------------------------------------------
 
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence")
+    // Binary serialization — called by the Serialization System at snapshot time.
+    virtual void SerializeForSave(FArchive& Ar) override;
+
+    // Binary deserialization — called by the Serialization System at restore time. Server-only.
+    virtual void DeserializeFromSave(FArchive& Ar) override;
+
+    // JSON helpers — GM tooling and debug inspection only. Never called on the save path.
+    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence|Debug")
     FString SerializeToString() const;
 
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence")
+    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence|Debug")
     void DeserializeFromString(const FString& Data);
 
     // -------------------------------------------------------------------------
     // Delegates
     // -------------------------------------------------------------------------
 
-    // Fired on server and broadcast to owning client when a level-up occurs.
+    // Fired on server and broadcast to owning client when a level-up or level-down occurs.
     UPROPERTY(BlueprintAssignable, Category = "Progression|Delegates")
     FOnProgressionLevelUp OnLevelUp;
     // Signature: (FGameplayTag ProgressionTag, int32 NewLevel)
@@ -135,6 +146,7 @@ private:
     const FProgressionLevelData* FindProgressionData(FGameplayTag Tag) const;
 
     void ProcessLevelUp(FProgressionLevelData& Data, ULevelProgressionDefinition* Def);
+    void ProcessLevelDown(FProgressionLevelData& Data, ULevelProgressionDefinition* Def);
     void GrantPointsForLevel(ULevelProgressionDefinition* Def, int32 NewLevel);
 };
 ```
@@ -155,21 +167,28 @@ FastArray ensures only changed progression entries are sent over the wire, which
 
 ## Server Authority Rules
 
-- `AddXP`, `RegisterProgression`, `UnregisterProgression`, `DeserializeFromString` are all `BlueprintAuthorityOnly` — calling from client is a no-op.
+- `AddXP`, `RegisterProgression`, `UnregisterProgression`, `DeserializeFromSave`, and `DeserializeFromString` are all server-only — calling from client is a no-op.
 - The component never exposes a direct `SetLevel` or `SetXP` — level is always a result of XP accumulation to prevent exploit surface.
 - Prerequisite checks in `RegisterProgression` run on the server; the client cannot register a progression directly.
 
 ---
 
-## Reputation / Negative XP Behavior
+## Negative XP Behavior
 
-When `AddXP` is called with a negative value:
+Behavior when `AddXP` is called with a negative value depends on `ULevelProgressionDefinition::bAllowLevelDecrement`:
+
+**`bAllowLevelDecrement = false` (default — permanent rank model):**
 
 1. `NewXP = FMath::Max(CurrentXP + Delta, 0)` — XP floor is 0 (base of current level).
-2. Level **never decreases** — only XP within the current level is affected.
+2. Level never decreases. Models systems where rank is permanent (GW2 WvW, ESO faction standing).
 3. `OnXPChanged` fires with the clamped delta.
 
-This models reputation systems (GW2 WvW rank, ESO faction standing) where standing fluctuates but rank is permanent.
+**`bAllowLevelDecrement = true` (demotion model):**
+
+1. XP is reduced freely. If it drops below 0, the level decrements and XP wraps to the top of the previous level.
+2. Level is clamped at 1 — never below. XP at level 1 clamps at 0.
+3. `OnLevelUp` fires with the new (lower) level. `OnXPChanged` fires with the actual delta.
+4. Use for progressions where demotion is intentional: pirate faction rank, PvP rating, bounty tier.
 
 ---
 
