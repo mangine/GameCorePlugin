@@ -1,12 +1,13 @@
 # IQueryStorageService
 
 **Module:** `GameCore`
-
 **Location:** `GameCore/Source/GameCore/Backend/QueryStorageService.h`
 
 Interface for structured, queryable storage backends (e.g. PostgreSQL, Elasticsearch, CockroachDB). Unlike `IKeyStorageService`, records here are searchable by field values, sortable, and paginatable. The backend owns the schema — GameCore only defines the filter and result contracts.
 
 Intended for data that needs to be **found without knowing its key**: market listings, leaderboards, guild registries, crafting recipes, admin lookups, and similar structured datasets.
+
+Accessed via `FGameCoreBackend::GetQueryStorage(Key)`.
 
 ---
 
@@ -152,6 +153,8 @@ public:
 
 ## Null Fallback Implementation
 
+`FNullQueryStorageService` is used by `FGameCoreBackend` when no service is registered or the subsystem is not live. Every call logs a `UE_LOG Warning` and invokes any callback with a failure result so callers are never silently stuck.
+
 ```cpp
 class GAMECORE_API FNullQueryStorageService : public IQueryStorageService
 {
@@ -223,6 +226,8 @@ public:
 };
 ```
 
+This implementation is declared in `QueryStorageService.h` and also instantiated as the static fallback `GNullQueryStorage` in `GameCoreBackend.cpp`.
+
 ---
 
 ## Usage Example — Market Listings
@@ -231,13 +236,11 @@ public:
 // Posting a market listing (game module)
 void UMarketSystem::PostListing(const FMarketListing& Listing)
 {
-    auto* Backend = GetGameInstance()->GetSubsystem<UGameCoreBackendSubsystem>();
-
     TArray<uint8> Bytes;
     FMemoryWriter Writer(Bytes);
     // ... serialize Listing into Writer ...
 
-    Backend->GetQueryStorage()->Upsert(
+    FGameCoreBackend::GetQueryStorage()->Upsert(
         TAG_Schema_Market_Listing,
         Listing.ListingId,
         Bytes);
@@ -247,14 +250,12 @@ void UMarketSystem::PostListing(const FMarketListing& Listing)
 void UMarketSystem::SearchByItemType(FName ItemType,
     TFunction<void(const TArray<FMarketListing>&)> OnResults)
 {
-    auto* Backend = GetGameInstance()->GetSubsystem<UGameCoreBackendSubsystem>();
-
     FDBQueryFilter Filter;
     Filter.Predicates.Add({ TEXT("ItemType"), EDBComparison::Eq, ItemType.ToString() });
     Filter.Sort = FDBSortField{ TEXT("Price"), EDBSortDirection::Ascending };
     Filter.Limit = 50;
 
-    Backend->GetQueryStorage()->Query(TAG_Schema_Market_Listing, Filter,
+    FGameCoreBackend::GetQueryStorage()->Query(TAG_Schema_Market_Listing, Filter,
         [OnResults](bool bSuccess, const TArray<FDBQueryResult>& Results, const FString&)
         {
             if (!bSuccess) return;
