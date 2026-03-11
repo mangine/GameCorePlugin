@@ -6,17 +6,29 @@
 
 **Type:** `UGameInstanceSubsystem`
 
-Central subsystem for all external backend service integrations. Owns and manages the lifecycle of three service interfaces: database, audit, and logging. Acts as the single injection point for backend transport implementations — GameCore itself has **no knowledge of concrete backends** (Redis, Postgres, Datadog, etc.).
+Central subsystem for all external backend service integrations. Owns and manages the lifecycle of four service interfaces: key storage, query storage, audit, and logging. Acts as the single injection point for backend transport implementations — GameCore itself has **no knowledge of concrete backends** (Redis, Postgres, Datadog, etc.).
 
 The subsystem enforces that all service connections are established during `Initialize` and torn down during `Deinitialize`. It is **server-only** by default via `ShouldCreateSubsystem`.
 
-All three services fall back to `UE_LOG` routing automatically when not registered or not yet connected. This means systems that depend on these interfaces never need to null-check — they always get a valid, safe implementation.
+All services fall back to `UE_LOG` routing automatically when not registered or not yet connected. Systems that depend on these interfaces never need to null-check — they always receive a valid, safe implementation.
+
+---
+
+## Service Responsibilities
+
+| Service | Interface | Backend Examples | Use For |
+|---|---|---|---|
+| Key Storage | `IKeyStorageService` | Redis, MongoDB, DynamoDB | Entity blobs, session state, ephemeral data with TTL |
+| Query Storage | `IQueryStorageService` | PostgreSQL, Elasticsearch, CockroachDB | Market listings, leaderboards, searchable structured records |
+| Audit | `IAuditService` | Kafka, append-only event store | Gameplay event audit trail, anti-cheat, rollback |
+| Logging | `ILoggingService` | Datadog, Loki, CloudWatch | Server log forwarding |
 
 ---
 
 ## Sub-pages
 
-- IDBService
+- IKeyStorageService
+- IQueryStorageService
 - IAuditService
 - ILoggingService
 
@@ -30,7 +42,8 @@ GameCore/
     └── GameCore/
         └── Backend/
             ├── BackendSubsystem.h/.cpp
-            ├── DBService.h
+            ├── KeyStorageService.h
+            ├── QueryStorageService.h
             ├── AuditService.h
             └── LoggingService.h
 ```
@@ -46,7 +59,8 @@ class GAMECORE_API UGameCoreBackendSubsystem : public UGameInstanceSubsystem
     GENERATED_BODY()
 
     // Only the subsystem may call Connect() on services
-    friend class IDBService;
+    friend class IKeyStorageService;
+    friend class IQueryStorageService;
     friend class IAuditService;
     friend class ILoggingService;
 
@@ -57,28 +71,34 @@ public:
 
     // --- Service Registration ---
     // Call before Initialize completes (e.g. from GameInstance::Init)
-    void RegisterDBService(TScriptInterface<IDBService> Service, const FString& ConnectionString);
-    void RegisterAuditService(TScriptInterface<IAuditService> Service, const FString& ConnectionString);
-    void RegisterLoggingService(TScriptInterface<ILoggingService> Service, const FString& ConnectionString);
+    void RegisterKeyStorageService  (TScriptInterface<IKeyStorageService>   Service, const FString& ConnectionString);
+    void RegisterQueryStorageService(TScriptInterface<IQueryStorageService> Service, const FString& ConnectionString);
+    void RegisterAuditService       (TScriptInterface<IAuditService>        Service, const FString& ConnectionString);
+    void RegisterLoggingService     (TScriptInterface<ILoggingService>      Service, const FString& ConnectionString);
 
     // --- Service Accessors ---
-    IDBService*      GetDB()      const;
-    IAuditService*   GetAudit()   const;
-    ILoggingService* GetLogging() const;
+    // Always safe — never return null. Return null fallback if not connected.
+    IKeyStorageService*   GetKeyStorage()   const;
+    IQueryStorageService* GetQueryStorage() const;
+    IAuditService*        GetAudit()        const;
+    ILoggingService*      GetLogging()      const;
 
 private:
-    TScriptInterface<IDBService>      DBService;
-    TScriptInterface<IAuditService>   AuditService;
-    TScriptInterface<ILoggingService> LoggingService;
+    TScriptInterface<IKeyStorageService>   KeyStorageService;
+    TScriptInterface<IQueryStorageService> QueryStorageService;
+    TScriptInterface<IAuditService>        AuditService;
+    TScriptInterface<ILoggingService>      LoggingService;
 
     // Null fallbacks — always valid, route to UE_LOG
-    TUniquePtr<FNullDBService>      NullDB;
-    TUniquePtr<FNullAuditService>   NullAudit;
-    TUniquePtr<FNullLoggingService> NullLogging;
+    TUniquePtr<FNullKeyStorageService>   NullKeyStorage;
+    TUniquePtr<FNullQueryStorageService> NullQueryStorage;
+    TUniquePtr<FNullAuditService>        NullAudit;
+    TUniquePtr<FNullLoggingService>      NullLogging;
 
-    bool bDBConnected      = false;
-    bool bAuditConnected   = false;
-    bool bLoggingConnected = false;
+    bool bKeyStorageConnected   = false;
+    bool bQueryStorageConnected = false;
+    bool bAuditConnected        = false;
+    bool bLoggingConnected      = false;
 };
 ```
 
@@ -89,11 +109,18 @@ private:
 Accessors never return null. If a service is not registered or failed to connect, they return the null fallback which routes to `UE_LOG`:
 
 ```cpp
-IDBService* UGameCoreBackendSubsystem::GetDB() const
+IKeyStorageService* UGameCoreBackendSubsystem::GetKeyStorage() const
 {
-    if (DBService.GetObject() && bDBConnected)
-        return DBService.GetInterface();
-    return NullDB.Get();
+    if (KeyStorageService.GetObject() && bKeyStorageConnected)
+        return KeyStorageService.GetInterface();
+    return NullKeyStorage.Get();
+}
+
+IQueryStorageService* UGameCoreBackendSubsystem::GetQueryStorage() const
+{
+    if (QueryStorageService.GetObject() && bQueryStorageConnected)
+        return QueryStorageService.GetInterface();
+    return NullQueryStorage.Get();
 }
 // Same pattern for GetAudit() and GetLogging()
 ```
@@ -103,17 +130,56 @@ IDBService* UGameCoreBackendSubsystem::GetDB() const
 ## Registration & Connection
 
 ```cpp
-void UGameCoreBackendSubsystem::RegisterDBService(
-    TScriptInterface<IDBService> Service, const FString& ConnectionString)
+void UGameCoreBackendSubsystem::RegisterKeyStorageService(
+    TScriptInterface<IKeyStorageService> Service, const FString& ConnectionString)
 {
-    DBService = Service;
-    bDBConnected = Service.GetInterface()->Connect(ConnectionString);
-    if (!bDBConnected)
-        UE_LOG(LogGameCore, Error, TEXT("[Backend] DBService failed to connect."));
+    KeyStorageService = Service;
+    bKeyStorageConnected = Service.GetInterface()->Connect(ConnectionString);
+    if (!bKeyStorageConnected)
+        UE_LOG(LogGameCore, Error, TEXT("[Backend] KeyStorageService failed to connect."));
 }
+
+void UGameCoreBackendSubsystem::RegisterQueryStorageService(
+    TScriptInterface<IQueryStorageService> Service, const FString& ConnectionString)
+{
+    QueryStorageService = Service;
+    bQueryStorageConnected = Service.GetInterface()->Connect(ConnectionString);
+    if (!bQueryStorageConnected)
+        UE_LOG(LogGameCore, Error, TEXT("[Backend] QueryStorageService failed to connect."));
+}
+// Same pattern for RegisterAuditService and RegisterLoggingService
 ```
 
 Register services from your game's `UGameInstance::Init` **before** `Super::Init()` completes, or from a `UGameInstanceSubsystem` with an earlier initialization order.
+
+---
+
+## Deinitialize — Graceful Shutdown
+
+`Deinitialize` calls `Flush()` on services that buffer data before tearing them down. This guarantees in-flight audit events and log messages are drained before the process exits.
+
+```cpp
+void UGameCoreBackendSubsystem::Deinitialize()
+{
+    // Flush buffered services before teardown
+    if (AuditService.GetObject() && bAuditConnected)
+        AuditService.GetInterface()->Flush();
+
+    if (LoggingService.GetObject() && bLoggingConnected)
+        LoggingService.GetInterface()->Flush();
+
+    // Reset all services
+    KeyStorageService   = nullptr;
+    QueryStorageService = nullptr;
+    AuditService        = nullptr;
+    LoggingService      = nullptr;
+
+    bKeyStorageConnected   = false;
+    bQueryStorageConnected = false;
+    bAuditConnected        = false;
+    bLoggingConnected      = false;
+}
+```
 
 ---
 
@@ -136,12 +202,8 @@ bool UGameCoreBackendSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 ## Notes
 
 - Services must be registered **before** `Initialize` calls `Connect`. The subsystem does not retry connections.
-- `GetDB()`, `GetAudit()`, `GetLogging()` are always safe to call — they never return null.
-- The `friend` declarations are intentional: `Connect()` is public on the interface for technical reasons but callers outside the subsystem should not call it directly. Document this contract clearly for implementors.
+- All accessors are always safe to call — they never return null.
+- `KeyStorageService` and `QueryStorageService` may point to different backend hosts, different databases, or even the same host with different routing logic. The game module decides.
+- `IAuditService` requires `SetServerId()` to be called after registration before events are dispatched. Until then, events queue internally. See `IAuditService` for queue behavior and cap details.
+- The `friend` declarations are intentional: `Connect()` is public on each interface for technical reasons but callers outside the subsystem must not call it directly.
 - In PIE, `ShouldCreateSubsystem` may return false depending on net mode. Use a dedicated server PIE configuration for local backend testing.
-
-[IDBService](GameCore%20Backend/IDBService%2031cd261a36cf8198ad66ec7abcc8fe97.md)
-
-[IAuditService](GameCore%20Backend/IAuditService%2031cd261a36cf81a6a338eaecf802df1f.md)
-
-[ILoggingService](GameCore%20Backend/ILoggingService%2031cd261a36cf81de96decd78a3ca7888.md)
