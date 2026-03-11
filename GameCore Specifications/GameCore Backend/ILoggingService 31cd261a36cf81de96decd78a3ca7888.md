@@ -3,7 +3,7 @@
 **Module:** `GameCore`
 **Location:** `GameCore/Source/GameCore/Backend/LoggingService.h`
 
-Interface for forwarding server log messages to an external logging backend (e.g. Datadog, Loki, CloudWatch). This is the **canonical logging interface** for GameCore systems. The temporary `ILogSubsystem` previously referenced in `UPersistenceSubsystem` is superseded by this interface via `UGameCoreBackendSubsystem`.
+Interface for forwarding server log messages to an external logging backend (e.g. Datadog, Loki, CloudWatch). This is the **canonical logging interface** for GameCore systems, accessed exclusively via `FGameCoreBackend::GetLogging()`.
 
 Convenience methods (`LogInfo`, `LogWarning`, etc.) are default-implemented via `Log()` so implementors only need to override one method.
 
@@ -123,7 +123,6 @@ protected:
     // Deliver a batch of entries to the backend. Called from the flush thread.
     // Return true on success.
     // Implementations must respect Config.MaxBatchSize — split large flushes into multiple calls.
-    // Retry logic, connection state, and threading are the responsibility of the concrete class.
     virtual bool DispatchBatch(const TArray<FLogEntry>& Entries) = 0;
 
 private:
@@ -184,7 +183,19 @@ Flush() (graceful shutdown):
 
 ## Null Fallback Implementation
 
-Routes all messages to `UE_LOG`. Used automatically when no service is registered.
+`FNullLoggingService` is the fallback used by `FGameCoreBackend` when no service is registered or the subsystem is not live. It routes every call to `UE_LOG(LogGameCore, ...)` so no log message is silently dropped in development.
+
+**Severity mapping:**
+
+| `ELogSeverity` | `UE_LOG` verbosity |
+|---|---|
+| `Verbose` | `Verbose` |
+| `Info` | `Log` |
+| `Warning` | `Warning` |
+| `Error` | `Error` |
+| `Critical` | `Error` (with `[CRITICAL]` prefix) + synchronous `Flush()` |
+
+> `Critical` deliberately does **not** map to `UE_LOG Fatal`. Fatal crashes the process and may lose buffered messages. Use a separate crash handler (`FCoreDelegates::OnHandleSystemError`) if a process crash is required.
 
 ```cpp
 class GAMECORE_API FNullLoggingService : public ILoggingService
@@ -210,7 +221,7 @@ public:
             case ELogSeverity::Warning:  UE_LOG(LogGameCore, Warning, TEXT("%s"), *Full); break;
             case ELogSeverity::Error:    UE_LOG(LogGameCore, Error,   TEXT("%s"), *Full); break;
             case ELogSeverity::Critical:
-                Flush();
+                Flush(); // no-op here, but required by interface contract
                 UE_LOG(LogGameCore, Error, TEXT("[CRITICAL] %s"), *Full);
                 break;
         }
@@ -218,9 +229,13 @@ public:
 };
 ```
 
+This implementation is declared in `LoggingService.h` and is also instantiated as the static fallback `GNullLogging` in `GameCoreBackend.cpp`.
+
 ---
 
 ## Wiring with UGameCoreBackendSubsystem
+
+Services are registered from the game module. After registration, all plugin code accesses logging via `FGameCoreBackend::GetLogging()` — no additional wiring per system.
 
 ```cpp
 FLoggingConfig Config;
@@ -232,8 +247,8 @@ Config.MaxBatchSize          = 500;
 
 Backend->RegisterLoggingService(NAME_None, MyLoggingService, Config);
 
-// Always safe — GetLogging() never returns null, falls back to FNullLoggingService if not registered
-Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message);
+// Plugin systems then call:
+FGameCoreBackend::GetLogging()->LogWarning(TEXT("Persistence"), Message);
 ```
 
 ---
@@ -241,9 +256,7 @@ Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message);
 ## Notes
 
 - `Flush()` **must** complete before process exit. The subsystem calls it automatically in `Deinitialize`.
-- `LogCritical` never maps to `UE_LOG Fatal`. Fatal crashes the process and may lose buffered messages. Use a separate crash handler (e.g. `FCoreDelegates::OnHandleSystemError`) if a process crash is required after a critical log.
-- `Payload` is optional and caller-formatted. Use JSON or `key=value` pairs for structured extra data (e.g. entity IDs, request context). The logging backend indexes it as-is — no parsing is done by the service.
+- `Payload` is optional and caller-formatted. Use JSON or `key=value` pairs for structured extra data (e.g. entity IDs, request context). The logging backend indexes it as-is.
 - `FLoggingServiceBase` runs its flush loop on a dedicated platform thread, not via `FTimerManager`, so it is safe to use before a World exists and during teardown.
 - Reconnect uses exponential backoff between `ReconnectDelaySeconds` and `MaxReconnectDelaySeconds`. Messages continue queuing during reconnect. If `MaxQueueSize` is exceeded, the oldest entries are dropped and a `UE_LOG Warning` is emitted.
-- **Abstraction vs implementation:** `FLoggingServiceBase` defines queue ownership, the pressure-flush mechanism, and the flush thread contract. Retry logic, connection pooling, and transport details are the responsibility of the **concrete implementation**. `MaxBatchSize` is a configuration hint — concrete implementations must respect it by splitting large flushes into multiple `DispatchBatch` calls.
 - This interface is **server-side only**. Never instantiate or call from client code.

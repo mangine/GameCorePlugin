@@ -2,21 +2,41 @@
 
 **Module:** `GameCore`
 **Location:** `GameCore/Source/GameCore/Backend/`
-**Type:** `UGameInstanceSubsystem`
+**Type:** `UGameInstanceSubsystem` + static facade
 
 Central subsystem for all external backend service integrations. Manages the lifecycle of **named service instances** across four interface types: key-value storage, query storage, audit, and logging. Acts as the single injection point for backend transport implementations — GameCore itself has **no knowledge of concrete backends** (Redis, Postgres, Datadog, etc.).
 
 Multiple named instances of any service type are supported. This allows different game systems to route to distinct backends — for example, a `"PlayerDB"` and an `"EconomyDB"` key-value store, or a `"Security"` and a `"Gameplay"` audit service.
 
-All service types fall back to safe null implementations when not registered or not connected. Accessors never return null.
+All service types fall back to safe null implementations when not registered or not connected. Null implementations route all calls to `UE_LOG` so nothing is silently swallowed. Accessors never return null.
 
 The subsystem is **server-only** by default via `ShouldCreateSubsystem`.
 
 ---
 
+## Access Pattern — FGameCoreBackend
+
+**All GameCore plugin code accesses backend services exclusively via `FGameCoreBackend`**, the static facade that sits in front of this subsystem. Direct `GetSubsystem<UGameCoreBackendSubsystem>()` calls are not permitted inside the plugin.
+
+All four service types use the same **tag-based accessors** — plugin systems pass their own `FGameplayTag` and routing is resolved automatically. Game module wiring code uses **FName-based accessors** to register and explicitly target specific instances.
+
+```cpp
+// Plugin system (tag-based — no backend name knowledge required)
+#include "Backend/GameCoreBackend.h"
+FGameCoreBackend::GetLogging(TAG_Log_Persistence)->LogWarning(TEXT("Persistence"), Message);
+FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)->Set(...);
+FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(...);
+```
+
+See the **FGameCoreBackend** sub-page for full specification.
+
+---
+
 ## Sub-pages
 
-- IDBService
+- [FGameCoreBackend](GameCore%20Backend/FGameCoreBackend.md) — static facade, tag routing, usage patterns, null fallback behavior
+- IKeyStorageService
+- IQueryStorageService
 - IAuditService
 - ILoggingService
 
@@ -29,8 +49,11 @@ GameCore/
 └── Source/
     └── GameCore/
         └── Backend/
+            ├── GameCoreBackend.h       ← Static facade
+            ├── GameCoreBackend.cpp     ← Static facade impl + null fallback statics
             ├── BackendSubsystem.h/.cpp
-            ├── DBService.h
+            ├── KeyStorageService.h
+            ├── QueryStorageService.h
             ├── AuditService.h
             └── LoggingService.h
 ```
@@ -39,19 +62,18 @@ GameCore/
 
 ## Named Service Model
 
-Each service type is stored in a `TMap<FName, TScriptInterface<T>>`. Callers select which backend to use by passing an `FName` key. If the requested key is not registered or failed to connect, the null fallback is returned.
+Services are registered under `FName` keys. `FName` remains the internal identifier for backend instances. `FGameplayTag` is the **routing key** that systems use — the subsystem resolves tag → name transparently. This applies uniformly to all four service types.
 
-**Recommended key conventions:**
+**Recommended FName key conventions:**
 
 | Key | Typical Use |
 |---|---|
-| `NAME_None` | General-purpose default — used by callers that don't need routing |
+| `NAME_None` | General-purpose default |
 | `"PlayerDB"` | Player character persistence |
 | `"EconomyDB"` | Market, currency, trades |
 | `"Security"` | Anti-cheat audit stream |
 | `"Gameplay"` | Quest, progression audit stream |
-
-Callers that don't need routing use `GetAudit()` (no argument), which resolves to `NAME_None` or the null fallback.
+| `"SecurityLog"` | Dedicated security log sink (optional) |
 
 ---
 
@@ -63,7 +85,6 @@ class GAMECORE_API UGameCoreBackendSubsystem : public UGameInstanceSubsystem
 {
     GENERATED_BODY()
 
-    // Only the subsystem may call Connect() on services
     friend class IKeyStorageService;
     friend class IQueryStorageService;
     friend class IAuditService;
@@ -75,14 +96,29 @@ public:
     virtual void Deinitialize() override;
 
     // --- Service Registration ---
-    // Call before Initialize completes (e.g. from GameInstance::Init or an early subsystem).
-    // Key identifies this named instance — use NAME_None for the primary/default service.
-    void RegisterKeyStorageService  (FName Key, TScriptInterface<IKeyStorageService>   Service, const FString& ConnectionString);
+    // Register a named backend instance. Call from GameInstance::Init before Super::Init().
+    void RegisterKeyStorageService  (FName Key, TScriptInterface<IKeyStorageService>   Service, const FKeyStorageConfig& Config);
     void RegisterQueryStorageService(FName Key, TScriptInterface<IQueryStorageService> Service, const FString& ConnectionString);
     void RegisterAuditService       (FName Key, TScriptInterface<IAuditService>        Service, const FString& ConnectionString);
     void RegisterLoggingService     (FName Key, TScriptInterface<ILoggingService>      Service, const FLoggingConfig& Config);
 
-    // --- Service Accessors ---
+    // --- Tag Routing Registration ---
+    // Map a FGameplayTag to a named backend instance.
+    // After this, FGameCoreBackend::GetX(Tag) resolves to the named instance.
+    // Call from GameInstance::Init alongside service registration.
+    // Unmapped tags resolve to NAME_None (the default service).
+    void MapTagToLogging     (FGameplayTag Tag, FName Key);
+    void MapTagToKeyStorage  (FGameplayTag Tag, FName Key);
+    void MapTagToQueryStorage(FGameplayTag Tag, FName Key);
+    void MapTagToAudit       (FGameplayTag Tag, FName Key);
+
+    // --- Tag Resolution (used internally by FGameCoreBackend) ---
+    FName ResolveLoggingTag     (FGameplayTag Tag) const;
+    FName ResolveKeyStorageTag  (FGameplayTag Tag) const;
+    FName ResolveQueryStorageTag(FGameplayTag Tag) const;
+    FName ResolveAuditTag       (FGameplayTag Tag) const;
+
+    // --- FName-Based Service Accessors ---
     // Returns the named service, or the null fallback if not registered / not connected.
     // Never returns null.
     IKeyStorageService*   GetKeyStorage  (FName Key = NAME_None) const;
@@ -91,6 +127,7 @@ public:
     ILoggingService*      GetLogging     (FName Key = NAME_None) const;
 
 private:
+    // --- Service Maps ---
     TMap<FName, TScriptInterface<IKeyStorageService>>   KeyStorageServices;
     TMap<FName, TScriptInterface<IQueryStorageService>> QueryStorageServices;
     TMap<FName, TScriptInterface<IAuditService>>        AuditServices;
@@ -101,7 +138,14 @@ private:
     TSet<FName> ConnectedAudit;
     TSet<FName> ConnectedLogging;
 
-    // Null fallbacks — always valid, route to UE_LOG or no-op
+    // --- Tag Routing Maps ---
+    // Game module populates these via MapTagTo*(). Plugin systems never read these directly.
+    TMap<FGameplayTag, FName> KeyStorageRoutes;
+    TMap<FGameplayTag, FName> QueryStorageRoutes;
+    TMap<FGameplayTag, FName> AuditRoutes;
+    TMap<FGameplayTag, FName> LoggingRoutes;
+
+    // --- Null Fallbacks ---
     TUniquePtr<FNullKeyStorageService>   NullKeyStorage;
     TUniquePtr<FNullQueryStorageService> NullQueryStorage;
     TUniquePtr<FNullAuditService>        NullAudit;
@@ -111,57 +155,84 @@ private:
 
 ---
 
+## Tag Resolution Implementation
+
+```cpp
+FName UGameCoreBackendSubsystem::ResolveLoggingTag(FGameplayTag Tag) const
+{
+    const FName* Found = LoggingRoutes.Find(Tag);
+    return Found ? *Found : NAME_None;
+}
+// Same pattern for ResolveKeyStorageTag(), ResolveQueryStorageTag(), ResolveAuditTag()
+```
+
+Resolution is **exact-match only** — O(1) `TMap` lookup. Register each tag that needs non-default routing explicitly.
+
+---
+
+## Tag Routing Registration
+
+```cpp
+void UGameCoreBackendSubsystem::MapTagToLogging(FGameplayTag Tag, FName Key)
+{
+    LoggingRoutes.Add(Tag, Key);
+}
+// Same pattern for MapTagToKeyStorage(), MapTagToQueryStorage(), MapTagToAudit()
+```
+
+---
+
 ## Accessors — Fallback Logic
 
-Accessors look up the named key first. If not found or not connected, the null fallback is returned:
-
 ```cpp
-IAuditService* UGameCoreBackendSubsystem::GetAudit(FName Key) const
+ILoggingService* UGameCoreBackendSubsystem::GetLogging(FName Key) const
 {
-    const auto* Entry = AuditServices.Find(Key);
-    if (Entry && ConnectedAudit.Contains(Key))
+    const auto* Entry = LoggingServices.Find(Key);
+    if (Entry && ConnectedLogging.Contains(Key))
         return Entry->GetInterface();
-    return NullAudit.Get();
+    return NullLogging.Get();
 }
-// Same pattern for GetKeyStorage(), GetQueryStorage(), GetLogging()
+// Same pattern for GetKeyStorage(), GetQueryStorage(), GetAudit()
 ```
 
 ---
 
-## Registration & Connection
+## Initialize — FGameCoreBackend Registration
 
 ```cpp
-void UGameCoreBackendSubsystem::RegisterAuditService(
-    FName Key, TScriptInterface<IAuditService> Service, const FString& ConnectionString)
+void UGameCoreBackendSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
-    AuditServices.Add(Key, Service);
-    if (Service.GetInterface()->Connect(ConnectionString))
-        ConnectedAudit.Add(Key);
-    else
-        UE_LOG(LogGameCore, Error, TEXT("[Backend] AuditService '%s' failed to connect."), *Key.ToString());
-}
-// Same pattern for RegisterKeyStorageService(), RegisterQueryStorageService(), RegisterLoggingService()
-```
+    Super::Initialize(Collection);
 
-Register services from your game's `UGameInstance::Init` **before** `Super::Init()` completes, or from a `UGameInstanceSubsystem` with an earlier initialization order.
+    NullKeyStorage   = MakeUnique<FNullKeyStorageService>();
+    NullQueryStorage = MakeUnique<FNullQueryStorageService>();
+    NullAudit        = MakeUnique<FNullAuditService>();
+    NullLogging      = MakeUnique<FNullLoggingService>();
+
+    FGameCoreBackend::Register(this);
+}
+```
 
 ---
 
-## Deinitialize — Graceful Shutdown
-
-`Deinitialize` calls `Flush()` on **all** registered buffered services (audit and logging) before tearing down. This guarantees no in-flight events are lost on shutdown regardless of how many named services are registered.
+## Deinitialize — Ordered Shutdown
 
 ```cpp
 void UGameCoreBackendSubsystem::Deinitialize()
 {
-    for (auto& [Key, Service] : AuditServices)
-        if (ConnectedAudit.Contains(Key))
-            Service.GetInterface()->Flush();
-
+    // 1. Flush all buffered services
     for (auto& [Key, Service] : LoggingServices)
         if (ConnectedLogging.Contains(Key))
             Service.GetInterface()->Flush();
 
+    for (auto& [Key, Service] : AuditServices)
+        if (ConnectedAudit.Contains(Key))
+            Service.GetInterface()->Flush();
+
+    // 2. Unregister facade — GetX() now routes to static null fallbacks
+    FGameCoreBackend::Unregister();
+
+    // 3. Clear all maps
     KeyStorageServices.Empty();
     QueryStorageServices.Empty();
     AuditServices.Empty();
@@ -171,6 +242,11 @@ void UGameCoreBackendSubsystem::Deinitialize()
     ConnectedQueryStorage.Empty();
     ConnectedAudit.Empty();
     ConnectedLogging.Empty();
+
+    KeyStorageRoutes.Empty();
+    QueryStorageRoutes.Empty();
+    AuditRoutes.Empty();
+    LoggingRoutes.Empty();
 }
 ```
 
@@ -192,46 +268,67 @@ bool UGameCoreBackendSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 
 ---
 
-## Usage Example — Multi-Backend Wiring
+## Usage Example — Full Game Module Wiring
+
+The game module registers services **and** tag routes in one place. After this, plugin systems need no knowledge of backend topology.
 
 ```cpp
 void UMyGameInstance::Init()
 {
     auto* Backend = GetSubsystem<UGameCoreBackendSubsystem>();
 
-    // Two separate key-value stores
-    Backend->RegisterKeyStorageService(TEXT("PlayerDB"),  PlayerRedis,  TEXT("redis://player-host:6379"));
-    Backend->RegisterKeyStorageService(TEXT("EconomyDB"), EconomyRedis, TEXT("redis://economy-host:6379"));
+    // 1. Register backend instances
+    Backend->RegisterKeyStorageService(TEXT("PlayerDB"),   PlayerRedis,     PlayerDbConfig);
+    Backend->RegisterKeyStorageService(TEXT("EconomyDB"),  EconomyRedis,    EconomyDbConfig);
+    Backend->RegisterQueryStorageService(TEXT("EconomyDB"), EconomyPostgres, TEXT("postgres://..."));
+    Backend->RegisterAuditService(TEXT("Security"),  SecurityAudit,  TEXT("postgres://audit-host/security"));
+    Backend->RegisterAuditService(TEXT("Gameplay"),  GameplayAudit,  TEXT("postgres://audit-host/gameplay"));
+    Backend->RegisterLoggingService(NAME_None,        MyDatadogLogger, LogConfig);         // default logger
+    Backend->RegisterLoggingService(TEXT("SecurityLog"), SecurityLogger, SecurityLogConfig); // optional dedicated sink
 
-    // Two audit streams
-    Backend->RegisterAuditService(TEXT("Security"), SecurityAudit, TEXT("postgres://audit-host/security"));
-    Backend->RegisterAuditService(TEXT("Gameplay"), GameplayAudit, TEXT("postgres://audit-host/gameplay"));
+    // 2. Register tag routes — all four service types
+    // Key storage
+    Backend->MapTagToKeyStorage(TAG_Persistence_Entity_Player,   TEXT("PlayerDB"));
+    Backend->MapTagToKeyStorage(TAG_Persistence_Entity_Quest,    TEXT("PlayerDB"));
+    Backend->MapTagToKeyStorage(TAG_Persistence_Economy_Listing, TEXT("EconomyDB"));
 
-    // One default logging service
-    FLoggingConfig LogConfig;
-    LogConfig.Endpoint              = TEXT("https://logs.datadoghq.com/...");
-    LogConfig.FlushIntervalSeconds  = 5.0f;
-    LogConfig.FlushThresholdPercent = 0.75f;
-    LogConfig.MaxBatchSize          = 500;
-    Backend->RegisterLoggingService(NAME_None, MyDatadogLogger, LogConfig);
+    // Query storage
+    Backend->MapTagToQueryStorage(TAG_Schema_Market_Listing, TEXT("EconomyDB"));
+    Backend->MapTagToQueryStorage(TAG_Schema_Leaderboard,    TEXT("EconomyDB"));
+
+    // Audit
+    Backend->MapTagToAudit(TAG_Audit_Progression, TEXT("Gameplay"));
+    Backend->MapTagToAudit(TAG_Audit_Market,      TEXT("Gameplay"));
+    Backend->MapTagToAudit(TAG_Audit_AntiCheat,   TEXT("Security"));
+
+    // Logging (optional — unmapped tags fall back to NAME_None default logger)
+    Backend->MapTagToLogging(TAG_Log_Security, TEXT("SecurityLog"));
 
     Super::Init();
 }
+```
 
-// Callers select the right backend by name:
-Backend->GetKeyStorage(TEXT("EconomyDB"))->Set(Key, Value);
-Backend->GetAudit(TEXT("Security"))->RecordEvent(CheatEntry);
-Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message); // resolves NAME_None
+Plugin systems need no knowledge of this topology:
+
+```cpp
+// Routes to "SecurityLog" automatically
+FGameCoreBackend::GetLogging(TAG_Log_Security)->LogError(TEXT("AntiCheat"), Details);
+
+// Falls back to NAME_None default logger (no explicit mapping needed)
+FGameCoreBackend::GetLogging(TAG_Log_Persistence)->LogWarning(TEXT("Persistence"), Message);
+
+// Storage and audit routing unchanged
+FGameCoreBackend::GetKeyStorage(Payload.PersistenceTag)->Set(
+    Payload.PersistenceTag, Payload.EntityId, Bytes,
+    Payload.bFlushImmediately, Payload.bCritical);
 ```
 
 ---
 
 ## Notes
 
-- Services must be registered **before** `Initialize` is called. The subsystem does not retry connections.
-- All accessors (`GetAudit`, `GetLogging`, etc.) are always safe to call — they never return null.
-- `NAME_None` is the conventional key for the single general-purpose instance of a service type. Use a consistent convention per service type across the project.
-- `Flush()` is called on **all** registered audit and logging services during `Deinitialize` — not just `NAME_None`. Every named instance is flushed.
-- `IKeyStorageService` and `IQueryStorageService` do not buffer — no `Flush()` call is needed for them on shutdown.
-- `friend` declarations are intentional: `Connect()` is public on each interface for technical reasons but callers outside the subsystem must not call it directly.
-- In PIE, `ShouldCreateSubsystem` may return false depending on net mode. Use a dedicated server PIE configuration for local backend testing.
+- Services must be registered **and** tag routes mapped before `Initialize` completes.
+- Unmapped tags resolve to `NAME_None` — ensure a default service is registered for `NAME_None`, or all unmapped calls will hit the null fallback.
+- Tag routing is **exact-match only**. Each tag that needs non-default routing must be registered explicitly.
+- `Flush()` is called on **all** registered audit and logging services during `Deinitialize`.
+- `friend` declarations are intentional: `Connect()` is public on interfaces for technical reasons but must only be called by the subsystem.

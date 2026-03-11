@@ -12,7 +12,7 @@ The subsystem does **not** own a write-behind queue, flush timer toward the DB, 
 
 ## Backend Compatibility
 
-`UPersistenceSubsystem` does **not** depend on `UGameCoreBackendSubsystem`. Logging calls use `ILoggingService` via a subsystem lookup — if not present or not connected, it falls back to `UE_LOG` transparently.
+`UPersistenceSubsystem` does **not** depend on `UGameCoreBackendSubsystem`. Logging calls use `FGameCoreBackend::GetLogging()` — if the backend subsystem is not live, `FGameCoreBackend` falls back to `FNullLoggingService` which routes to `UE_LOG` transparently. No conditional check required at the call site.
 
 Storage wiring is opt-in: bind `FOnPayloadReady` delegates to `IKeyStorageService::Set` in the game module. See **GameCore Backend → IKeyStorageService** for the wiring example.
 
@@ -63,7 +63,7 @@ bool bFullSave = (SaveCounter % (PartialSavesBetweenFullSave + 1) == 0);
 - On single-actor events (logout, zone transfer, trigger): immediate full save with `bCritical` and/or `bFlushImmediately` set
 - On server shutdown: full save all registered entities synchronously
 - Fire `OnComplete(false)` on load failure or timeout — never leave callbacks dangling
-- Log capacity alerts via `ILoggingService` (falls back to `UE_LOG` if not wired)
+- Log capacity alerts and errors via `FGameCoreBackend::GetLogging()` (falls back to `UE_LOG` automatically)
 
 ---
 
@@ -174,9 +174,6 @@ private:
 
     static bool IsCriticalReason(ESerializationReason Reason);
     static bool IsImmediateReason(ESerializationReason Reason);
-
-    void LogWarning(const FString& Message);
-    void LogError(const FString& Message);
 };
 ```
 
@@ -450,8 +447,8 @@ void UPersistenceSubsystem::OnLoadFailed(FGuid EntityId)
 {
     if (auto* Request = LoadCallbacks.Find(EntityId))
     {
-        LogError(FString::Printf(
-            TEXT("Load failed for entity [%s]."), *EntityId.ToString()));
+        FGameCoreBackend::GetLogging()->LogError(TEXT("Persistence"),
+            FString::Printf(TEXT("Load failed for entity [%s]."), *EntityId.ToString()));
         Request->Callback(false);
         LoadCallbacks.Remove(EntityId);
     }
@@ -478,9 +475,9 @@ void UPersistenceSubsystem::TickLoadTimeouts()
 
     for (const FGuid& ID : Expired)
     {
-        LogError(FString::Printf(
-            TEXT("Load timed out for entity [%s]. Firing OnComplete(false)."),
-            *ID.ToString()));
+        FGameCoreBackend::GetLogging()->LogError(TEXT("Persistence"),
+            FString::Printf(TEXT("Load timed out for entity [%s]. Firing OnComplete(false)."),
+                *ID.ToString()));
         LoadCallbacks[ID].Callback(false);
         LoadCallbacks.Remove(ID);
     }
@@ -508,10 +505,10 @@ void UPersistenceSubsystem::DispatchPayload(const FEntityPersistencePayload& Pay
     FOnPayloadReady* Delegate = TagDelegates.Find(Payload.PersistenceTag);
     if (!Delegate)
     {
-        LogError(FString::Printf(
-            TEXT("No delegate for tag [%s]. Payload for [%s] dropped."),
-            *Payload.PersistenceTag.ToString(),
-            *Payload.EntityId.ToString()));
+        FGameCoreBackend::GetLogging()->LogError(TEXT("Persistence"),
+            FString::Printf(TEXT("No delegate for tag [%s]. Payload for [%s] dropped."),
+                *Payload.PersistenceTag.ToString(),
+                *Payload.EntityId.ToString()));
         return;
     }
     Delegate->Broadcast(Payload);
@@ -595,16 +592,16 @@ See `IPersistableComponent` → `ClearIfSaved(uint32 FlushedGeneration)` for the
 
 ---
 
-## Logging Helper
+## Logging
+
+All logging in `UPersistenceSubsystem` uses `FGameCoreBackend::GetLogging()` directly at the call site. No private logging helper methods. If the backend subsystem is not live, `FGameCoreBackend` returns `FNullLoggingService` which routes to `UE_LOG(LogGameCore, ...)` transparently.
 
 ```cpp
-void UPersistenceSubsystem::LogWarning(const FString& Message)
-{
-    if (auto* Backend = GetGameInstance()->GetSubsystem<UGameCoreBackendSubsystem>())
-        Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message);
-    else
-        UE_LOG(LogPersistence, Warning, TEXT("%s"), *Message);
-}
+// Example inline usage throughout the subsystem's .cpp:
+#include "Backend/GameCoreBackend.h"
+
+FGameCoreBackend::GetLogging()->LogWarning(TEXT("Persistence"), Message);
+FGameCoreBackend::GetLogging()->LogError(TEXT("Persistence"), Message);
 ```
 
 ---
@@ -631,7 +628,7 @@ GameCore/
 - `RequestShutdownSave` is synchronous. All payloads are dispatched with `bFlushImmediately = true` so the DB service does not queue them — they go directly to the backend.
 - `LoadTimeoutSeconds` should exceed the worst-case DB round-trip. Default 30s is conservative.
 - `SaveCounter` is `uint32` and wraps at ~4 billion cycles. At one cycle per 300s this is ~40,000 years.
-- `ServerInstanceId` must be set via `DefaultGame.ini` or a `UGameInstance` override before `Initialize()`. If unset, a `UE_LOG Error` is emitted.
+- `ServerInstanceId` must be set via `DefaultGame.ini` or a `UGameInstance` override before `Initialize()`. If unset, a `UE_LOG Error` is emitted (using `UE_LOG` directly here, before the backend subsystem is guaranteed live).
 - Only one transport layer should bind per tag's `OnLoadRequested` — multiple bindings cause duplicate fetch attempts.
 - The subsystem has no save queue, no DB flush timer, and no priority queue. All of that is owned by `IKeyStorageService`.
 
