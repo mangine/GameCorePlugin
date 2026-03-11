@@ -276,15 +276,17 @@ FGameCoreBackend::GetLogging(TAG_Log_Unregistered)
 // In any plugin .cpp — one include, no context object required
 #include "Backend/GameCoreBackend.h"
 
-// Tag-based (preferred inside plugin systems — no backend name knowledge required)
+// Tag-based (preferred for all plugin systems — no backend name knowledge required)
 FGameCoreBackend::GetLogging(TAG_Log_Persistence)->LogWarning(TEXT("Persistence"), Message);
 FGameCoreBackend::GetLogging(TAG_Log_Security)->LogError(TEXT("AntiCheat"), Details);
 FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)->Set(TAG_Persistence_Entity_Player, EntityId, Data, false, false);
+FGameCoreBackend::GetQueryStorage(TAG_Schema_Market_Listing)->Query(TAG_Schema_Market_Listing, Filter, Callback);
 FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(Entry);
 
-// FName-based (game module wiring code only)
-FGameCoreBackend::GetLogging(NAME_None)->LogWarning(TEXT("MySystem"), Message);
-FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(...);
+// FName-based (game module wiring code only — explicit instance targeting)
+FGameCoreBackend::GetLogging(TEXT("SecurityLog"))->LogError(TEXT("AntiCheat"), Details);
+FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(TAG_Persistence_Entity_Player, EntityId, Data, false, false);
+FGameCoreBackend::GetAudit(TEXT("Security"))->RecordEvent(CheatEntry);
 ```
 
 **Do not** call `GetSubsystem<UGameCoreBackendSubsystem>()` anywhere inside the GameCore plugin. Use `FGameCoreBackend` instead.
