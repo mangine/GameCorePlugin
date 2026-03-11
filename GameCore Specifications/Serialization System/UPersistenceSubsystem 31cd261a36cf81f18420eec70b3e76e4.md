@@ -4,7 +4,9 @@
 **Location:** `GameCore/Source/GameCore/Persistence/PersistenceSubsystem.h`
 **Type:** `UGameInstanceSubsystem`
 
-Central coordinator of the persistence system. Owns all timing, actor registries, the dirty set, and the save queue. Produces `FEntityPersistencePayload` blobs stamped as **Partial** or **Full** and routes them via `FGameplayTag`-keyed delegates. Has **no knowledge of storage backends** — transport is external.
+Central coordinator of the persistence system. Owns all timing, actor registries, and the dirty set. Serializes actor component state into `FEntityPersistencePayload` blobs and routes them via `FGameplayTag`-keyed delegates. Has **no knowledge of storage backends** — transport is external.
+
+The subsystem does **not** own a write-behind queue, flush timer toward the DB, or a priority queue. These responsibilities belong entirely to `IKeyStorageService`. The subsystem's only job is: decide *which actors* to serialize and *when*, produce payloads, and dispatch them immediately via delegates. The DB service absorbs each payload into its own write-behind queue and handles batching, priority, flush timing, retry, and deduplication from that point forward.
 
 ---
 
@@ -12,7 +14,21 @@ Central coordinator of the persistence system. Owns all timing, actor registries
 
 `UPersistenceSubsystem` does **not** depend on `UGameCoreBackendSubsystem`. Logging calls use `ILoggingService` via a subsystem lookup — if not present or not connected, it falls back to `UE_LOG` transparently.
 
-Storage wiring is opt-in: bind `FOnPayloadReady` delegates to `IDBService::Set` in the game module. See **GameCore Backend → IDBService** for the wiring example.
+Storage wiring is opt-in: bind `FOnPayloadReady` delegates to `IKeyStorageService::Set` in the game module. See **GameCore Backend → IKeyStorageService** for the wiring example.
+
+---
+
+## Responsibility Boundary
+
+| Responsibility | Owner |
+|---|---|
+| Which actors to serialize and when | `UPersistenceSubsystem` |
+| Dirty tracking, partial vs full cycles | `UPersistenceSubsystem` |
+| Serializing component state into binary blobs | `UPersistenceSubsystem` |
+| Dispatching payloads to transport delegates | `UPersistenceSubsystem` |
+| Write-behind queue, flush timing, batching | `IKeyStorageService` |
+| Priority lanes, critical entry guarantees | `IKeyStorageService` |
+| Retry, reconnect, deduplication | `IKeyStorageService` |
 
 ---
 
@@ -39,15 +55,13 @@ bool bFullSave = (SaveCounter % (PartialSavesBetweenFullSave + 1) == 0);
 
 - Maintain `RegisteredEntities` — source of truth for all persistent actors
 - Maintain `DirtySet` — GUIDs of actors with unsaved changes
-- Maintain `PrioritySaveQueue` — critical payloads (Logout, ZoneTransfer, ServerShutdown), never dropped
-- Maintain `SaveQueue` — normal dead-actor payloads, bounded by `MaxSaveQueueSize`
-- Drive timers: periodic save cycle, DB queue drain, load timeout sweep
-- On partial cycles: process dirty actors within per-tick budget (`ActorsPerFlushTick`)
-- On full cycles: spread all registered actors across ticks using `ActorsPerFlushTick` budget
-- Stamp every payload with `EPayloadType` and `ESerializationReason`
-- Route payloads to the correct `FGameplayTag` delegate
-- On single-actor events (logout, zone transfer, trigger): immediate full save
-- On server shutdown: full save all actors synchronously, drain immediately
+- Drive timers: periodic save cycle and load timeout sweep
+- On partial cycles: serialize dirty actors within per-tick budget (`ActorsPerFlushTick`)
+- On full cycles: serialize all registered actors across ticks using `ActorsPerFlushTick` budget
+- Stamp every payload with `EPayloadType`, `ESerializationReason`, `bCritical`, and `bFlushImmediately`
+- Route payloads to the correct `FGameplayTag` delegate immediately — no intermediate queue
+- On single-actor events (logout, zone transfer, trigger): immediate full save with `bCritical` and/or `bFlushImmediately` set
+- On server shutdown: full save all registered entities synchronously
 - Fire `OnComplete(false)` on load failure or timeout — never leave callbacks dangling
 - Log capacity alerts via `ILoggingService` (falls back to `UE_LOG` if not wired)
 
@@ -70,26 +84,9 @@ public:
     UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Timing")
     int32 PartialSavesBetweenFullSave = 9;
 
-    UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Timing")
-    float DBFlushInterval = 60.f;
-
     // Applies to BOTH partial and full cycles.
     UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Performance")
     int32 ActorsPerFlushTick = 100;
-
-    UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Performance")
-    int32 MaxSaveQueueSize = 1000;
-
-    // When SaveQueue reaches this fraction of MaxSaveQueueSize, FlushSaveQueue is triggered
-    // immediately rather than waiting for DBFlushInterval. Prevents data loss under burst load
-    // at the cost of a spike.
-    UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Performance")
-    float DBFlushThresholdPercent = 0.75f;
-
-    // Maximum number of normal-priority payloads dispatched per FlushSaveQueue call.
-    // Priority payloads are always fully drained regardless of this budget.
-    UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Performance")
-    int32 MaxPayloadsPerDBFlush = 200;
 
     // Seconds before a pending load callback fires OnComplete(false).
     UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Load")
@@ -97,7 +94,7 @@ public:
 
     // Stable server identity stamped into every FEntityPersistencePayload.
     // Must be set via DefaultGame.ini or a UGameInstance override before Initialize() is called.
-    // If unset, a UE_LOG Error is emitted. Payloads stamped with an unstable GUID cannot be
+    // If unset, a UE_LOG Error is emitted. Payloads stamped with an invalid GUID cannot be
     // deduplicated across server restarts — this matters for audit and rollback tooling.
     UPROPERTY(Config, EditDefaultsOnly, Category="Persistence|Identity")
     FGuid ServerInstanceId;
@@ -135,9 +132,6 @@ public:
     void RegisterEntity(UPersistenceRegistrationComponent* RegComp);
     void UnregisterEntity(FGuid EntityId);
     void EnqueueDirty(FGuid EntityId);
-    void MoveToSaveQueue(FGuid EntityId, FEntityPersistencePayload Payload);
-
-    static FGuid GetServerInstanceId();
 
 protected:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
@@ -148,14 +142,6 @@ private:
     // --- Registries ---
     TMap<FGuid, TWeakObjectPtr<UPersistenceRegistrationComponent>> RegisteredEntities;
     TSet<FGuid> DirtySet;
-
-    // Priority queue: Logout / ZoneTransfer / ServerShutdown — never dropped.
-    // Keyed by EntityId: one entry per entity. A newer save for the same entity overwrites the older one.
-    // This is intentional — we want the most recent state, not duplicate saves of the same actor.
-    TMap<FGuid, FEntityPersistencePayload> PrioritySaveQueue;
-
-    // Normal queue: bounded by MaxSaveQueueSize.
-    TMap<FGuid, FEntityPersistencePayload> SaveQueue;
 
     TMap<FGameplayTag, FOnPayloadReady> TagDelegates;
 
@@ -170,14 +156,12 @@ private:
     // --- Cycle State ---
     uint32 SaveCounter = 0;
 
-    // Full-cycle spread state
     bool          bFullCycleInProgress  = false;
     int32         FullCycleCursorIndex  = 0;
     TArray<FGuid> FullCycleEntitySnapshot;
 
     // --- Timers ---
     FTimerHandle SaveTimer;
-    FTimerHandle DBFlushTimer;
     FTimerHandle FullCycleTickTimer;
     FTimerHandle LoadTimeoutTimer;
 
@@ -185,11 +169,11 @@ private:
     void FlushSaveCycle();
     void FlushPartialCycle();
     void TickFullCycle();
-    void FlushSaveQueue();
     void DispatchPayload(const FEntityPersistencePayload& Payload);
     void TickLoadTimeouts();
 
     static bool IsCriticalReason(ESerializationReason Reason);
+    static bool IsImmediateReason(ESerializationReason Reason);
 
     void LogWarning(const FString& Message);
     void LogError(const FString& Message);
@@ -233,10 +217,6 @@ void UPersistenceSubsystem::Initialize(FSubsystemCollectionBase& Collection)
         &UPersistenceSubsystem::FlushSaveCycle,
         SaveInterval, true);
 
-    TM.SetTimer(DBFlushTimer, this,
-        &UPersistenceSubsystem::FlushSaveQueue,
-        DBFlushInterval, true);
-
     TM.SetTimer(LoadTimeoutTimer, this,
         &UPersistenceSubsystem::TickLoadTimeouts,
         5.f, true);
@@ -255,12 +235,10 @@ void UPersistenceSubsystem::FlushSaveCycle()
 
     if (bFullSave)
     {
-        // Snapshot entity list and begin spreading across ticks
         RegisteredEntities.GetKeys(FullCycleEntitySnapshot);
         FullCycleCursorIndex = 0;
         bFullCycleInProgress = true;
 
-        // Fire every frame until complete
         GetWorld()->GetTimerManager().SetTimer(
             FullCycleTickTimer, this,
             &UPersistenceSubsystem::TickFullCycle,
@@ -281,7 +259,6 @@ void UPersistenceSubsystem::FlushSaveCycle()
 void UPersistenceSubsystem::TickFullCycle()
 {
     int32 Processed = 0;
-    TArray<FEntityPersistencePayload> ReadyPayloads;
 
     while (FullCycleCursorIndex < FullCycleEntitySnapshot.Num()
            && Processed < ActorsPerFlushTick)
@@ -291,15 +268,15 @@ void UPersistenceSubsystem::TickFullCycle()
         if (!RegCompPtr || !RegCompPtr->IsValid()) continue;
 
         FEntityPersistencePayload Payload = RegCompPtr->Get()->BuildPayload(true);
-        Payload.PayloadType = EPayloadType::Full;
-        Payload.SaveReason  = ESerializationReason::Periodic;
-        ReadyPayloads.Add(MoveTemp(Payload));
+        Payload.PayloadType       = EPayloadType::Full;
+        Payload.SaveReason        = ESerializationReason::Periodic;
+        Payload.bCritical         = false;
+        Payload.bFlushImmediately = false;
         DirtySet.Remove(ID);
         Processed++;
-    }
 
-    for (auto& Payload : ReadyPayloads)
         DispatchPayload(Payload);
+    }
 
     if (FullCycleCursorIndex >= FullCycleEntitySnapshot.Num())
     {
@@ -317,7 +294,6 @@ void UPersistenceSubsystem::TickFullCycle()
 ```cpp
 void UPersistenceSubsystem::FlushPartialCycle()
 {
-    TArray<FEntityPersistencePayload> ReadyPayloads;
     TArray<FGuid> ToRemove;
     int32 Processed = 0;
 
@@ -333,17 +309,17 @@ void UPersistenceSubsystem::FlushPartialCycle()
         }
 
         FEntityPersistencePayload Payload = RegCompPtr->Get()->BuildPayload(false);
-        Payload.PayloadType = EPayloadType::Partial;
-        Payload.SaveReason  = ESerializationReason::Periodic;
-        ReadyPayloads.Add(MoveTemp(Payload));
+        Payload.PayloadType       = EPayloadType::Partial;
+        Payload.SaveReason        = ESerializationReason::Periodic;
+        Payload.bCritical         = false;
+        Payload.bFlushImmediately = false;
         ToRemove.Add(ID);
+
+        DispatchPayload(Payload);
     }
 
     for (const FGuid& ID : ToRemove)
         DirtySet.Remove(ID);
-
-    for (auto& Payload : ReadyPayloads)
-        DispatchPayload(Payload);
 }
 ```
 
@@ -351,7 +327,22 @@ void UPersistenceSubsystem::FlushPartialCycle()
 
 ## RequestFullSave — Single Actor Event
 
+For critical reasons (Logout, ZoneTransfer, ServerShutdown), sets `bCritical = true` on the payload so the DB service places it in its priority lane. For Logout and ServerShutdown, also sets `bFlushImmediately = true` to bypass the DB queue entirely.
+
 ```cpp
+bool UPersistenceSubsystem::IsCriticalReason(ESerializationReason Reason)
+{
+    return Reason == ESerializationReason::Logout
+        || Reason == ESerializationReason::ZoneTransfer
+        || Reason == ESerializationReason::ServerShutdown;
+}
+
+bool UPersistenceSubsystem::IsImmediateReason(ESerializationReason Reason)
+{
+    return Reason == ESerializationReason::Logout
+        || Reason == ESerializationReason::ServerShutdown;
+}
+
 void UPersistenceSubsystem::RequestFullSave(AActor* Entity,
     ESerializationReason Reason)
 {
@@ -360,16 +351,13 @@ void UPersistenceSubsystem::RequestFullSave(AActor* Entity,
     if (!RegComp) return;
 
     FEntityPersistencePayload Payload = RegComp->BuildPayload(true);
-    Payload.PayloadType = EPayloadType::Full;
-    Payload.SaveReason  = Reason;
+    Payload.PayloadType       = EPayloadType::Full;
+    Payload.SaveReason        = Reason;
+    Payload.bCritical         = IsCriticalReason(Reason);
+    Payload.bFlushImmediately = IsImmediateReason(Reason);
 
-    MoveToSaveQueue(RegComp->GetEntityGUID(), MoveTemp(Payload));
-
-    if (Reason == ESerializationReason::Logout ||
-        Reason == ESerializationReason::ServerShutdown)
-    {
-        FlushSaveQueue(); // Drain immediately
-    }
+    DirtySet.Remove(RegComp->GetEntityGUID());
+    DispatchPayload(Payload);
 }
 ```
 
@@ -377,7 +365,7 @@ void UPersistenceSubsystem::RequestFullSave(AActor* Entity,
 
 ## RequestShutdownSave — All Actors
 
-Synchronous. Cancels all timers and serializes everything immediately. Drains both queues.
+Synchronous. Cancels all timers and serializes everything immediately. All payloads are marked `bCritical = true` and `bFlushImmediately = true`.
 
 ```cpp
 void UPersistenceSubsystem::RequestShutdownSave()
@@ -394,100 +382,15 @@ void UPersistenceSubsystem::RequestShutdownSave()
         if (!RegCompPtr.IsValid()) continue;
 
         FEntityPersistencePayload Payload = RegCompPtr->BuildPayload(true);
-        Payload.PayloadType = EPayloadType::Full;
-        Payload.SaveReason  = ESerializationReason::ServerShutdown;
+        Payload.PayloadType       = EPayloadType::Full;
+        Payload.SaveReason        = ESerializationReason::ServerShutdown;
+        Payload.bCritical         = true;
+        Payload.bFlushImmediately = true;
 
-        // Always goes to priority queue on shutdown
-        PrioritySaveQueue.Add(ID, MoveTemp(Payload));
+        DispatchPayload(Payload);
     }
-
-    // Drain priority first, then normal
-    for (auto& [ID, Payload] : PrioritySaveQueue)
-        DispatchPayload(Payload);
-    PrioritySaveQueue.Empty();
-
-    for (auto& [ID, Payload] : SaveQueue)
-        DispatchPayload(Payload);
-    SaveQueue.Empty();
 
     DirtySet.Empty();
-}
-```
-
----
-
-## MoveToSaveQueue — Priority vs Normal
-
-Critical reasons (`Logout`, `ZoneTransfer`, `ServerShutdown`) are never dropped and go to `PrioritySaveQueue`. All other reasons respect the `MaxSaveQueueSize` cap.
-
-`PrioritySaveQueue` is keyed by `EntityId` — a newer save for the same entity overwrites the older one. This is intentional: we always want the most recent state of an entity, not duplicate saves.
-
-```cpp
-bool UPersistenceSubsystem::IsCriticalReason(ESerializationReason Reason)
-{
-    return Reason == ESerializationReason::Logout
-        || Reason == ESerializationReason::ZoneTransfer
-        || Reason == ESerializationReason::ServerShutdown;
-}
-
-void UPersistenceSubsystem::MoveToSaveQueue(FGuid EntityId,
-    FEntityPersistencePayload Payload)
-{
-    DirtySet.Remove(EntityId);
-
-    if (IsCriticalReason(Payload.SaveReason))
-    {
-        // Critical: always accepted, overwrites duplicate if re-queued
-        PrioritySaveQueue.Add(EntityId, MoveTemp(Payload));
-        return;
-    }
-
-    if (SaveQueue.Num() >= MaxSaveQueueSize)
-    {
-        LogWarning(FString::Printf(
-            TEXT("SaveQueue at capacity (%d). Non-critical payload for [%s] dropped."),
-            MaxSaveQueueSize, *EntityId.ToString()));
-        return;
-    }
-
-    SaveQueue.Add(EntityId, MoveTemp(Payload));
-
-    // Pressure flush: if SaveQueue crosses the threshold, drain immediately
-    // rather than waiting for the next DBFlushInterval tick.
-    const int32 Threshold = FMath::FloorToInt(MaxSaveQueueSize * DBFlushThresholdPercent);
-    if (SaveQueue.Num() >= Threshold)
-        FlushSaveQueue();
-}
-```
-
----
-
-## FlushSaveQueue — Priority-First Drain with Chunking
-
-Drains all priority entries first (always fully), then normal entries up to `MaxPayloadsPerDBFlush` per call. If normal entries remain after the budget is exhausted, the timer fires again next interval to continue draining.
-
-Called periodically by `DBFlushTimer` and immediately by the pressure-flush path in `MoveToSaveQueue`.
-
-```cpp
-void UPersistenceSubsystem::FlushSaveQueue()
-{
-    if (PrioritySaveQueue.IsEmpty() && SaveQueue.IsEmpty()) return;
-
-    // Priority payloads — always fully drained, no budget limit
-    for (auto It = PrioritySaveQueue.CreateIterator(); It; ++It)
-    {
-        DispatchPayload(It->Value);
-        It.RemoveCurrent();
-    }
-
-    // Normal payloads — respect MaxPayloadsPerDBFlush budget
-    int32 Dispatched = 0;
-    for (auto It = SaveQueue.CreateIterator(); It && Dispatched < MaxPayloadsPerDBFlush; ++It)
-    {
-        DispatchPayload(It->Value);
-        It.RemoveCurrent();
-        ++Dispatched;
-    }
 }
 ```
 
@@ -543,7 +446,6 @@ void UPersistenceSubsystem::OnRawPayloadReceived(AActor* Actor,
     }
 }
 
-// Transport calls this when a DB fetch fails.
 void UPersistenceSubsystem::OnLoadFailed(FGuid EntityId)
 {
     if (auto* Request = LoadCallbacks.Find(EntityId))
@@ -584,8 +486,6 @@ void UPersistenceSubsystem::TickLoadTimeouts()
     }
 }
 ```
-
-> The game module defines what `OnComplete(false)` does — kick the player, show an error screen, queue a retry. The subsystem guarantees the callback always fires.
 
 ---
 
@@ -628,22 +528,6 @@ Subsystem->GetSaveDelegate(TAG_Persistence_Entity_Player)
 
 ---
 
-## Logging Helper
-
-```cpp
-void UPersistenceSubsystem::LogWarning(const FString& Message)
-{
-    if (auto* Backend = GetGameInstance()->GetSubsystem<UGameCoreBackendSubsystem>())
-        Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message);
-    else
-        UE_LOG(LogPersistence, Warning, TEXT("%s"), *Message);
-}
-```
-
-> `GetLogging()` never returns null — it returns `FNullLoggingService` if not connected. The outer `if` guards against `UGameCoreBackendSubsystem` not being present at all (e.g. client builds or PIE).
-
----
-
 ## ESerializationReason & EPayloadType
 
 ```cpp
@@ -651,10 +535,10 @@ UENUM()
 enum class ESerializationReason : uint8
 {
     Periodic,        // Timer-driven cycle
-    ZoneTransfer,    // Actor moving between servers — always Full, never dropped
-    Logout,          // Player disconnect — always Full, immediate flush, never dropped
+    ZoneTransfer,    // Actor moving between servers — bCritical=true
+    Logout,          // Player disconnect — bCritical=true, bFlushImmediately=true
     CriticalEvent,   // Explicit trigger — game-defined
-    ServerShutdown,  // Server shutting down — all actors, synchronous, never dropped
+    ServerShutdown,  // Server shutting down — bCritical=true, bFlushImmediately=true
 };
 
 UENUM()
@@ -691,8 +575,36 @@ struct GAMECORE_API FEntityPersistencePayload
     EPayloadType              PayloadType  = EPayloadType::Partial;
     ESerializationReason      SaveReason   = ESerializationReason::Periodic;
     int64                     Timestamp    = 0;
+
+    // Set by UPersistenceSubsystem based on ESerializationReason.
+    // Forwarded to IKeyStorageService::Set as call parameters.
+    bool bCritical         = false; // Place in DB service priority lane — never dropped
+    bool bFlushImmediately = false; // Bypass DB queue, dispatch synchronously
+
     TArray<FComponentPersistenceBlob> Components;
 };
+```
+
+---
+
+## Dirty Flag & Generation Counter
+
+The dirty flag is linked to **serialization time**, not save time. When `BuildPayload` runs it captures the current `SaveGeneration`. If a component is dirtied again while its payload is in the DB service's write-behind queue, `DirtyGeneration` advances and the component remains dirty for the next save cycle. The subsystem never needs a "save confirmed" callback from the DB service to maintain correctness.
+
+See `IPersistableComponent` → `ClearIfSaved(uint32 FlushedGeneration)` for the generation counter contract.
+
+---
+
+## Logging Helper
+
+```cpp
+void UPersistenceSubsystem::LogWarning(const FString& Message)
+{
+    if (auto* Backend = GetGameInstance()->GetSubsystem<UGameCoreBackendSubsystem>())
+        Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message);
+    else
+        UE_LOG(LogPersistence, Warning, TEXT("%s"), *Message);
+}
 ```
 
 ---
@@ -716,12 +628,12 @@ GameCore/
 
 - `ActorsPerFlushTick` applies to **both** partial and full cycles. Full cycles snapshot `RegisteredEntities` at cycle start and spread across frames via `FullCycleTickTimer`.
 - If a new actor registers mid-full-cycle it will be picked up on the next full cycle — this is acceptable.
-- `RequestShutdownSave` is synchronous and bypasses the tick budget. Transport bindings must handle synchronous dispatch.
-- `PrioritySaveQueue` is keyed by `EntityId` — a newer save for the same entity overwrites the older one. This is intentional. The queue is logically bounded by the number of concurrently connected players.
+- `RequestShutdownSave` is synchronous. All payloads are dispatched with `bFlushImmediately = true` so the DB service does not queue them — they go directly to the backend.
 - `LoadTimeoutSeconds` should exceed the worst-case DB round-trip. Default 30s is conservative.
 - `SaveCounter` is `uint32` and wraps at ~4 billion cycles. At one cycle per 300s this is ~40,000 years.
-- `ServerInstanceId` must be set via `DefaultGame.ini` or a `UGameInstance` override before `Initialize()`. If unset, a `UE_LOG Error` is emitted — payloads without a stable ID cannot be deduplicated across server restarts.
+- `ServerInstanceId` must be set via `DefaultGame.ini` or a `UGameInstance` override before `Initialize()`. If unset, a `UE_LOG Error` is emitted.
 - Only one transport layer should bind per tag's `OnLoadRequested` — multiple bindings cause duplicate fetch attempts.
+- The subsystem has no save queue, no DB flush timer, and no priority queue. All of that is owned by `IKeyStorageService`.
 
 ---
 
@@ -730,5 +642,5 @@ GameCore/
 - Per-tag `ActorsPerFlushTick` budgets to prevent player saves being starved by mobs
 - `CriticalEvent` component key filter on `RequestFullSave`
 - PIE teardown guard in `EndPlay`
-- Metrics hooks: payload size, queue depth, flush latency, dropped payload counter
-- Load retry logic — currently `OnComplete(false)` fires and game module must handle retry; a built-in retry with backoff could be added here
+- Metrics hooks: payload size, flush latency, dropped payload counter
+- Load retry logic — currently `OnComplete(false)` fires and game module must handle retry
