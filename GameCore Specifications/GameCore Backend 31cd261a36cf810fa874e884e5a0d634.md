@@ -18,16 +18,14 @@ The subsystem is **server-only** by default via `ShouldCreateSubsystem`.
 
 **All GameCore plugin code accesses backend services exclusively via `FGameCoreBackend`**, the static facade that sits in front of this subsystem. Direct `GetSubsystem<UGameCoreBackendSubsystem>()` calls are not permitted inside the plugin.
 
-Plugin systems use **tag-based accessors** — they pass their own `FGameplayTag` and routing is resolved automatically. Game module wiring code uses **FName-based accessors** to register and explicitly target specific instances.
+All four service types use the same **tag-based accessors** — plugin systems pass their own `FGameplayTag` and routing is resolved automatically. Game module wiring code uses **FName-based accessors** to register and explicitly target specific instances.
 
 ```cpp
 // Plugin system (tag-based — no backend name knowledge required)
 #include "Backend/GameCoreBackend.h"
+FGameCoreBackend::GetLogging(TAG_Log_Persistence)->LogWarning(TEXT("Persistence"), Message);
 FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)->Set(...);
 FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(...);
-
-// Logging is always FName-based — one logger for all systems
-FGameCoreBackend::GetLogging()->LogWarning(TEXT("MySystem"), Message);
 ```
 
 See the **FGameCoreBackend** sub-page for full specification.
@@ -64,7 +62,7 @@ GameCore/
 
 ## Named Service Model
 
-Services are registered under `FName` keys. `FName` remains the internal identifier for backend instances. `FGameplayTag` is the **routing key** that systems use — the subsystem resolves tag → name transparently.
+Services are registered under `FName` keys. `FName` remains the internal identifier for backend instances. `FGameplayTag` is the **routing key** that systems use — the subsystem resolves tag → name transparently. This applies uniformly to all four service types.
 
 **Recommended FName key conventions:**
 
@@ -75,6 +73,7 @@ Services are registered under `FName` keys. `FName` remains the internal identif
 | `"EconomyDB"` | Market, currency, trades |
 | `"Security"` | Anti-cheat audit stream |
 | `"Gameplay"` | Quest, progression audit stream |
+| `"SecurityLog"` | Dedicated security log sink (optional) |
 
 ---
 
@@ -105,14 +104,16 @@ public:
 
     // --- Tag Routing Registration ---
     // Map a FGameplayTag to a named backend instance.
-    // After this, FGameCoreBackend::GetKeyStorage(Tag) resolves to the named instance.
+    // After this, FGameCoreBackend::GetX(Tag) resolves to the named instance.
     // Call from GameInstance::Init alongside service registration.
     // Unmapped tags resolve to NAME_None (the default service).
+    void MapTagToLogging     (FGameplayTag Tag, FName Key);
     void MapTagToKeyStorage  (FGameplayTag Tag, FName Key);
     void MapTagToQueryStorage(FGameplayTag Tag, FName Key);
     void MapTagToAudit       (FGameplayTag Tag, FName Key);
 
     // --- Tag Resolution (used internally by FGameCoreBackend) ---
+    FName ResolveLoggingTag     (FGameplayTag Tag) const;
     FName ResolveKeyStorageTag  (FGameplayTag Tag) const;
     FName ResolveQueryStorageTag(FGameplayTag Tag) const;
     FName ResolveAuditTag       (FGameplayTag Tag) const;
@@ -142,7 +143,7 @@ private:
     TMap<FGameplayTag, FName> KeyStorageRoutes;
     TMap<FGameplayTag, FName> QueryStorageRoutes;
     TMap<FGameplayTag, FName> AuditRoutes;
-    // Note: No LoggingRoutes — logging always uses a single named instance (NAME_None default).
+    TMap<FGameplayTag, FName> LoggingRoutes;
 
     // --- Null Fallbacks ---
     TUniquePtr<FNullKeyStorageService>   NullKeyStorage;
@@ -157,26 +158,26 @@ private:
 ## Tag Resolution Implementation
 
 ```cpp
-FName UGameCoreBackendSubsystem::ResolveKeyStorageTag(FGameplayTag Tag) const
+FName UGameCoreBackendSubsystem::ResolveLoggingTag(FGameplayTag Tag) const
 {
-    const FName* Found = KeyStorageRoutes.Find(Tag);
+    const FName* Found = LoggingRoutes.Find(Tag);
     return Found ? *Found : NAME_None;
 }
-// Same pattern for ResolveQueryStorageTag(), ResolveAuditTag()
+// Same pattern for ResolveKeyStorageTag(), ResolveQueryStorageTag(), ResolveAuditTag()
 ```
 
-Resolution is **exact-match only** — O(1) `TMap` lookup. `TAG_Persistence_Entity_Player` and `TAG_Persistence_Entity_Player_Inventory` are independent entries. Register each tag that needs non-default routing explicitly.
+Resolution is **exact-match only** — O(1) `TMap` lookup. Register each tag that needs non-default routing explicitly.
 
 ---
 
 ## Tag Routing Registration
 
 ```cpp
-void UGameCoreBackendSubsystem::MapTagToKeyStorage(FGameplayTag Tag, FName Key)
+void UGameCoreBackendSubsystem::MapTagToLogging(FGameplayTag Tag, FName Key)
 {
-    KeyStorageRoutes.Add(Tag, Key);
+    LoggingRoutes.Add(Tag, Key);
 }
-// Same pattern for MapTagToQueryStorage(), MapTagToAudit()
+// Same pattern for MapTagToKeyStorage(), MapTagToQueryStorage(), MapTagToAudit()
 ```
 
 ---
@@ -184,14 +185,14 @@ void UGameCoreBackendSubsystem::MapTagToKeyStorage(FGameplayTag Tag, FName Key)
 ## Accessors — Fallback Logic
 
 ```cpp
-IAuditService* UGameCoreBackendSubsystem::GetAudit(FName Key) const
+ILoggingService* UGameCoreBackendSubsystem::GetLogging(FName Key) const
 {
-    const auto* Entry = AuditServices.Find(Key);
-    if (Entry && ConnectedAudit.Contains(Key))
+    const auto* Entry = LoggingServices.Find(Key);
+    if (Entry && ConnectedLogging.Contains(Key))
         return Entry->GetInterface();
-    return NullAudit.Get();
+    return NullLogging.Get();
 }
-// Same pattern for GetKeyStorage(), GetQueryStorage(), GetLogging()
+// Same pattern for GetKeyStorage(), GetQueryStorage(), GetAudit()
 ```
 
 ---
@@ -245,6 +246,7 @@ void UGameCoreBackendSubsystem::Deinitialize()
     KeyStorageRoutes.Empty();
     QueryStorageRoutes.Empty();
     AuditRoutes.Empty();
+    LoggingRoutes.Empty();
 }
 ```
 
@@ -276,18 +278,19 @@ void UMyGameInstance::Init()
     auto* Backend = GetSubsystem<UGameCoreBackendSubsystem>();
 
     // 1. Register backend instances
-    Backend->RegisterKeyStorageService(TEXT("PlayerDB"),  PlayerRedis,  PlayerDbConfig);
-    Backend->RegisterKeyStorageService(TEXT("EconomyDB"), EconomyRedis, EconomyDbConfig);
+    Backend->RegisterKeyStorageService(TEXT("PlayerDB"),   PlayerRedis,     PlayerDbConfig);
+    Backend->RegisterKeyStorageService(TEXT("EconomyDB"),  EconomyRedis,    EconomyDbConfig);
     Backend->RegisterQueryStorageService(TEXT("EconomyDB"), EconomyPostgres, TEXT("postgres://..."));
-    Backend->RegisterAuditService(TEXT("Security"), SecurityAudit, TEXT("postgres://audit-host/security"));
-    Backend->RegisterAuditService(TEXT("Gameplay"), GameplayAudit, TEXT("postgres://audit-host/gameplay"));
-    Backend->RegisterLoggingService(NAME_None, MyDatadogLogger, LogConfig);
+    Backend->RegisterAuditService(TEXT("Security"),  SecurityAudit,  TEXT("postgres://audit-host/security"));
+    Backend->RegisterAuditService(TEXT("Gameplay"),  GameplayAudit,  TEXT("postgres://audit-host/gameplay"));
+    Backend->RegisterLoggingService(NAME_None,        MyDatadogLogger, LogConfig);         // default logger
+    Backend->RegisterLoggingService(TEXT("SecurityLog"), SecurityLogger, SecurityLogConfig); // optional dedicated sink
 
-    // 2. Register tag routes — plugin systems now route automatically
-    // Persistence
-    Backend->MapTagToKeyStorage(TAG_Persistence_Entity_Player,    TEXT("PlayerDB"));
-    Backend->MapTagToKeyStorage(TAG_Persistence_Entity_Quest,     TEXT("PlayerDB"));  // same instance, different namespace
-    Backend->MapTagToKeyStorage(TAG_Persistence_Economy_Listing,  TEXT("EconomyDB"));
+    // 2. Register tag routes — all four service types
+    // Key storage
+    Backend->MapTagToKeyStorage(TAG_Persistence_Entity_Player,   TEXT("PlayerDB"));
+    Backend->MapTagToKeyStorage(TAG_Persistence_Entity_Quest,    TEXT("PlayerDB"));
+    Backend->MapTagToKeyStorage(TAG_Persistence_Economy_Listing, TEXT("EconomyDB"));
 
     // Query storage
     Backend->MapTagToQueryStorage(TAG_Schema_Market_Listing, TEXT("EconomyDB"));
@@ -298,25 +301,26 @@ void UMyGameInstance::Init()
     Backend->MapTagToAudit(TAG_Audit_Market,      TEXT("Gameplay"));
     Backend->MapTagToAudit(TAG_Audit_AntiCheat,   TEXT("Security"));
 
+    // Logging (optional — unmapped tags fall back to NAME_None default logger)
+    Backend->MapTagToLogging(TAG_Log_Security, TEXT("SecurityLog"));
+
     Super::Init();
 }
 ```
 
-After `Init()`, plugin systems call:
+Plugin systems need no knowledge of this topology:
 
 ```cpp
-// UPersistenceSubsystem transport binding — now a simple one-liner, no FName needed
-Persistence->GetSaveDelegate(TAG_Persistence_Entity_Player)
-    ->AddLambda([](const FEntityPersistencePayload& Payload)
-    {
-        // Tag routing resolves "PlayerDB" automatically
-        FGameCoreBackend::GetKeyStorage(Payload.PersistenceTag)->Set(
-            Payload.PersistenceTag, Payload.EntityId, Bytes,
-            Payload.bFlushImmediately, Payload.bCritical);
-    });
+// Routes to "SecurityLog" automatically
+FGameCoreBackend::GetLogging(TAG_Log_Security)->LogError(TEXT("AntiCheat"), Details);
 
-// Any system records audit with no backend knowledge
-FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(Entry);
+// Falls back to NAME_None default logger (no explicit mapping needed)
+FGameCoreBackend::GetLogging(TAG_Log_Persistence)->LogWarning(TEXT("Persistence"), Message);
+
+// Storage and audit routing unchanged
+FGameCoreBackend::GetKeyStorage(Payload.PersistenceTag)->Set(
+    Payload.PersistenceTag, Payload.EntityId, Bytes,
+    Payload.bFlushImmediately, Payload.bCritical);
 ```
 
 ---
@@ -324,8 +328,7 @@ FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(Entry);
 ## Notes
 
 - Services must be registered **and** tag routes mapped before `Initialize` completes.
-- Unmapped tags resolve to `NAME_None` — ensure a default service is registered for `NAME_None` if unmapped tags are possible, or all calls will hit the null fallback.
+- Unmapped tags resolve to `NAME_None` — ensure a default service is registered for `NAME_None`, or all unmapped calls will hit the null fallback.
 - Tag routing is **exact-match only**. Each tag that needs non-default routing must be registered explicitly.
-- No `LoggingRoutes` map exists — logging always resolves by `FName` (`NAME_None` default). All systems share one log stream.
 - `Flush()` is called on **all** registered audit and logging services during `Deinitialize`.
 - `friend` declarations are intentional: `Connect()` is public on interfaces for technical reasons but must only be called by the subsystem.

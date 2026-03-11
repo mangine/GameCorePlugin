@@ -18,7 +18,7 @@ Without this facade, every system that needs logging must either:
 
 `FGameCoreBackend` solves this universally. One include, one line, always correct.
 
-With tag-based routing, systems also no longer need to know the `FName` key of the backend instance they should write to — they pass their own `FGameplayTag` and the routing map resolves the correct instance automatically.
+With tag-based routing, systems also no longer need to know the `FName` key of the backend instance they should write to — they pass their own `FGameplayTag` and the routing map resolves the correct instance automatically. This applies uniformly to all four service types including logging.
 
 ---
 
@@ -59,7 +59,8 @@ class IAuditService;
  * Falls back to null implementations (UE_LOG routing) when the subsystem is not live.
  *
  * Tag-based overloads resolve FGameplayTag → FName via the subsystem's routing maps.
- * Systems pass their own tag and never need to know which backend instance to use.
+ * Unregistered tags fall back to NAME_None (the default service).
+ * All four service types use the same tag-based routing pattern.
  *
  * FName overloads remain for game-module-level code that needs explicit routing.
  *
@@ -77,6 +78,7 @@ struct GAMECORE_API FGameCoreBackend
     // Resolves the FGameplayTag to an FName via the subsystem's routing map.
     // Falls back to NAME_None (the default service) if no mapping is registered for the tag.
     // Returns the null fallback if the subsystem is not live.
+    static ILoggingService*      GetLogging     (FGameplayTag Tag);
     static IKeyStorageService*   GetKeyStorage  (FGameplayTag Tag);
     static IQueryStorageService* GetQueryStorage(FGameplayTag Tag);
     static IAuditService*        GetAudit       (FGameplayTag Tag);
@@ -85,12 +87,10 @@ struct GAMECORE_API FGameCoreBackend
     // Select a specific named backend instance directly.
     // Use when the caller explicitly knows which instance it needs (e.g. GameInstance::Init wiring).
     // Falls back to the null fallback if the key is not registered or subsystem is not live.
+    static ILoggingService*      GetLogging     (FName Key = NAME_None);
     static IKeyStorageService*   GetKeyStorage  (FName Key = NAME_None);
     static IQueryStorageService* GetQueryStorage(FName Key = NAME_None);
     static IAuditService*        GetAudit       (FName Key = NAME_None);
-
-    // --- Logging (always FName-based — one logger for the whole server) ---
-    static ILoggingService*      GetLogging     (FName Key = NAME_None);
 
 private:
     // Raw pointer — lifetime is controlled by UGameCoreBackendSubsystem.
@@ -134,7 +134,17 @@ void FGameCoreBackend::Unregister()
 
 // --- Tag-based overloads ---
 // Tag → FName resolution is delegated to the subsystem's routing maps.
-// If no mapping exists for the tag, NAME_None is used, which resolves to the default service.
+// Unregistered tags resolve to NAME_None (the default service).
+
+ILoggingService* FGameCoreBackend::GetLogging(FGameplayTag Tag)
+{
+    if (Instance)
+    {
+        const FName Key = Instance->ResolveLoggingTag(Tag);
+        return Instance->GetLogging(Key);
+    }
+    return &GNullLogging;
+}
 
 IKeyStorageService* FGameCoreBackend::GetKeyStorage(FGameplayTag Tag)
 {
@@ -233,6 +243,7 @@ void UGameCoreBackendSubsystem::Deinitialize()
     KeyStorageRoutes.Empty();
     QueryStorageRoutes.Empty();
     AuditRoutes.Empty();
+    LoggingRoutes.Empty();
 }
 ```
 
@@ -240,19 +251,22 @@ void UGameCoreBackendSubsystem::Deinitialize()
 
 ## Tag Routing — How It Works
 
-The game module registers tag→name mappings on the subsystem once during `GameInstance::Init`. After that, any plugin system can call `FGameCoreBackend::GetKeyStorage(MyTag)` without knowing which backend instance it maps to.
+The game module registers tag→name mappings on the subsystem once during `GameInstance::Init`. After that, any plugin system can pass its own tag and get the correct backend instance with no knowledge of the topology.
 
 ```
-FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)
-    → Instance->ResolveKeyStorageTag(TAG_Persistence_Entity_Player)
-    → KeyStorageRoutes.Find(tag) → "PlayerDB"
-    → Instance->GetKeyStorage("PlayerDB")
-    → returns the registered Redis instance for player data
+FGameCoreBackend::GetLogging(TAG_Log_Security)
+    → Instance->ResolveLoggingTag(TAG_Log_Security)
+    → LoggingRoutes.Find(tag) → "SecurityLog"
+    → Instance->GetLogging("SecurityLog")
+    → returns the dedicated security log sink
+
+FGameCoreBackend::GetLogging(TAG_Log_Unregistered)
+    → LoggingRoutes.Find(tag) → not found → NAME_None
+    → Instance->GetLogging(NAME_None)
+    → returns the default logger
 ```
 
-If no mapping exists for the tag, `ResolveKeyStorageTag` returns `NAME_None`, which resolves to the default registered service (or the null fallback if none is registered).
-
-**Resolution is exact-match only.** `TAG_Persistence_Entity_Player` and `TAG_Persistence_Entity_Player_Inventory` are independent keys — if you want both to route to `"PlayerDB"`, register both explicitly.
+**Resolution is exact-match only** — O(1) `TMap` lookup. Each tag that needs non-default routing must be registered explicitly.
 
 ---
 
@@ -263,17 +277,14 @@ If no mapping exists for the tag, `ResolveKeyStorageTag` returns `NAME_None`, wh
 #include "Backend/GameCoreBackend.h"
 
 // Tag-based (preferred inside plugin systems — no backend name knowledge required)
+FGameCoreBackend::GetLogging(TAG_Log_Persistence)->LogWarning(TEXT("Persistence"), Message);
+FGameCoreBackend::GetLogging(TAG_Log_Security)->LogError(TEXT("AntiCheat"), Details);
 FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)->Set(TAG_Persistence_Entity_Player, EntityId, Data, false, false);
 FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(Entry);
-FGameCoreBackend::GetQueryStorage(TAG_Schema_Market_Listing)->Query(TAG_Schema_Market_Listing, Filter, Callback);
-
-// Logging always FName-based — one logger for all systems
-FGameCoreBackend::GetLogging()->LogWarning(TEXT("Persistence"), Message);
-FGameCoreBackend::GetLogging()->LogError(TEXT("Leveling"), FString::Printf(TEXT("XP overflow for %s"), *Id.ToString()));
 
 // FName-based (game module wiring code only)
+FGameCoreBackend::GetLogging(NAME_None)->LogWarning(TEXT("MySystem"), Message);
 FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(...);
-FGameCoreBackend::GetAudit(TEXT("Security"))->RecordEvent(CheatEntry);
 ```
 
 **Do not** call `GetSubsystem<UGameCoreBackendSubsystem>()` anywhere inside the GameCore plugin. Use `FGameCoreBackend` instead.
@@ -304,7 +315,7 @@ See individual service spec pages for the exact `UE_LOG` strings each null metho
 - `ILoggingService::Log()` is internally thread-safe (lock-free queue) — calling `GetLogging()` on the game thread and passing the pointer to a background thread is safe for the duration of the subsystem's lifetime
 
 **Unsafe case:**
-- Background tasks that outlive `UGameCoreBackendSubsystem::Deinitialize()` and call `FGameCoreBackend::GetLogging()` after `Unregister()` has been called. This is a lifecycle bug — tasks must complete or be cancelled before `Deinitialize` returns.
+- Background tasks that outlive `UGameCoreBackendSubsystem::Deinitialize()` and call any `FGameCoreBackend::GetX()` after `Unregister()`. This is a lifecycle bug — tasks must complete or be cancelled before `Deinitialize` returns.
 
 If a future system requires background-safe access after teardown, make `Instance` a `std::atomic<UGameCoreBackendSubsystem*>`.
 
@@ -314,5 +325,5 @@ If a future system requires background-safe access after teardown, make `Instanc
 
 - `FGameCoreBackend` has no UObject overhead — it is a plain struct with only static methods and one static pointer.
 - The static null fallbacks (`GNullLogging`, etc.) are file-scope statics in `GameCoreBackend.cpp`. They are constructed at module load and never destroyed until module unload — no order-of-destruction issues.
-- Tag routing resolution (`ResolveKeyStorageTag` etc.) is an O(1) `TMap` lookup — negligible cost.
+- Tag routing resolution is an O(1) `TMap` lookup — negligible cost.
 - This struct must **not** be used in client-side code. All backend services are server-only.
