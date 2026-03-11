@@ -18,6 +18,8 @@ Without this facade, every system that needs logging must either:
 
 `FGameCoreBackend` solves this universally. One include, one line, always correct.
 
+With tag-based routing, systems also no longer need to know the `FName` key of the backend instance they should write to — they pass their own `FGameplayTag` and the routing map resolves the correct instance automatically.
+
 ---
 
 ## File Location
@@ -42,6 +44,7 @@ Forward declarations only — no heavy includes. This header is designed to be i
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GameplayTagContainer.h"
 
 // Forward declarations — concrete types only needed in .cpp
 class UGameCoreBackendSubsystem;
@@ -55,9 +58,10 @@ class IAuditService;
  * Registered automatically by the subsystem on Initialize/Deinitialize.
  * Falls back to null implementations (UE_LOG routing) when the subsystem is not live.
  *
- * Usage:
- *   FGameCoreBackend::GetLogging()->LogWarning(TEXT("MySystem"), Message);
- *   FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(Tag, Id, Data, false, false);
+ * Tag-based overloads resolve FGameplayTag → FName via the subsystem's routing maps.
+ * Systems pass their own tag and never need to know which backend instance to use.
+ *
+ * FName overloads remain for game-module-level code that needs explicit routing.
  *
  * Never returns null. Always safe to call, including before subsystem init and during teardown.
  */
@@ -69,19 +73,29 @@ struct GAMECORE_API FGameCoreBackend
     static void Register  (UGameCoreBackendSubsystem* Subsystem);
     static void Unregister();
 
-    // --- Service Accessors ---
-    // Returns the live service for the given key, or the static null fallback.
-    // Null fallbacks route all calls to UE_LOG — see Null Fallback Behavior below.
-    static ILoggingService*      GetLogging     (FName Key = NAME_None);
+    // --- Tag-Based Accessors (preferred for plugin systems) ---
+    // Resolves the FGameplayTag to an FName via the subsystem's routing map.
+    // Falls back to NAME_None (the default service) if no mapping is registered for the tag.
+    // Returns the null fallback if the subsystem is not live.
+    static IKeyStorageService*   GetKeyStorage  (FGameplayTag Tag);
+    static IQueryStorageService* GetQueryStorage(FGameplayTag Tag);
+    static IAuditService*        GetAudit       (FGameplayTag Tag);
+
+    // --- FName-Based Accessors (for game module wiring code) ---
+    // Select a specific named backend instance directly.
+    // Use when the caller explicitly knows which instance it needs (e.g. GameInstance::Init wiring).
+    // Falls back to the null fallback if the key is not registered or subsystem is not live.
     static IKeyStorageService*   GetKeyStorage  (FName Key = NAME_None);
     static IQueryStorageService* GetQueryStorage(FName Key = NAME_None);
     static IAuditService*        GetAudit       (FName Key = NAME_None);
+
+    // --- Logging (always FName-based — one logger for the whole server) ---
+    static ILoggingService*      GetLogging     (FName Key = NAME_None);
 
 private:
     // Raw pointer — lifetime is controlled by UGameCoreBackendSubsystem.
     // Unregister() nulls this before the subsystem tears down.
     // Read is always on the game thread; no atomic needed for standard usage.
-    // See Thread Safety note below for background thread considerations.
     static UGameCoreBackendSubsystem* Instance;
 };
 ```
@@ -103,7 +117,6 @@ private:
 UGameCoreBackendSubsystem* FGameCoreBackend::Instance = nullptr;
 
 // Static null fallbacks — constructed once at module load, never destroyed until module unload.
-// These are the UE_LOG-routing implementations used whenever no live service is registered.
 static FNullLoggingService      GNullLogging;
 static FNullKeyStorageService   GNullKeyStorage;
 static FNullQueryStorageService GNullQueryStorage;
@@ -118,6 +131,42 @@ void FGameCoreBackend::Unregister()
 {
     Instance = nullptr;
 }
+
+// --- Tag-based overloads ---
+// Tag → FName resolution is delegated to the subsystem's routing maps.
+// If no mapping exists for the tag, NAME_None is used, which resolves to the default service.
+
+IKeyStorageService* FGameCoreBackend::GetKeyStorage(FGameplayTag Tag)
+{
+    if (Instance)
+    {
+        const FName Key = Instance->ResolveKeyStorageTag(Tag);
+        return Instance->GetKeyStorage(Key);
+    }
+    return &GNullKeyStorage;
+}
+
+IQueryStorageService* FGameCoreBackend::GetQueryStorage(FGameplayTag Tag)
+{
+    if (Instance)
+    {
+        const FName Key = Instance->ResolveQueryStorageTag(Tag);
+        return Instance->GetQueryStorage(Key);
+    }
+    return &GNullQueryStorage;
+}
+
+IAuditService* FGameCoreBackend::GetAudit(FGameplayTag Tag)
+{
+    if (Instance)
+    {
+        const FName Key = Instance->ResolveAuditTag(Tag);
+        return Instance->GetAudit(Key);
+    }
+    return &GNullAudit;
+}
+
+// --- FName-based overloads ---
 
 ILoggingService* FGameCoreBackend::GetLogging(FName Key)
 {
@@ -150,12 +199,17 @@ IAuditService* FGameCoreBackend::GetAudit(FName Key)
 void UGameCoreBackendSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-    FGameCoreBackend::Register(this); // ← facade goes live
+
+    NullKeyStorage   = MakeUnique<FNullKeyStorageService>();
+    NullQueryStorage = MakeUnique<FNullQueryStorageService>();
+    NullAudit        = MakeUnique<FNullAuditService>();
+    NullLogging      = MakeUnique<FNullLoggingService>();
+
+    FGameCoreBackend::Register(this);
 }
 
 void UGameCoreBackendSubsystem::Deinitialize()
 {
-    // 1. Flush all buffered services first
     for (auto& [Key, Service] : LoggingServices)
         if (ConnectedLogging.Contains(Key))
             Service.GetInterface()->Flush();
@@ -164,10 +218,8 @@ void UGameCoreBackendSubsystem::Deinitialize()
         if (ConnectedAudit.Contains(Key))
             Service.GetInterface()->Flush();
 
-    // 2. Unregister facade BEFORE clearing maps — any log calls during cleanup still resolve
-    FGameCoreBackend::Unregister(); // ← facade drops to null fallbacks
+    FGameCoreBackend::Unregister();
 
-    // 3. Clear all service maps
     KeyStorageServices.Empty();
     QueryStorageServices.Empty();
     AuditServices.Empty();
@@ -177,32 +229,50 @@ void UGameCoreBackendSubsystem::Deinitialize()
     ConnectedQueryStorage.Empty();
     ConnectedAudit.Empty();
     ConnectedLogging.Empty();
+
+    KeyStorageRoutes.Empty();
+    QueryStorageRoutes.Empty();
+    AuditRoutes.Empty();
 }
 ```
 
-**Order matters:** Flush → Unregister → Empty maps. This guarantees any `UE_LOG` or logging calls made during map teardown still resolve safely to null fallbacks rather than crashing on dangling pointers.
+---
+
+## Tag Routing — How It Works
+
+The game module registers tag→name mappings on the subsystem once during `GameInstance::Init`. After that, any plugin system can call `FGameCoreBackend::GetKeyStorage(MyTag)` without knowing which backend instance it maps to.
+
+```
+FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)
+    → Instance->ResolveKeyStorageTag(TAG_Persistence_Entity_Player)
+    → KeyStorageRoutes.Find(tag) → "PlayerDB"
+    → Instance->GetKeyStorage("PlayerDB")
+    → returns the registered Redis instance for player data
+```
+
+If no mapping exists for the tag, `ResolveKeyStorageTag` returns `NAME_None`, which resolves to the default registered service (or the null fallback if none is registered).
+
+**Resolution is exact-match only.** `TAG_Persistence_Entity_Player` and `TAG_Persistence_Entity_Player_Inventory` are independent keys — if you want both to route to `"PlayerDB"`, register both explicitly.
 
 ---
 
 ## Usage — Call Site Pattern
 
-All GameCore systems (subsystems, components, utilities) use this pattern exclusively:
-
 ```cpp
-// In any .cpp — one include, no context object required
+// In any plugin .cpp — one include, no context object required
 #include "Backend/GameCoreBackend.h"
 
-// Logging
+// Tag-based (preferred inside plugin systems — no backend name knowledge required)
+FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)->Set(TAG_Persistence_Entity_Player, EntityId, Data, false, false);
+FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(Entry);
+FGameCoreBackend::GetQueryStorage(TAG_Schema_Market_Listing)->Query(TAG_Schema_Market_Listing, Filter, Callback);
+
+// Logging always FName-based — one logger for all systems
 FGameCoreBackend::GetLogging()->LogWarning(TEXT("Persistence"), Message);
-FGameCoreBackend::GetLogging()->LogError(TEXT("Leveling"), FString::Printf(TEXT("XP overflow for entity %s"), *Id.ToString()));
+FGameCoreBackend::GetLogging()->LogError(TEXT("Leveling"), FString::Printf(TEXT("XP overflow for %s"), *Id.ToString()));
 
-// Key-value storage (named backend)
-FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(Tag, EntityId, Data, false, false);
-
-// Default key-value storage
-FGameCoreBackend::GetKeyStorage()->Set(Tag, EntityId, Data, true, true);
-
-// Audit
+// FName-based (game module wiring code only)
+FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(...);
 FGameCoreBackend::GetAudit(TEXT("Security"))->RecordEvent(CheatEntry);
 ```
 
@@ -219,7 +289,7 @@ When `Instance` is null (subsystem not initialized, or already deinitialized), a
 | `ILoggingService` | `FNullLoggingService` | Maps `ELogSeverity` → `UE_LOG(LogGameCore, ...)` |
 | `IKeyStorageService` | `FNullKeyStorageService` | `UE_LOG(LogGameCore, Warning, ...)` per call |
 | `IQueryStorageService` | `FNullQueryStorageService` | `UE_LOG(LogGameCore, Warning, ...)` per call |
-| `IAuditService` | `FNullAuditService` | `UE_LOG(LogGameCore, Warning, ...)` per call |
+| `IAuditService` | `FNullAuditService` | `UE_LOG(LogGameCore, Log, ...)` per event |
 
 See individual service spec pages for the exact `UE_LOG` strings each null method emits.
 
@@ -244,4 +314,5 @@ If a future system requires background-safe access after teardown, make `Instanc
 
 - `FGameCoreBackend` has no UObject overhead — it is a plain struct with only static methods and one static pointer.
 - The static null fallbacks (`GNullLogging`, etc.) are file-scope statics in `GameCoreBackend.cpp`. They are constructed at module load and never destroyed until module unload — no order-of-destruction issues.
-- This struct must **not** be used in client-side code. All backend services are server-only. `UGameCoreBackendSubsystem::ShouldCreateSubsystem` enforces this at the subsystem level; `FGameCoreBackend::Instance` will be null on clients naturally.
+- Tag routing resolution (`ResolveKeyStorageTag` etc.) is an O(1) `TMap` lookup — negligible cost.
+- This struct must **not** be used in client-side code. All backend services are server-only.
