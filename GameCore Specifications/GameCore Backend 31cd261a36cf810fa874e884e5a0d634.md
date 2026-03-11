@@ -2,21 +2,40 @@
 
 **Module:** `GameCore`
 **Location:** `GameCore/Source/GameCore/Backend/`
-**Type:** `UGameInstanceSubsystem`
+**Type:** `UGameInstanceSubsystem` + static facade
 
 Central subsystem for all external backend service integrations. Manages the lifecycle of **named service instances** across four interface types: key-value storage, query storage, audit, and logging. Acts as the single injection point for backend transport implementations — GameCore itself has **no knowledge of concrete backends** (Redis, Postgres, Datadog, etc.).
 
 Multiple named instances of any service type are supported. This allows different game systems to route to distinct backends — for example, a `"PlayerDB"` and an `"EconomyDB"` key-value store, or a `"Security"` and a `"Gameplay"` audit service.
 
-All service types fall back to safe null implementations when not registered or not connected. Accessors never return null.
+All service types fall back to safe null implementations when not registered or not connected. Null implementations route all calls to `UE_LOG` so nothing is silently swallowed. Accessors never return null.
 
 The subsystem is **server-only** by default via `ShouldCreateSubsystem`.
 
 ---
 
+## Access Pattern — FGameCoreBackend
+
+**All GameCore plugin code accesses backend services exclusively via `FGameCoreBackend`**, the static facade that sits in front of this subsystem. Direct `GetSubsystem<UGameCoreBackendSubsystem>()` calls are not permitted inside the plugin.
+
+```cpp
+// Any .cpp in the plugin — one include, no context object
+#include "Backend/GameCoreBackend.h"
+
+FGameCoreBackend::GetLogging()->LogWarning(TEXT("MySystem"), Message);
+FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(Tag, Id, Data, false, false);
+FGameCoreBackend::GetAudit(TEXT("Security"))->RecordEvent(Entry);
+```
+
+See the **FGameCoreBackend** sub-page for full specification.
+
+---
+
 ## Sub-pages
 
-- IDBService
+- [FGameCoreBackend](GameCore%20Backend/FGameCoreBackend.md) — static facade, usage patterns, null fallback behavior
+- IKeyStorageService
+- IQueryStorageService
 - IAuditService
 - ILoggingService
 
@@ -29,8 +48,11 @@ GameCore/
 └── Source/
     └── GameCore/
         └── Backend/
+            ├── GameCoreBackend.h       ← Static facade (new — HAP-6)
+            ├── GameCoreBackend.cpp     ← Static facade impl + null fallback statics
             ├── BackendSubsystem.h/.cpp
-            ├── DBService.h
+            ├── KeyStorageService.h
+            ├── QueryStorageService.h
             ├── AuditService.h
             └── LoggingService.h
 ```
@@ -84,7 +106,7 @@ public:
 
     // --- Service Accessors ---
     // Returns the named service, or the null fallback if not registered / not connected.
-    // Never returns null.
+    // Never returns null. Null fallbacks route to UE_LOG.
     IKeyStorageService*   GetKeyStorage  (FName Key = NAME_None) const;
     IQueryStorageService* GetQueryStorage(FName Key = NAME_None) const;
     IAuditService*        GetAudit       (FName Key = NAME_None) const;
@@ -101,7 +123,8 @@ private:
     TSet<FName> ConnectedAudit;
     TSet<FName> ConnectedLogging;
 
-    // Null fallbacks — always valid, route to UE_LOG or no-op
+    // Null fallbacks — always valid, route all calls to UE_LOG.
+    // Owned by the subsystem; also referenced as static fallbacks in GameCoreBackend.cpp.
     TUniquePtr<FNullKeyStorageService>   NullKeyStorage;
     TUniquePtr<FNullQueryStorageService> NullQueryStorage;
     TUniquePtr<FNullAuditService>        NullAudit;
@@ -147,21 +170,49 @@ Register services from your game's `UGameInstance::Init` **before** `Super::Init
 
 ---
 
-## Deinitialize — Graceful Shutdown
+## Initialize — FGameCoreBackend Registration
 
-`Deinitialize` calls `Flush()` on **all** registered buffered services (audit and logging) before tearing down. This guarantees no in-flight events are lost on shutdown regardless of how many named services are registered.
+`Initialize` registers `this` with `FGameCoreBackend` so all plugin code can access services via the static facade immediately after the subsystem comes online.
+
+```cpp
+void UGameCoreBackendSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
+
+    // Bring null fallbacks online before registering —
+    // so any log call that happens during service registration is already safe.
+    NullKeyStorage   = MakeUnique<FNullKeyStorageService>();
+    NullQueryStorage = MakeUnique<FNullQueryStorageService>();
+    NullAudit        = MakeUnique<FNullAuditService>();
+    NullLogging      = MakeUnique<FNullLoggingService>();
+
+    // Register the static facade — from this point, FGameCoreBackend::GetLogging() etc. are live.
+    FGameCoreBackend::Register(this);
+}
+```
+
+---
+
+## Deinitialize — Ordered Shutdown
+
+Shutdown order is critical. Flush first, unregister the facade second, clear maps last. Any logging that happens during map teardown still resolves safely to null fallbacks via the static statics in `GameCoreBackend.cpp`.
 
 ```cpp
 void UGameCoreBackendSubsystem::Deinitialize()
 {
-    for (auto& [Key, Service] : AuditServices)
-        if (ConnectedAudit.Contains(Key))
-            Service.GetInterface()->Flush();
-
+    // 1. Flush all buffered services — no data loss on shutdown
     for (auto& [Key, Service] : LoggingServices)
         if (ConnectedLogging.Contains(Key))
             Service.GetInterface()->Flush();
 
+    for (auto& [Key, Service] : AuditServices)
+        if (ConnectedAudit.Contains(Key))
+            Service.GetInterface()->Flush();
+
+    // 2. Unregister facade — FGameCoreBackend::GetX() now routes to static null fallbacks in .cpp
+    FGameCoreBackend::Unregister();
+
+    // 3. Clear service maps
     KeyStorageServices.Empty();
     QueryStorageServices.Empty();
     AuditServices.Empty();
@@ -192,7 +243,7 @@ bool UGameCoreBackendSubsystem::ShouldCreateSubsystem(UObject* Outer) const
 
 ---
 
-## Usage Example — Multi-Backend Wiring
+## Usage Example — Multi-Backend Wiring (Game Module)
 
 ```cpp
 void UMyGameInstance::Init()
@@ -217,21 +268,18 @@ void UMyGameInstance::Init()
 
     Super::Init();
 }
-
-// Callers select the right backend by name:
-Backend->GetKeyStorage(TEXT("EconomyDB"))->Set(Key, Value);
-Backend->GetAudit(TEXT("Security"))->RecordEvent(CheatEntry);
-Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message); // resolves NAME_None
 ```
+
+After this, all GameCore plugin systems automatically route through `FGameCoreBackend` with no additional wiring required.
 
 ---
 
 ## Notes
 
-- Services must be registered **before** `Initialize` is called. The subsystem does not retry connections.
-- All accessors (`GetAudit`, `GetLogging`, etc.) are always safe to call — they never return null.
-- `NAME_None` is the conventional key for the single general-purpose instance of a service type. Use a consistent convention per service type across the project.
-- `Flush()` is called on **all** registered audit and logging services during `Deinitialize` — not just `NAME_None`. Every named instance is flushed.
+- Services must be registered **before** `Initialize` completes. The subsystem does not retry connections.
+- All `FGameCoreBackend::GetX()` calls are always safe — they never return null before, during, or after the subsystem's lifetime.
+- `NAME_None` is the conventional key for the single general-purpose instance of a service type.
+- `Flush()` is called on **all** registered audit and logging services during `Deinitialize` — not just `NAME_None`.
 - `IKeyStorageService` and `IQueryStorageService` do not buffer — no `Flush()` call is needed for them on shutdown.
-- `friend` declarations are intentional: `Connect()` is public on each interface for technical reasons but callers outside the subsystem must not call it directly.
-- In PIE, `ShouldCreateSubsystem` may return false depending on net mode. Use a dedicated server PIE configuration for local backend testing.
+- `friend` declarations on the subsystem are intentional: `Connect()` is technically public on each interface but must only be called by the subsystem.
+- In PIE, `ShouldCreateSubsystem` may return false depending on net mode. `FGameCoreBackend::Instance` will be null on clients — all calls transparently fall through to `UE_LOG` null fallbacks.
