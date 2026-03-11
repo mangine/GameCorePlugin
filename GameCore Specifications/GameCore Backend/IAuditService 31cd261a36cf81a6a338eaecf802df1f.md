@@ -1,7 +1,6 @@
 # IAuditService
 
 **Module:** `GameCore`
-
 **Location:** `GameCore/Source/GameCore/Backend/AuditService.h`
 
 Interface for recording immutable, auditable game events into an append-only backend. Used by any system that requires anti-cheat validation, exploit investigation, or rollback tooling — progression, market, inventory, trades, currency changes, etc.
@@ -91,7 +90,7 @@ class GAMECORE_API IAuditService
     GENERATED_BODY()
 
 public:
-    // Called only by UGameCoreBackendSubsystem during registration
+    // Called only by UGameCoreBackendSubsystem during registration.
     virtual bool Connect(const FString& ConnectionString) = 0;
 
     // Flush all pending events immediately — must be called on graceful shutdown.
@@ -117,15 +116,17 @@ public:
 
 ## FAuditServiceBase
 
-Abstract C++ base class (not a UInterface) that all concrete audit backends extend. Owns the write-behind queue, ServerId hold logic, flush timer, and transactional group tracking. Implementors only override `DispatchBatch`.
+Abstract C++ base class that all concrete audit backends extend. Owns the write-behind queue, ServerId hold logic, flush timer, and transactional group tracking. Implementors only override `DispatchBatch`.
 
 ```cpp
 class GAMECORE_API FAuditServiceBase : public IAuditService
 {
 public:
     // --- Configuration (set before Connect) ---
-    float FlushIntervalSeconds = 2.0f;
-    int32 MaxQueueSize         = 10000; // Cap + warn on overflow — oldest entries dropped
+    float FlushIntervalSeconds  = 2.0f;
+    int32 MaxQueueSize          = 10000;  // Hard cap — oldest entries dropped on overflow
+    float FlushThresholdPercent = 0.75f;  // Pressure flush: immediate flush when queue reaches this fill ratio
+    int32 MaxBatchSize          = 500;    // Implementation hint: DispatchBatch must be split into chunks of this size
 
     // --- IAuditService ---
     virtual bool Connect(const FString& ConnectionString) override;
@@ -137,6 +138,11 @@ public:
 protected:
     // Implementors override this — receives a ready-to-send batch, already stamped.
     // bTransactional indicates whether the batch must be committed atomically.
+    //
+    // Implementation requirements:
+    //   - Respect MaxBatchSize: split large pending queues into multiple DispatchBatch calls.
+    //   - Implement retry logic internally — FAuditServiceBase does not retry on failure.
+    //   - Threading is the implementor's responsibility.
     virtual void DispatchBatch(const TArray<FAuditEntryInternal>& Batch, bool bTransactional) = 0;
 
 private:
@@ -157,6 +163,7 @@ private:
 ```
 SetServerId() not called yet:
   RecordEvent / RecordBatch → PendingQueue (held, not dispatched)
+  UE_LOG Warning fires once if queue reaches 50% capacity while ServerId is unset
 
 SetServerId() called:
   → All pending entries stamped with ServerId and flushed via DispatchBatch
@@ -166,10 +173,13 @@ SetServerId() called:
 FlushTimer fires every FlushIntervalSeconds:
   → PendingQueue drained → grouped by TransactionGroupId → DispatchBatch per group
 
+Queue reaches FlushThresholdPercent of MaxQueueSize:
+  → Immediate flush triggered — bypasses timer at the cost of a spike
+  → Prevents data loss under sustained high event throughput
+
 MaxQueueSize exceeded:
   → Oldest entries dropped
   → UE_LOG Warning fired once per overflow event
-  → Additional warning fired at 50% capacity if ServerId is still unset
   → New entries continue to enqueue
 
 Flush() (graceful shutdown):
@@ -236,11 +246,10 @@ private:
 
 ```cpp
 void UMarketSystem::AuditTrade(
-    const FGuid&   BuyerActorId,
-    const FString& BuyerName,
-    const FGuid&   ListingId,
-    int32          Price,
-    const FGuid&   SessionId)
+    const FGuid& BuyerActorId,   const FString& BuyerName,
+    const FGuid& ListingId,
+    int32        Price,
+    const FGuid& SessionId)
 {
     FAuditPayloadBuilder Builder;
     Builder.SetInt   (TEXT("price"),    Price)
@@ -248,60 +257,24 @@ void UMarketSystem::AuditTrade(
            .SetGuid  (TEXT("listing"),  ListingId);
 
     FAuditEntry Entry;
-    Entry.EventTag         = TAG_Audit_Market_Trade;
-    Entry.SchemaVersion    = 1;
-    Entry.ActorId          = BuyerActorId;
-    Entry.ActorDisplayName = BuyerName;
-    Entry.SubjectId        = ListingId;
-    Entry.SubjectTag       = TAG_Subject_Market_Listing;
-    Entry.SessionId        = SessionId;
-    Entry.Payload          = Builder.ToString();
+    Entry.EventTag          = TAG_Audit_Market_Trade;
+    Entry.SchemaVersion     = 1;
+    Entry.ActorId           = BuyerActorId;
+    Entry.ActorDisplayName  = BuyerName;
+    Entry.SubjectId         = ListingId;
+    Entry.SubjectTag        = TAG_Subject_Market_Listing;
+    Entry.SessionId         = SessionId;
+    Entry.Payload           = Builder.ToString();
 
-    Backend->GetAudit()->RecordEvent(Entry);
+    Backend->GetAudit(TEXT("Gameplay"))->RecordEvent(Entry);
 }
 ```
 
 ---
 
-## Usage Example — Transactional Batch (Inventory Swap)
+## Recommended GameplayTag Namespaces
 
-```cpp
-void UInventorySystem::AuditItemTransfer(
-    const FGuid& FromPlayerId, const FGuid& ToPlayerId,
-    const FGuid& ItemId,       const FGuid& SessionId)
-{
-    FAuditEntry Remove;
-    Remove.EventTag         = TAG_Audit_Inventory_ItemRemoved;
-    Remove.SchemaVersion    = 1;
-    Remove.ActorId          = FromPlayerId;
-    Remove.SubjectId        = ItemId;
-    Remove.SubjectTag       = TAG_Subject_Item;
-    Remove.SessionId        = SessionId;
-    Remove.Payload          = FAuditPayloadBuilder()
-                                  .SetGuid(TEXT("item"), ItemId)
-                                  .ToString();
-
-    FAuditEntry Add;
-    Add.EventTag         = TAG_Audit_Inventory_ItemAdded;
-    Add.SchemaVersion    = 1;
-    Add.ActorId          = ToPlayerId;
-    Add.SubjectId        = ItemId;
-    Add.SubjectTag       = TAG_Subject_Item;
-    Add.SessionId        = SessionId;
-    Add.Payload          = FAuditPayloadBuilder()
-                               .SetGuid(TEXT("item"), ItemId)
-                               .ToString();
-
-    // bTransactional = true: both entries commit atomically or not at all
-    Backend->GetAudit()->RecordBatch({ Remove, Add }, true);
-}
-```
-
----
-
-## GameplayTag Conventions
-
-| Prefix | Used For |
+| Namespace | Usage |
 |---|---|
 | `Audit.Progression.*` | XP gains, level ups, skill changes |
 | `Audit.Market.*` | Listings, trades, cancellations |
@@ -322,4 +295,5 @@ void UInventorySystem::AuditItemTransfer(
 - `bTransactional = true` in `RecordBatch` guarantees atomic delivery only if the backend implementation supports it. Implementations that cannot honor transactionality must document this clearly.
 - `Connect()` is public for interface technical reasons but **must only be called by `UGameCoreBackendSubsystem`**.
 - `Flush()` is called automatically by `UGameCoreBackendSubsystem::Deinitialize()` — implementors do not need to call it manually on shutdown.
+- **Abstraction vs implementation:** `FAuditServiceBase` defines queue ownership and flush policy. Retry logic, connection pooling, and threading are the responsibility of the **concrete implementation** (e.g. `FDatadogAuditService`). `MaxBatchSize` is a configuration hint — concrete implementations must respect it by splitting large flushes into multiple `DispatchBatch` calls rather than sending unbounded payloads to the backend in a single call.
 - This interface is **server-side only**. Never instantiate or call from client code.

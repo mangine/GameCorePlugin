@@ -1,7 +1,6 @@
 # ILoggingService
 
 **Module:** `GameCore`
-
 **Location:** `GameCore/Source/GameCore/Backend/LoggingService.h`
 
 Interface for forwarding server log messages to an external logging backend (e.g. Datadog, Loki, CloudWatch). This is the **canonical logging interface** for GameCore systems. The temporary `ILogSubsystem` previously referenced in `UPersistenceSubsystem` is superseded by this interface via `UGameCoreBackendSubsystem`.
@@ -44,10 +43,17 @@ struct GAMECORE_API FLoggingConfig
     // Interval between periodic flushes of the write-behind queue (seconds).
     float FlushIntervalSeconds = 5.0f;
 
+    // Immediate flush triggered when queue reaches this fraction of MaxQueueSize.
+    // Prevents data loss under burst load at the cost of a spike.
+    float FlushThresholdPercent = 0.75f;
+
     // Maximum entries in the write-behind queue before oldest entries are dropped.
     int32 MaxQueueSize = 4096;
 
-    // Reconnect backoff: initial delay (seconds). Doubles on each failed attempt up to MaxReconnectDelaySec.
+    // Implementation hint: concrete implementations must split flushes into chunks of this size.
+    int32 MaxBatchSize = 500;
+
+    // Reconnect backoff: initial delay (seconds). Doubles on each failed attempt up to MaxReconnectDelaySeconds.
     float ReconnectDelaySeconds    = 2.0f;
     float MaxReconnectDelaySeconds = 60.0f;
 };
@@ -98,6 +104,8 @@ public:
 
 Abstract C++ base class that all concrete logging backends extend. Owns the write-behind queue, flush timer, and reconnect logic. Implementors only override `ConnectToBackend` and `DispatchBatch`.
 
+The write-behind queue uses `TCircularQueue` for lock-free MPSC (multi-producer, single-consumer) access. `Log()` can be safely called from any thread without blocking the caller. The dedicated flush thread is the sole consumer.
+
 ```cpp
 class GAMECORE_API FLoggingServiceBase : public ILoggingService
 {
@@ -113,17 +121,24 @@ protected:
     virtual bool ConnectToBackend(const FLoggingConfig& Config) = 0;
 
     // Deliver a batch of entries to the backend. Called from the flush thread.
-    // Return true on success. On failure, FLoggingServiceBase retries the batch.
+    // Return true on success.
+    // Implementations must respect Config.MaxBatchSize — split large flushes into multiple calls.
+    // Retry logic, connection state, and threading are the responsibility of the concrete class.
     virtual bool DispatchBatch(const TArray<FLogEntry>& Entries) = 0;
 
 private:
-    FLoggingConfig          Config;
-    TArray<FLogEntry>       Queue;          // Write-behind buffer
-    FCriticalSection        QueueLock;
-    FThreadSafeCounter      bConnected;
-    float                   CurrentReconnectDelay = 0.f;
+    FLoggingConfig Config;
+
+    // Lock-free MPSC ring buffer. Sized to Config.MaxQueueSize at Initialize time.
+    // Log() enqueues from any thread; the flush thread is the sole consumer.
+    // Oldest entries are dropped silently on overflow with a UE_LOG Warning.
+    TCircularQueue<FLogEntry> Queue;
+
+    FThreadSafeCounter bConnected;
+    float              CurrentReconnectDelay = 0.f;
 
     // Runs on a dedicated platform thread — no FTimerManager dependency.
+    // Handles periodic flush, pressure flush at FlushThresholdPercent, and reconnect.
     void FlushThreadLoop();
     void AttemptReconnect();
 };
@@ -142,6 +157,27 @@ struct FLogEntry
     FString      Payload;   // Optional. Caller-formatted extra data (JSON, key=value, etc.)
     FDateTime    Timestamp; // Stamped at enqueue time (UTC).
 };
+```
+
+### Queue Behavior
+
+```
+Log() called (any thread):
+  → Enqueued into TCircularQueue — lock-free, never blocks caller
+  → If queue depth reaches FlushThresholdPercent of MaxQueueSize:
+      → Flush thread signaled for immediate dispatch (pressure flush)
+
+Flush thread wakes periodically (FlushIntervalSeconds):
+  → Dequeues all available entries
+  → Splits into batches of MaxBatchSize → DispatchBatch per batch
+
+MaxQueueSize exceeded:
+  → Oldest entries dropped, UE_LOG Warning emitted
+  → New entries continue to enqueue
+
+Flush() (graceful shutdown):
+  → Flush thread drains remaining entries synchronously before returning
+  → Called automatically by UGameCoreBackendSubsystem::Deinitialize()
 ```
 
 ---
@@ -186,51 +222,28 @@ public:
 
 ## Wiring with UGameCoreBackendSubsystem
 
-Registration passes a config struct. The subsystem stores the service and calls `Initialize` — it never manages connection state.
-
 ```cpp
-// Registration (from UGameInstance::Init or an early subsystem)
 FLoggingConfig Config;
-Config.Endpoint             = TEXT("https://logs.datadoghq.com/...");
-Config.FlushIntervalSeconds = 5.0f;
-Config.MaxQueueSize         = 4096;
+Config.Endpoint              = TEXT("https://logs.datadoghq.com/...");
+Config.FlushIntervalSeconds  = 5.0f;
+Config.FlushThresholdPercent = 0.75f;
+Config.MaxQueueSize          = 4096;
+Config.MaxBatchSize          = 500;
 
-Backend->RegisterLoggingService(MyLoggingService, Config);
-```
+Backend->RegisterLoggingService(NAME_None, MyLoggingService, Config);
 
-```cpp
-// UGameCoreBackendSubsystem::RegisterLoggingService
-void UGameCoreBackendSubsystem::RegisterLoggingService(
-    TScriptInterface<ILoggingService> Service, const FLoggingConfig& Config)
-{
-    LoggingService = Service;
-    bLoggingRegistered = true;
-    Service.GetInterface()->Initialize(Config);
-}
-```
-
-> Connection is async. The service queues messages internally until the backend is reachable. Callers never observe a failure — Log() always succeeds from the caller's perspective.
-
----
-
-## Wiring with UPersistenceSubsystem
-
-```cpp
 // Always safe — GetLogging() never returns null, falls back to FNullLoggingService if not registered
-if (auto* Backend = GetGameInstance()->GetSubsystem<UGameCoreBackendSubsystem>())
-    Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message);
+Backend->GetLogging()->LogWarning(TEXT("Persistence"), Message);
 ```
-
-> Wiring is opt-in. `UPersistenceSubsystem` does not need to depend on `UGameCoreBackendSubsystem`. Only wire when a real logging backend is available.
 
 ---
 
 ## Notes
 
 - `Flush()` **must** complete before process exit. The subsystem calls it automatically in `Deinitialize`.
-- `LogCritical` calls `Flush()` before logging in the null fallback to maximize message durability. Concrete implementations in `FLoggingServiceBase` do the same — flush is synchronous and blocking at that point.
 - `LogCritical` never maps to `UE_LOG Fatal`. Fatal crashes the process and may lose buffered messages. Use a separate crash handler (e.g. `FCoreDelegates::OnHandleSystemError`) if a process crash is required after a critical log.
 - `Payload` is optional and caller-formatted. Use JSON or `key=value` pairs for structured extra data (e.g. entity IDs, request context). The logging backend indexes it as-is — no parsing is done by the service.
 - `FLoggingServiceBase` runs its flush loop on a dedicated platform thread, not via `FTimerManager`, so it is safe to use before a World exists and during teardown.
 - Reconnect uses exponential backoff between `ReconnectDelaySeconds` and `MaxReconnectDelaySeconds`. Messages continue queuing during reconnect. If `MaxQueueSize` is exceeded, the oldest entries are dropped and a `UE_LOG Warning` is emitted.
+- **Abstraction vs implementation:** `FLoggingServiceBase` defines queue ownership, the pressure-flush mechanism, and the flush thread contract. Retry logic, connection pooling, and transport details are the responsibility of the **concrete implementation**. `MaxBatchSize` is a configuration hint — concrete implementations must respect it by splitting large flushes into multiple `DispatchBatch` calls.
 - This interface is **server-side only**. Never instantiate or call from client code.
