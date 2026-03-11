@@ -5,6 +5,8 @@
 
 Interface for recording immutable, auditable game events into an append-only backend. Used by any system that requires anti-cheat validation, exploit investigation, or rollback tooling — progression, market, inventory, trades, currency changes, etc.
 
+Accessed via `FGameCoreBackend::GetAudit(Key)`.
+
 `InstanceGUID`, `ServerId`, and `Timestamp` are **stamped internally** by `FAuditServiceBase` before dispatch — callers never provide them. `SessionId` is optional and caller-provided.
 
 ---
@@ -191,6 +193,8 @@ Flush() (graceful shutdown):
 
 ## Null Fallback Implementation
 
+`FNullAuditService` is used by `FGameCoreBackend` when no service is registered or the subsystem is not live. Events are routed to `UE_LOG(LogGameCore, Log, ...)` so they remain visible in development and are never silently dropped.
+
 ```cpp
 class GAMECORE_API FNullAuditService : public IAuditService
 {
@@ -215,6 +219,8 @@ public:
     }
 };
 ```
+
+This implementation is declared in `AuditService.h` and instantiated as the static fallback `GNullAudit` in `GameCoreBackend.cpp`.
 
 ---
 
@@ -251,11 +257,6 @@ void UMarketSystem::AuditTrade(
     int32        Price,
     const FGuid& SessionId)
 {
-    FAuditPayloadBuilder Builder;
-    Builder.SetInt   (TEXT("price"),    Price)
-           .SetString(TEXT("currency"), TEXT("Gold"))
-           .SetGuid  (TEXT("listing"),  ListingId);
-
     FAuditEntry Entry;
     Entry.EventTag          = TAG_Audit_Market_Trade;
     Entry.SchemaVersion     = 1;
@@ -264,9 +265,13 @@ void UMarketSystem::AuditTrade(
     Entry.SubjectId         = ListingId;
     Entry.SubjectTag        = TAG_Subject_Market_Listing;
     Entry.SessionId         = SessionId;
-    Entry.Payload           = Builder.ToString();
+    Entry.Payload           = FAuditPayloadBuilder{}
+        .SetInt   (TEXT("price"),    Price)
+        .SetString(TEXT("currency"), TEXT("Gold"))
+        .SetGuid  (TEXT("listing"),  ListingId)
+        .ToString();
 
-    Backend->GetAudit(TEXT("Gameplay"))->RecordEvent(Entry);
+    FGameCoreBackend::GetAudit(TEXT("Gameplay"))->RecordEvent(Entry);
 }
 ```
 
@@ -295,5 +300,5 @@ void UMarketSystem::AuditTrade(
 - `bTransactional = true` in `RecordBatch` guarantees atomic delivery only if the backend implementation supports it. Implementations that cannot honor transactionality must document this clearly.
 - `Connect()` is public for interface technical reasons but **must only be called by `UGameCoreBackendSubsystem`**.
 - `Flush()` is called automatically by `UGameCoreBackendSubsystem::Deinitialize()` — implementors do not need to call it manually on shutdown.
-- **Abstraction vs implementation:** `FAuditServiceBase` defines queue ownership and flush policy. Retry logic, connection pooling, and threading are the responsibility of the **concrete implementation** (e.g. `FDatadogAuditService`). `MaxBatchSize` is a configuration hint — concrete implementations must respect it by splitting large flushes into multiple `DispatchBatch` calls rather than sending unbounded payloads to the backend in a single call.
+- `MaxBatchSize` is a configuration hint — concrete implementations must respect it by splitting large flushes into multiple `DispatchBatch` calls.
 - This interface is **server-side only**. Never instantiate or call from client code.
