@@ -204,6 +204,7 @@ public:
     // Soft cap — can be raised per patch without code changes.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Level")
     int32 MaxLevel = 100;
+
     // If true, negative XP can cause the level to decrease when XP drops below
     // the floor of the current level. Level is clamped at 1 — never below.
     // Default false: reputation tracks where rank is permanent (ESO, GW2 model).
@@ -224,6 +225,13 @@ public:
 
     UPROPERTY(EditAnywhere, meta = (EditCondition = "XPCurveType == EXPCurveType::CurveTable"), Category = "XP Curve")
     FCurveTableRowHandle XPCurveTableRow;
+
+    // --- XP Reduction ---
+    // Optional. If null, no level-based XP reduction is applied for this progression.
+    // Assign a UXPReductionPolicyCurve asset or any custom UXPReductionPolicy subclass.
+    // See UXPReductionPolicy spec for details.
+    UPROPERTY(EditAnywhere, Instanced, BlueprintReadOnly, Category = "XP Reduction")
+    TObjectPtr<UXPReductionPolicy> ReductionPolicy;
 
     // --- Level-Up Grants ---
     // Single grant definition per progression. Amount scales with level via EGrantCurveType.
@@ -277,4 +285,3 @@ public:
 The Serialization System calls these automatically at snapshot and restore time — the game layer does not need to manage them manually.
 
 > **JSON helpers retained for tooling only.** `SerializeToString()` / `DeserializeFromString()` remain as `BlueprintAuthorityOnly` utilities for GM console commands, debug inspection, and live-ops tooling. They are never called on the save path.
->

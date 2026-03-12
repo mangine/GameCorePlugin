@@ -6,6 +6,8 @@
 
 All mutations are **server-only**. The client receives delta-replicated state via FastArray and reacts through delegates.
 
+> **XP grants must go through `UProgressionSubsystem::GrantXP`.** `ApplyXP` is internal and not exposed to gameplay code or Blueprints. Direct calls bypass multiplier resolution, audit, and watcher notification.
+
 ## Plugin Module
 
 `GameCore` (runtime module)
@@ -23,6 +25,7 @@ GameCore/Source/GameCore/Progression/
 - `URequirement` — for advanced prerequisite evaluation.
 - `ISourceIDInterface` — for XP audit source identification.
 - `ULevelProgressionDefinition` — data asset defining each progression.
+- `UXPReductionPolicy` — sampled by `ApplyXP` to compute final XP from war XP.
 - `IPersistableComponent` — implemented for binary save/load via the Serialization System.
 
 ---
@@ -62,27 +65,32 @@ public:
     void UnregisterProgression(FGameplayTag ProgressionTag);
 
     // -------------------------------------------------------------------------
-    // XP
+    // XP  (internal — called only by UProgressionSubsystem)
     // -------------------------------------------------------------------------
 
     /**
-     * Adds XP to a progression. Negative values reduce XP.
-     * If bAllowLevelDecrement is false on the definition, XP is clamped at the
-     * base of the current level — level never decreases.
-     * If bAllowLevelDecrement is true, XP can drop below 0 causing level to
-     * decrement. Level is always clamped at 1 minimum.
+     * Applies war XP to a progression after sampling the ReductionPolicy.
+     * Final XP = WarXP * ReductionPolicy->Evaluate(PlayerLevel, ContentLevel).
+     * If ReductionPolicy is null or ContentLevel is INDEX_NONE, no reduction is applied.
+     *
+     * NOT BlueprintCallable. All external XP grants must go through
+     * UProgressionSubsystem::GrantXP to ensure multipliers, audit, and
+     * watcher notification are correctly applied.
+     *
      * Server-only.
      *
      * @param ProgressionTag  Which progression receives the XP.
-     * @param Amount          XP delta (positive or negative).
-     * @param Source          Optional source for audit/telemetry.
+     * @param WarXP           XP after global and personal multipliers (pre-reduction).
+     * @param ContentLevel    Level of the originating content. INDEX_NONE = skip reduction.
      */
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Progression")
-    void AddXP(
-        FGameplayTag ProgressionTag,
-        int32 Amount,
-        TScriptInterface<ISourceIDInterface> Source
-    );
+    void ApplyXP(FGameplayTag ProgressionTag, int32 WarXP, int32 ContentLevel);
+
+    /**
+     * Returns the final XP delta applied by the most recent ApplyXP call.
+     * Used by UProgressionSubsystem to read the post-reduction amount for audit.
+     * Reset to 0 at the start of each ApplyXP call.
+     */
+    int32 GetLastAppliedXPDelta() const { return LastAppliedXPDelta; }
 
     // -------------------------------------------------------------------------
     // Queries (safe to call from client)
@@ -121,7 +129,9 @@ public:
     // Delegates
     // -------------------------------------------------------------------------
 
-    // Fired on server and broadcast to owning client when a level-up or level-down occurs.
+    // Fired on server when a level-up or level-down occurs.
+    // UProgressionSubsystem subscribes to this for level-up audit.
+    // Also triggers client-side via replicated state change.
     UPROPERTY(BlueprintAssignable, Category = "Progression|Delegates")
     FOnProgressionLevelUp OnLevelUp;
     // Signature: (FGameplayTag ProgressionTag, int32 NewLevel)
@@ -142,6 +152,9 @@ private:
     UPROPERTY()
     TMap<FGameplayTag, TObjectPtr<ULevelProgressionDefinition>> Definitions;
 
+    // Cached result of the most recent ApplyXP call — read by UProgressionSubsystem for audit.
+    int32 LastAppliedXPDelta = 0;
+
     FProgressionLevelData* FindProgressionData(FGameplayTag Tag);
     const FProgressionLevelData* FindProgressionData(FGameplayTag Tag) const;
 
@@ -149,6 +162,31 @@ private:
     void ProcessLevelDown(FProgressionLevelData& Data, ULevelProgressionDefinition* Def);
     void GrantPointsForLevel(ULevelProgressionDefinition* Def, int32 NewLevel);
 };
+```
+
+---
+
+## ApplyXP Logic
+
+```cpp
+void ULevelingComponent::ApplyXP(FGameplayTag ProgressionTag, int32 WarXP, int32 ContentLevel)
+{
+    LastAppliedXPDelta = 0;
+
+    ULevelProgressionDefinition* Def = Definitions.FindRef(ProgressionTag);
+    if (!Def) return;
+
+    const float Reduction = Def->ReductionPolicy
+        ? Def->ReductionPolicy->Evaluate(GetLevel(ProgressionTag), ContentLevel)
+        : 1.f;
+
+    const int32 FinalXP = FMath::RoundToInt(WarXP * Reduction);
+    LastAppliedXPDelta = FinalXP;
+
+    if (FinalXP == 0) return;
+
+    // ... existing XP mutation, level-up processing, delegate firing
+}
 ```
 
 ---
@@ -167,20 +205,21 @@ FastArray ensures only changed progression entries are sent over the wire, which
 
 ## Server Authority Rules
 
-- `AddXP`, `RegisterProgression`, `UnregisterProgression`, `DeserializeFromSave`, and `DeserializeFromString` are all server-only — calling from client is a no-op.
+- `ApplyXP`, `RegisterProgression`, `UnregisterProgression`, `DeserializeFromSave`, and `DeserializeFromString` are all server-only.
 - The component never exposes a direct `SetLevel` or `SetXP` — level is always a result of XP accumulation to prevent exploit surface.
 - Prerequisite checks in `RegisterProgression` run on the server; the client cannot register a progression directly.
+- `ApplyXP` is not `BlueprintCallable` and not exposed publicly — all external XP grants go through `UProgressionSubsystem::GrantXP`.
 
 ---
 
 ## Negative XP Behavior
 
-Behavior when `AddXP` is called with a negative value depends on `ULevelProgressionDefinition::bAllowLevelDecrement`:
+Behavior when `ApplyXP` receives a negative `WarXP` (e.g. from a penalty system) depends on `ULevelProgressionDefinition::bAllowLevelDecrement`:
 
 **`bAllowLevelDecrement = false` (default — permanent rank model):**
 
-1. `NewXP = FMath::Max(CurrentXP + Delta, 0)` — XP floor is 0 (base of current level).
-2. Level never decreases. Models systems where rank is permanent (GW2 WvW, ESO faction standing).
+1. `NewXP = FMath::Max(CurrentXP + FinalXP, 0)` — XP floor is 0 (base of current level).
+2. Level never decreases.
 3. `OnXPChanged` fires with the clamped delta.
 
 **`bAllowLevelDecrement = true` (demotion model):**
@@ -202,12 +241,17 @@ if (HasAuthority())
     LevelingComp->RegisterProgression(Def);
 }
 
-// Grant XP from a mob kill
-LevelingComp->AddXP(
-    FGameplayTag::RequestGameplayTag("Progression.Swordsmanship"),
-    50,
-    MobActor  // implements ISourceIDInterface
-);
+// Grant XP — always through the subsystem
+if (UProgressionSubsystem* PS = GetWorld()->GetSubsystem<UProgressionSubsystem>())
+{
+    PS->GrantXP(
+        PlayerState,
+        FGameplayTag::RequestGameplayTag("Progression.Swordsmanship"),
+        50,           // base amount
+        MobLevel,     // content level for reduction; INDEX_NONE to skip
+        MobActor      // implements ISourceIDInterface
+    );
+}
 
 // Query (safe from client)
 int32 Level = LevelingComp->GetLevel(
