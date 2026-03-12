@@ -8,6 +8,8 @@ Static zero-cost facade over `UGameCoreBackendSubsystem`. Provides a single, uni
 
 This is the **canonical way all GameCore systems access backend services**. Direct `GetSubsystem<UGameCoreBackendSubsystem>()` calls are not permitted inside the plugin.
 
+**Using `UGameCoreBackendSubsystem` is entirely optional.** The facade can also be wired via lightweight delegates — no subsystem, no interface implementation required.
+
 ---
 
 ## Motivation
@@ -56,37 +58,88 @@ class IAuditService;
 /**
  * Static facade over UGameCoreBackendSubsystem.
  * Registered automatically by the subsystem on Initialize/Deinitialize.
- * Falls back to null implementations (UE_LOG routing) when the subsystem is not live.
+ * Falls back gracefully when no subsystem is registered:
+ *   - Logging   → UE_LOG (FNullLoggingService)
+ *   - Audit     → silent no-op (FNullAuditService)
+ *   - Storage   → silent no-op writes, failure callbacks on reads
  *
- * Tag-based overloads resolve FGameplayTag → FName via the subsystem's routing maps.
+ * Lightweight delegate hooks allow wiring to any custom system without
+ * implementing the full service interfaces. Delegates take priority over
+ * the subsystem path when bound. Cost when unbound: one null-check branch,
+ * predicted-not-taken by the CPU — effectively zero overhead.
+ *
+ * Tag-based overloads resolve FGameplayTag -> FName via the subsystem's routing maps.
  * Unregistered tags fall back to NAME_None (the default service).
- * All four service types use the same tag-based routing pattern.
- *
- * FName overloads remain for game-module-level code that needs explicit routing.
  *
  * Never returns null. Always safe to call, including before subsystem init and during teardown.
  */
 struct GAMECORE_API FGameCoreBackend
 {
-    // --- Registration ---
+    // --- Subsystem Registration ---
     // Called exclusively by UGameCoreBackendSubsystem::Initialize and ::Deinitialize.
     // Never call directly.
     static void Register  (UGameCoreBackendSubsystem* Subsystem);
     static void Unregister();
 
-    // --- Tag-Based Accessors (preferred for plugin systems) ---
-    // Resolves the FGameplayTag to an FName via the subsystem's routing map.
-    // Falls back to NAME_None (the default service) if no mapping is registered for the tag.
+    // -------------------------------------------------------------------------
+    // Lightweight Delegate Hooks
+    // -------------------------------------------------------------------------
+    // Optional. Wire these to intercept calls without implementing a full service
+    // interface. When bound, the delegate is called INSTEAD of the subsystem path.
+    // When unbound (nullptr), the subsystem or null fallback is used.
+    //
+    // Set from your GameInstance::Init before any system calls into the backend.
+    // Clear (set to nullptr) in GameInstance::Shutdown to avoid dangling captures.
+    //
+    // Logging: always falls back to UE_LOG even when unbound — never fully silent.
+    // Audit / Persistence: silent no-op when unbound and no subsystem is registered.
+
+    // (Severity, Category, Message, OptionalPayload)
+    static TFunction<void(ELogSeverity, const FString&, const FString&, const FString&)> OnLog;
+
+    // (Entry)
+    static TFunction<void(const FAuditEntry&)> OnAudit;
+
+    // (Tag, EntityId, SerializedBytes)
+    static TFunction<void(FGameplayTag, FGuid, TArrayView<const uint8>)> OnPersistenceWrite;
+
+    // -------------------------------------------------------------------------
+    // Canonical Call Methods (preferred over GetLogging()->Log() etc.)
+    // -------------------------------------------------------------------------
+    // Use these instead of chaining GetX()->Method(). They route through the
+    // delegate hook first, then fall through to the service or null fallback.
+    // Logging always reaches UE_LOG at minimum — it is never silently dropped.
+
+    static void Log(
+        ELogSeverity   Severity,
+        const FString& Category,
+        const FString& Message,
+        const FString& Payload = FString{});
+
+    static void Audit(const FAuditEntry& Entry);
+
+    static void PersistenceWrite(
+        FGameplayTag           Tag,
+        FGuid                  EntityId,
+        TArrayView<const uint8> Bytes);
+
+    // -------------------------------------------------------------------------
+    // Tag-Based Service Accessors (for direct service interface access)
+    // -------------------------------------------------------------------------
+    // Prefer the canonical call methods above for logging, audit, and persistence.
+    // Use these accessors when you need lower-level service interface methods
+    // (e.g. Query, GetById, RecordBatch).
+    //
+    // Resolves FGameplayTag -> FName via the subsystem routing map.
     // Returns the null fallback if the subsystem is not live.
     static ILoggingService*      GetLogging     (FGameplayTag Tag);
     static IKeyStorageService*   GetKeyStorage  (FGameplayTag Tag);
     static IQueryStorageService* GetQueryStorage(FGameplayTag Tag);
     static IAuditService*        GetAudit       (FGameplayTag Tag);
 
-    // --- FName-Based Accessors (for game module wiring code) ---
-    // Select a specific named backend instance directly.
-    // Use when the caller explicitly knows which instance it needs (e.g. GameInstance::Init wiring).
-    // Falls back to the null fallback if the key is not registered or subsystem is not live.
+    // -------------------------------------------------------------------------
+    // FName-Based Service Accessors (game module wiring code only)
+    // -------------------------------------------------------------------------
     static ILoggingService*      GetLogging     (FName Key = NAME_None);
     static IKeyStorageService*   GetKeyStorage  (FName Key = NAME_None);
     static IQueryStorageService* GetQueryStorage(FName Key = NAME_None);
@@ -113,10 +166,18 @@ private:
 #include "Backend/QueryStorageService.h"
 #include "Backend/AuditService.h"
 
-// Static instance — set by UGameCoreBackendSubsystem::Initialize
+// Static instance
 UGameCoreBackendSubsystem* FGameCoreBackend::Instance = nullptr;
 
-// Static null fallbacks — constructed once at module load, never destroyed until module unload.
+// Static delegate hooks — nullptr by default (zero overhead when unbound)
+TFunction<void(ELogSeverity, const FString&, const FString&, const FString&)>
+    FGameCoreBackend::OnLog            = nullptr;
+TFunction<void(const FAuditEntry&)>
+    FGameCoreBackend::OnAudit          = nullptr;
+TFunction<void(FGameplayTag, FGuid, TArrayView<const uint8>)>
+    FGameCoreBackend::OnPersistenceWrite = nullptr;
+
+// Static null fallbacks — constructed once at module load.
 static FNullLoggingService      GNullLogging;
 static FNullKeyStorageService   GNullKeyStorage;
 static FNullQueryStorageService GNullQueryStorage;
@@ -132,9 +193,49 @@ void FGameCoreBackend::Unregister()
     Instance = nullptr;
 }
 
-// --- Tag-based overloads ---
-// Tag → FName resolution is delegated to the subsystem's routing maps.
-// Unregistered tags resolve to NAME_None (the default service).
+// --- Canonical call methods ---
+
+void FGameCoreBackend::Log(
+    ELogSeverity   Severity,
+    const FString& Category,
+    const FString& Message,
+    const FString& Payload)
+{
+    if (OnLog)
+    {
+        OnLog(Severity, Category, Message, Payload);
+        return;
+    }
+    // Falls through to service (which itself falls back to UE_LOG via FNullLoggingService)
+    GetLogging(FGameplayTag{})->Log(Severity, Category, Message, Payload);
+}
+
+void FGameCoreBackend::Audit(const FAuditEntry& Entry)
+{
+    if (OnAudit)
+    {
+        OnAudit(Entry);
+        return;
+    }
+    // Falls through to service — FNullAuditService is a silent no-op when no subsystem
+    GetAudit(FGameplayTag{})->RecordEvent(Entry);
+}
+
+void FGameCoreBackend::PersistenceWrite(
+    FGameplayTag            Tag,
+    FGuid                   EntityId,
+    TArrayView<const uint8> Bytes)
+{
+    if (OnPersistenceWrite)
+    {
+        OnPersistenceWrite(Tag, EntityId, Bytes);
+        return;
+    }
+    // Falls through to service — FNullKeyStorageService silent no-op when no subsystem
+    GetKeyStorage(Tag)->Set(Tag, EntityId, TArray<uint8>(Bytes.GetData(), Bytes.Num()), false, false);
+}
+
+// --- Tag-based accessors ---
 
 ILoggingService* FGameCoreBackend::GetLogging(FGameplayTag Tag)
 {
@@ -173,10 +274,10 @@ IAuditService* FGameCoreBackend::GetAudit(FGameplayTag Tag)
         const FName Key = Instance->ResolveAuditTag(Tag);
         return Instance->GetAudit(Key);
     }
-    return &GNullAudit;
+    return &GNullAudit; // silent no-op
 }
 
-// --- FName-based overloads ---
+// --- FName-based accessors ---
 
 ILoggingService* FGameCoreBackend::GetLogging(FName Key)
 {
@@ -270,41 +371,43 @@ FGameCoreBackend::GetLogging(TAG_Log_Unregistered)
 
 ---
 
-## Usage — Call Site Pattern
+## Usage — Canonical Call Sites
+
+Systems inside the plugin should use the canonical call methods, not the `GetX()->Method()` chain. This ensures delegate hooks are honoured and the correct null fallback is applied.
 
 ```cpp
-// In any plugin .cpp — one include, no context object required
 #include "Backend/GameCoreBackend.h"
 
-// Tag-based (preferred for all plugin systems — no backend name knowledge required)
-FGameCoreBackend::GetLogging(TAG_Log_Persistence)->LogWarning(TEXT("Persistence"), Message);
-FGameCoreBackend::GetLogging(TAG_Log_Security)->LogError(TEXT("AntiCheat"), Details);
+// Logging — always reaches UE_LOG at minimum
+FGameCoreBackend::Log(ELogSeverity::Warning, TEXT("LevelingComponent"), TEXT("Invalid progression tag"));
+FGameCoreBackend::Log(ELogSeverity::Error,   TEXT("PersistenceSubsystem"), TEXT("Flush failed"), PayloadJson);
+
+// Audit — silent no-op if no subsystem and no delegate
+FGameCoreBackend::Audit(Entry);
+
+// Persistence write — silent no-op if no subsystem and no delegate
+FGameCoreBackend::PersistenceWrite(PersistenceTag, EntityId, SerializedBytes);
+
+// Direct service access — use for service-specific methods (Query, GetById, RecordBatch, etc.)
 FGameCoreBackend::GetKeyStorage(TAG_Persistence_Entity_Player)->Set(TAG_Persistence_Entity_Player, EntityId, Data, false, false);
 FGameCoreBackend::GetQueryStorage(TAG_Schema_Market_Listing)->Query(TAG_Schema_Market_Listing, Filter, Callback);
-FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(Entry);
-
-// FName-based (game module wiring code only — explicit instance targeting)
-FGameCoreBackend::GetLogging(TEXT("SecurityLog"))->LogError(TEXT("AntiCheat"), Details);
-FGameCoreBackend::GetKeyStorage(TEXT("PlayerDB"))->Set(TAG_Persistence_Entity_Player, EntityId, Data, false, false);
-FGameCoreBackend::GetAudit(TEXT("Security"))->RecordEvent(CheatEntry);
+FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordBatch(Entries, /*bTransactional=*/true);
 ```
-
-**Do not** call `GetSubsystem<UGameCoreBackendSubsystem>()` anywhere inside the GameCore plugin. Use `FGameCoreBackend` instead.
 
 ---
 
-## Null Fallback Behavior
+## Null Fallback Behaviour
 
-When `Instance` is null (subsystem not initialized, or already deinitialized), all getters return static null implementations. Each null implementation routes to `UE_LOG` so no calls are silently swallowed:
+When `Instance` is null and no delegate hook is bound, each service type has a distinct policy:
 
-| Service | Null Fallback | UE_LOG Behavior |
+| Service | Null Fallback | No-Subsystem Behaviour |
 |---|---|---|
-| `ILoggingService` | `FNullLoggingService` | Maps `ELogSeverity` → `UE_LOG(LogGameCore, ...)` |
-| `IKeyStorageService` | `FNullKeyStorageService` | `UE_LOG(LogGameCore, Warning, ...)` per call |
-| `IQueryStorageService` | `FNullQueryStorageService` | `UE_LOG(LogGameCore, Warning, ...)` per call |
-| `IAuditService` | `FNullAuditService` | `UE_LOG(LogGameCore, Log, ...)` per event |
+| `ILoggingService` | `FNullLoggingService` | Always routes to `UE_LOG(LogGameCore, ...)` — never silent |
+| `IAuditService` | `FNullAuditService` | **Silent no-op** — audit is opt-in infrastructure |
+| `IKeyStorageService` | `FNullKeyStorageService` | Writes: silent no-op. Reads: `bSuccess=false` callback, no log spam |
+| `IQueryStorageService` | `FNullQueryStorageService` | Writes: silent no-op. Reads: `bSuccess=false` callback, no log spam |
 
-See individual service spec pages for the exact `UE_LOG` strings each null method emits.
+See individual service spec pages for null implementation details.
 
 ---
 
@@ -328,4 +431,6 @@ If a future system requires background-safe access after teardown, make `Instanc
 - `FGameCoreBackend` has no UObject overhead — it is a plain struct with only static methods and one static pointer.
 - The static null fallbacks (`GNullLogging`, etc.) are file-scope statics in `GameCoreBackend.cpp`. They are constructed at module load and never destroyed until module unload — no order-of-destruction issues.
 - Tag routing resolution is an O(1) `TMap` lookup — negligible cost.
+- Delegate hook null-checks are branch-predicted-not-taken — zero overhead in the common case.
 - This struct must **not** be used in client-side code. All backend services are server-only.
+- See **Custom Wiring Examples** for how to wire delegates to third-party systems without implementing the full service interfaces.

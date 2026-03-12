@@ -5,7 +5,7 @@
 
 Interface for recording immutable, auditable game events into an append-only backend. Used by any system that requires anti-cheat validation, exploit investigation, or rollback tooling — progression, market, inventory, trades, currency changes, etc.
 
-Accessed via `FGameCoreBackend::GetAudit(Key)`.
+Accessed via `FGameCoreBackend::Audit()` (canonical) or `FGameCoreBackend::GetAudit(Key)` for batch/transactional operations.
 
 `InstanceGUID`, `ServerId`, and `Timestamp` are **stamped internally** by `FAuditServiceBase` before dispatch — callers never provide them. `SessionId` is optional and caller-provided.
 
@@ -84,7 +84,7 @@ struct FAuditEntryInternal
 ## Interface Declaration
 
 ```cpp
-UINTERFACE(MinimalAPI, NotBlueprintable)
+UIINTERFACE(MinimalAPI, NotBlueprintable)
 class UAuditService : public UInterface { GENERATED_BODY() };
 
 class GAMECORE_API IAuditService
@@ -110,7 +110,7 @@ public:
     // Enqueue a group of events.
     // bTransactional = true: entries are kept together and delivered as one atomic batch.
     // bTransactional = false (default): best-effort per entry on the backend.
-    virtual void RecordBatch(const TArray<FAuditEntry>& Entries, bool bTransactional = false) = 0;
+    virtual void RecordBatch(TArray<FAuditEntry>&& Entries, bool bTransactional = false) = 0;
 };
 ```
 
@@ -127,15 +127,15 @@ public:
     // --- Configuration (set before Connect) ---
     float FlushIntervalSeconds  = 2.0f;
     int32 MaxQueueSize          = 10000;  // Hard cap — oldest entries dropped on overflow
-    float FlushThresholdPercent = 0.75f;  // Pressure flush: immediate flush when queue reaches this fill ratio
-    int32 MaxBatchSize          = 500;    // Implementation hint: DispatchBatch must be split into chunks of this size
+    float FlushThresholdPercent = 0.75f;  // Pressure flush: immediate flush at this fill ratio
+    int32 MaxBatchSize          = 500;    // Hint: DispatchBatch must split into chunks of this size
 
     // --- IAuditService ---
     virtual bool Connect(const FString& ConnectionString) override;
     virtual void Flush() override;
     virtual void SetServerId(const FString& InServerId) override;
     virtual void RecordEvent(const FAuditEntry& Entry) override;
-    virtual void RecordBatch(const TArray<FAuditEntry>& Entries, bool bTransactional = false) override;
+    virtual void RecordBatch(TArray<FAuditEntry>&& Entries, bool bTransactional = false) override;
 
 protected:
     // Implementors override this — receives a ready-to-send batch, already stamped.
@@ -193,7 +193,7 @@ Flush() (graceful shutdown):
 
 ## Null Fallback Implementation
 
-`FNullAuditService` is used by `FGameCoreBackend` when no service is registered or the subsystem is not live. Events are routed to `UE_LOG(LogGameCore, Log, ...)` so they remain visible in development and are never silently dropped.
+`FNullAuditService` is used by `FGameCoreBackend` when no service is registered and no `OnAudit` delegate is bound. It is a **silent no-op** — audit is opt-in infrastructure and should never pollute logs when not configured.
 
 ```cpp
 class GAMECORE_API FNullAuditService : public IAuditService
@@ -202,25 +202,14 @@ public:
     virtual bool Connect(const FString&) override { return true; }
     virtual void Flush() override {}
     virtual void SetServerId(const FString&) override {}
-
-    virtual void RecordEvent(const FAuditEntry& Entry) override
-    {
-        UE_LOG(LogGameCore, Log,
-            TEXT("[NullAudit] Event [%s] Actor=%s: %s"),
-            *Entry.EventTag.ToString(),
-            *Entry.ActorId.ToString(),
-            *Entry.Payload);
-    }
-
-    virtual void RecordBatch(const TArray<FAuditEntry>& Entries, bool) override
-    {
-        for (const FAuditEntry& Entry : Entries)
-            RecordEvent(Entry);
-    }
+    virtual void RecordEvent(const FAuditEntry&) override {}
+    virtual void RecordBatch(TArray<FAuditEntry>&&, bool) override {}
 };
 ```
 
 This implementation is declared in `AuditService.h` and instantiated as the static fallback `GNullAudit` in `GameCoreBackend.cpp`.
+
+> **Rationale:** Unlike logging (which must always surface to UE_LOG) and storage (which returns failure callbacks), audit is opt-in infrastructure. Log-spamming when audit is not configured provides no value and creates noise. If you need to debug audit call sites in development, bind the `OnAudit` delegate to a local lambda that calls `UE_LOG`.
 
 ---
 
@@ -251,7 +240,7 @@ private:
 ## Usage Example — Market Trade
 
 ```cpp
-void UMarketSystem::AuditTrade(
+void UMarketSubsystem::AuditTrade(
     const FGuid& BuyerActorId,   const FString& BuyerName,
     const FGuid& ListingId,
     int32        Price,
@@ -271,7 +260,9 @@ void UMarketSystem::AuditTrade(
         .SetGuid  (TEXT("listing"),  ListingId)
         .ToString();
 
-    FGameCoreBackend::GetAudit(TEXT("Gameplay"))->RecordEvent(Entry);
+    // Use canonical method — routes through OnAudit delegate if bound,
+    // otherwise through subsystem, otherwise silent no-op.
+    FGameCoreBackend::Audit(Entry);
 }
 ```
 
