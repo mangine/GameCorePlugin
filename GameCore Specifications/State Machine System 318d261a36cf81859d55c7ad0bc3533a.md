@@ -2,7 +2,7 @@
 
 **Part of: GameCore Plugin** | **Status: Active Specification** | **UE Version: 5.7**
 
-The State Machine System is a data-driven, event-driven, graph-based finite state machine framework. It is game-agnostic and designed to be extended by any system — quests, ship states, NPC behaviour, UI flows — without modification to the core. States and transitions are authored as instanced UObjects inside a `UDataAsset` graph definition, edited via a custom graph editor, and driven at runtime by the owning system through explicit event calls. Execution authority is declared per-component and can be server-only, client-only, or replicated.
+The State Machine System is a data-driven, event-driven, graph-based finite state machine framework. It is game-agnostic and designed to be extended by any system — quests, ship states, NPC behaviour, UI flows — without modification to the core.
 
 ---
 
@@ -18,38 +18,32 @@ The State Machine System is a data-driven, event-driven, graph-based finite stat
 | Runtime Driver | `UStateMachineComponent` | Actor component that hosts an asset and drives execution. |
 | Authority Mode | `EStateMachineAuthority` | Enum declaring server-only, client-only, or replicated execution per component. |
 
-> `UStateNodeBase` and `UTransitionRule` are `UCLASS(Abstract, EditInlineNew)` — instanced UObjects owned by the asset, not standalone Content Browser assets. Same pattern as Behavior Tree Tasks and PCG Nodes. No per-asset overhead in the Content Browser.
-> 
-
 ---
 
 # Core Design Principles
 
-- **The asset is the definition, the component is the runtime.** `UStateMachineAsset` carries no mutable state. All runtime data lives in `FStateMachineRuntime` on the component. The same asset can be shared across many components safely.
-- **Event-driven by default, no tick.** The component does not tick. Transitions fire only when the owning system calls `RequestTransition` or `EvaluateTransitions`. The owning system decides when to poke the machine.
-- **Authority is explicit.** `EStateMachineAuthority` is set at design time on the component. The component enforces it at runtime — it does not rely on the owning actor's net role. This makes components reusable across server-only, client-only, and replicated actors without logic changes.
-- **Only current state replicates.** A single `FGameplayTag` travels over the wire. State node data, history, and rule state never replicate. Clients receive `OnStateChanged` and reconstruct any derived display state locally.
-- **No cross-system imports at the core layer.** `UStateNodeBase` and `UTransitionRule` in `StateMachine/` have zero dependencies on game systems. Each extending system subclasses these types inside its own folder.
-- **Subclassing is the extension mechanism.** There is no central registry. A quest system creates `UQuestStateNode : UStateNodeBase`. A ship system creates `UShipStateNode : UStateNodeBase`. The graph editor discovers all `EditInlineNew` subclasses automatically via UE reflection.
+- **The asset is the definition, the component is the runtime.** `UStateMachineAsset` carries no mutable state.
+- **Event-driven by default, no tick.** Transitions fire only when the owning system calls `RequestTransition` or `EvaluateTransitions`.
+- **Authority is explicit.** `EStateMachineAuthority` is set at design time on the component.
+- **Only current state replicates.** A single `FGameplayTag` travels over the wire.
+- **No cross-system imports at the core layer.** `UStateNodeBase` and `UTransitionRule` have zero dependencies on game systems.
+- **Subclassing is the extension mechanism.** No central registry.
 
 ---
 
 # How the Pieces Connect
 
-**Authoring.** A designer or programmer creates a `UStateMachineAsset` (or a typed subclass like `UQuestStateMachineAsset`) in the Content Browser and opens it in the custom graph editor. States are added as nodes — each node is an instanced `UStateNodeBase` subclass chosen from a class picker showing all loaded subclasses. Transitions are drawn as edges, each referencing an instanced `UTransitionRule` (or left rule-free for unconditional transitions). An Entry node marks the initial state. Any-state transitions are configured in a sidebar panel.
+**Authoring.** A designer creates a `UStateMachineAsset`, opens it in the graph editor, adds state nodes, and draws transition edges.
 
-**Runtime setup.** `UStateMachineComponent` is added to an Actor. `StateMachineAsset` is assigned and `AuthorityMode` is set. On `BeginPlay`, the component validates the asset, instantiates `FStateMachineRuntime`, enters the entry state (calling `OnEnter` on the first `UStateNodeBase`), and is ready. No tick is registered.
+**Runtime setup.** `UStateMachineComponent` is added to an Actor, the asset assigned, `AuthorityMode` set. On `BeginPlay` the component validates the asset, instantiates `FStateMachineRuntime`, enters the entry state, and is ready.
 
-**Driving transitions.** The owning system calls either:
+**Driving transitions.** The owning system calls:
+- `RequestTransition(TargetStateTag)` — forced move, owning system has already validated.
+- `EvaluateTransitions(ContextObject)` — machine checks its rules; first passing rule wins.
 
-- `RequestTransition(TargetStateTag)` — when the owning system already knows the desired next state (direct push).
-- `EvaluateTransitions(ContextObject)` — when the owning system signals that something relevant happened and the machine should check its rules.
+**State change.** On transition: `OnExit` → runtime update → `OnEnter` → `OnStateChanged` delegate fires → GMS broadcast fires.
 
-On `EvaluateTransitions`, any-state rules are evaluated first, then rules from the current state's outgoing transitions in definition order. The first passing rule wins. `RequestTransition` bypasses rules entirely — it is a forced move and must only be called when the owning system has already validated the transition is correct.
-
-**State change.** On transition: `OnExit` fires on the leaving node → `FStateMachineRuntime` updates current state and pushes to history → `OnEnter` fires on the entering node → `OnStateChanged` delegate broadcasts. On the server with `AuthorityMode != ClientOnly`, the replicated state tag is updated and pushed to clients via the normal replication path.
-
-**Client reception.** Clients with `AuthorityMode == Both` receive the replicated `FGameplayTag`. `OnStateChanged` fires on the client, allowing cosmetic updates, UI sync, and animation state changes without any additional RPCs.
+**Client reception.** Clients with `AuthorityMode == Both` receive the replicated `FGameplayTag`. `OnStateChanged` fires locally for cosmetics and UI sync.
 
 ---
 
@@ -59,16 +53,9 @@ On `EvaluateTransitions`, any-state rules are evaluated first, then rules from t
 UENUM(BlueprintType)
 enum class EStateMachineAuthority : uint8
 {
-    // Machine runs on server only. Current state tag replicates to clients.
-    // Clients receive OnStateChanged but cannot call RequestTransition or EvaluateTransitions.
-    ServerOnly,
-
-    // Machine runs on owning client only. Nothing replicates. Used for cosmetic-only machines.
-    ClientOnly,
-
-    // Server is authoritative. Current state tag replicates. Clients may run a local
-    // predicted copy but server result always wins on conflict.
-    Both
+    ServerOnly,   // Runs server only. State tag replicates to clients.
+    ClientOnly,   // Runs owning client only. Nothing replicates.
+    Both          // Server authoritative. Client runs predicted copy.
 };
 ```
 
@@ -81,35 +68,26 @@ UCLASS(BlueprintType)
 class GAMECORE_API UStateMachineAsset : public UDataAsset
 {
     GENERATED_BODY()
-
 public:
-    // All state nodes in this machine. Instanced — each asset owns its own copies.
     UPROPERTY(EditDefaultsOnly, Instanced, Category = "States")
     TArray<TObjectPtr<UStateNodeBase>> States;
 
-    // All transitions. Evaluated in order during EvaluateTransitions.
     UPROPERTY(EditDefaultsOnly, Category = "Transitions")
     TArray<FStateTransition> Transitions;
 
-    // Transitions evaluated from any state regardless of current state (e.g. forced reset, death).
-    // Checked before per-state transitions in EvaluateTransitions.
     UPROPERTY(EditDefaultsOnly, Category = "Transitions")
     TArray<FStateTransition> AnyStateTransitions;
 
-    // Tag identifying the entry state. Must match a StateTag on one of the States entries.
     UPROPERTY(EditDefaultsOnly, Category = "States")
     FGameplayTag EntryStateTag;
 
-    // Max history entries retained at runtime. 0 = history disabled.
     UPROPERTY(EditDefaultsOnly, Category = "Settings", meta = (ClampMin = 0, ClampMax = 32))
     int32 HistorySize = 8;
 
-    // Editor: validate that all transition FromState/ToState tags resolve to known states.
 #if WITH_EDITOR
     virtual EDataValidationResult IsDataValid(FDataValidationContext& Context) const override;
 #endif
 
-    // Returns the node for a given state tag. Returns null if not found.
     UStateNodeBase* FindNode(const FGameplayTag& StateTag) const;
 };
 ```
@@ -123,72 +101,23 @@ UCLASS(Abstract, EditInlineNew, CollapseCategories, BlueprintType, Blueprintable
 class GAMECORE_API UStateNodeBase : public UObject
 {
     GENERATED_BODY()
-
 public:
-    // Stable identifier for this state. Must be unique within the owning asset.
     UPROPERTY(EditDefaultsOnly, Category = "State")
     FGameplayTag StateTag;
 
-    // Optional gameplay tags applied to the owning actor while this state is active.
-    // Applied on OnEnter, removed on OnExit. Requires ITaggedInterface on the owner.
-    UPROPERTY(EditDefaultsOnly, Category = "State")
-    FGameplayTagContainer GrantedTags;
-    // If true, no transition can interrupt this state once entered — including RequestTransition.
-    // OnTransitionBlocked fires for any rejected attempt.
-    // Use for irreversible or safety-critical states: Sinking, Boarding, Cutscene, Death.
-    // AnyStateTransitions with bCanBypassNonInterruptible = true still fire (for hard resets).
+    // No transition may leave this state unless the transition has bCanBypassNonInterruptible.
     UPROPERTY(EditDefaultsOnly, Category = "State")
     bool bNonInterruptible = false;
 
-    // Called when the machine enters this state.
-    // Component is the UStateMachineComponent driving this machine.
+    UPROPERTY(EditDefaultsOnly, Category = "State")
+    FGameplayTagContainer GrantedTags;
+
     virtual void OnEnter(UStateMachineComponent* Component) {}
-
-    // Called when the machine exits this state.
-    virtual void OnExit(UStateMachineComponent* Component) {}
-
-    // Blueprint extension points.
-    UFUNCTION(BlueprintImplementableEvent, Category = "State Machine")
-    void BP_OnEnter(UStateMachineComponent* Component);
-
-    UFUNCTION(BlueprintImplementableEvent, Category = "State Machine")
-    void BP_OnExit(UStateMachineComponent* Component);
+    virtual void OnExit(UStateMachineComponent* Component)  {}
 
 #if WITH_EDITOR
-    // Short description shown on the node in the graph editor.
-    virtual FString GetNodeDescription() const { return StateTag.ToString(); }
-
-    // Color used for this node type in the graph editor. Override in subclasses.
-    virtual FLinearColor GetNodeColor() const { return FLinearColor(0.2f, 0.4f, 0.8f); }
-#endif
-};
-```
-
----
-
-# `UTransitionRule`
-
-```cpp
-UCLASS(Abstract, EditInlineNew, CollapseCategories, BlueprintType, Blueprintable)
-class GAMECORE_API UTransitionRule : public UObject
-{
-    GENERATED_BODY()
-
-public:
-    // Evaluate whether this rule passes.
-    // Context is an optional object supplied by the owning system via EvaluateTransitions.
-    // Must return immediately — no async, no deferred results.
-    virtual bool Evaluate(UStateMachineComponent* Component, UObject* Context) const
-    {
-        return false;
-    }
-
-    UFUNCTION(BlueprintImplementableEvent, Category = "State Machine")
-    bool BP_Evaluate(UStateMachineComponent* Component, UObject* Context) const;
-
-#if WITH_EDITOR
-    // Short label displayed on the transition edge in the graph editor.
-    virtual FString GetRuleDescription() const { return TEXT("Rule"); }
+    virtual FString GetNodeDescription() const { return FString(); }
+    virtual FLinearColor GetNodeColor()   const { return FLinearColor::White; }
 #endif
 };
 ```
@@ -198,48 +127,20 @@ public:
 # `FStateTransition`
 
 ```cpp
-// Composition mode for multi-rule transitions.
-UENUM(BlueprintType)
-enum class ETransitionComposition : uint8
-{
-    // All rules must pass.
-    AND,
-    // Any one rule must pass.
-    OR
-};
-
-USTRUCT(BlueprintType)
+USTRUCT()
 struct GAMECORE_API FStateTransition
 {
     GENERATED_BODY()
 
-    // Tag of the source state. Empty = any-state transition (used in AnyStateTransitions array).
-    UPROPERTY(EditDefaultsOnly, Category = "Transition")
-    FGameplayTag FromStateTag;
+    UPROPERTY(EditDefaultsOnly) FGameplayTag FromState;
+    UPROPERTY(EditDefaultsOnly) FGameplayTag ToState;
+    UPROPERTY(EditDefaultsOnly, Instanced) TObjectPtr<UTransitionRule> Rule;
+    UPROPERTY(EditDefaultsOnly) ETransitionComposition Composition = ETransitionComposition::And;
 
-    // Tag of the destination state.
-    UPROPERTY(EditDefaultsOnly, Category = "Transition")
-    FGameplayTag ToStateTag;
+    // If true, this transition may fire even when current state is bNonInterruptible.
+    // Reserved for hard resets (AnyState → Destroyed).
+    UPROPERTY(EditDefaultsOnly) bool bCanBypassNonInterruptible = false;
 
-    // Rules evaluated to determine if this transition can fire.
-    // Empty = unconditional transition (always passes when evaluated).
-    UPROPERTY(EditDefaultsOnly, Instanced, Category = "Transition")
-    TArray<TObjectPtr<UTransitionRule>> Rules;
-
-    // How multiple rules are composed.
-    UPROPERTY(EditDefaultsOnly, Category = "Transition")
-    ETransitionComposition Composition = ETransitionComposition::AND;
-
-    // Priority. Higher values are evaluated first within the same FromState.
-    UPROPERTY(EditDefaultsOnly, Category = "Transition")
-    int32 Priority = 0;
-    // If true, this transition can fire even when the current state has bNonInterruptible = true.
-    // Use sparingly — only for hard resets (e.g. AnyState → Destroyed, AnyState → ForceReset).
-    // Has no effect when the current state is interruptible.
-    UPROPERTY(EditDefaultsOnly, Category = "Transition")
-    bool bCanBypassNonInterruptible = false;
-
-    // Evaluate all rules against the current component and context.
     bool Evaluate(UStateMachineComponent* Component, UObject* Context) const;
 };
 ```
@@ -254,29 +155,14 @@ struct GAMECORE_API FStateMachineRuntime
 {
     GENERATED_BODY()
 
-    // Currently active state tag.
-    UPROPERTY()
-    FGameplayTag CurrentStateTag;
+    UPROPERTY() FGameplayTag CurrentStateTag;
+    UPROPERTY() TArray<FGameplayTag> History;
+    UPROPERTY() float CurrentStateEnterTime = 0.f;
+    UPROPERTY() int32 TransitionCount = 0;
 
-    // Previous state tags, newest first. Capped by UStateMachineAsset::HistorySize.
-    UPROPERTY()
-    TArray<FGameplayTag> History;
-
-    // World time when the current state was entered.
-    UPROPERTY()
-    float CurrentStateEnterTime = 0.f;
-
-    // Total number of transitions that have fired since BeginPlay.
-    UPROPERTY()
-    int32 TransitionCount = 0;
-
-    // Returns how long (in seconds) the machine has been in the current state.
-    float GetTimeInCurrentState(const UWorld* World) const;
-
-    // Returns the previous state tag, or an empty tag if history is empty.
+    float        GetTimeInCurrentState(const UWorld* World) const;
     FGameplayTag GetPreviousStateTag() const;
-
-    void Reset();
+    void         Reset();
 };
 ```
 
@@ -300,70 +186,34 @@ UCLASS(ClassGroup = (GameCore), meta = (BlueprintSpawnableComponent))
 class GAMECORE_API UStateMachineComponent : public UActorComponent
 {
     GENERATED_BODY()
-
 public:
-    // ── Configuration ─────────────────────────────────────────────────────────
-
-    // The graph definition to run. Assigned at design time.
     UPROPERTY(EditDefaultsOnly, Category = "State Machine")
     TObjectPtr<UStateMachineAsset> StateMachineAsset;
 
-    // Execution and replication authority.
     UPROPERTY(EditDefaultsOnly, Category = "State Machine")
     EStateMachineAuthority AuthorityMode = EStateMachineAuthority::ServerOnly;
 
-    // ── Delegates ─────────────────────────────────────────────────────────────
+    // ── Delegates — intra-system / Blueprint convenience ──────────────────────
 
-    // Fires after every successful state transition, on whichever machine(s) run
-    // (server, client, or both depending on AuthorityMode).
+    // Fires after every successful state transition.
+    // Decoupled external systems MUST use GMS channel GameCoreEvent.StateMachine.StateChanged.
     UPROPERTY(BlueprintAssignable, Category = "State Machine")
     FOnStateChanged OnStateChanged;
 
-    // Fires when RequestTransition is called but the target state is not reachable
-    // from the current state (no valid transition edge exists).
+    // Fires when a transition is blocked by bNonInterruptible.
+    // External consumers may use GMS channel GameCoreEvent.StateMachine.TransitionBlocked.
     UPROPERTY(BlueprintAssignable, Category = "State Machine")
     FOnTransitionBlocked OnTransitionBlocked;
 
     // ── Runtime API ───────────────────────────────────────────────────────────
 
-    // Force a transition to TargetState, bypassing all transition rules.
-    // Respects AuthorityMode — no-ops on the wrong authority side.
-    // Blocked if the current state has bNonInterruptible = true, unless the matching
-    // FStateTransition has bCanBypassNonInterruptible = true.
-    // Fires OnTransitionBlocked when rejected (no valid edge OR non-interruptible guard).
-    UFUNCTION(BlueprintCallable, Category = "State Machine")
-    void RequestTransition(FGameplayTag TargetStateTag);
+    void ForceTransition(const FGameplayTag& TargetStateTag);
+    void RequestTransition(const FGameplayTag& TargetStateTag);
+    void EvaluateTransitions(UObject* ContextObject = nullptr);
 
-    // Evaluate all applicable transition rules from the current state (and any-state rules).
-    // Context is forwarded to every UTransitionRule::Evaluate call. May be null.
-    // Fires the first passing transition. No-op if no rules pass.
-    UFUNCTION(BlueprintCallable, Category = "State Machine")
-    void EvaluateTransitions(UObject* Context = nullptr);
+    bool IsInState(const FGameplayTag& StateTag) const;
+    const FStateMachineRuntime& GetRuntime() const { return Runtime; }
 
-    // ── State Queries ─────────────────────────────────────────────────────────
-
-    UFUNCTION(BlueprintPure, Category = "State Machine")
-    FGameplayTag GetCurrentStateTag() const;
-
-    UFUNCTION(BlueprintPure, Category = "State Machine")
-    bool IsInState(FGameplayTag StateTag) const;
-
-    UFUNCTION(BlueprintPure, Category = "State Machine")
-    float GetTimeInCurrentState() const;
-
-    UFUNCTION(BlueprintPure, Category = "State Machine")
-    FGameplayTag GetPreviousStateTag() const;
-
-    UFUNCTION(BlueprintPure, Category = "State Machine")
-    const UStateMachineAsset* GetAsset() const { return StateMachineAsset; }
-
-    // ── UActorComponent ───────────────────────────────────────────────────────
-
-    virtual void BeginPlay() override;
-    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
-
-protected:
-    // Replicated current state tag (ServerOnly and Both modes only).
     UPROPERTY(ReplicatedUsing = OnRep_CurrentStateTag)
     FGameplayTag ReplicatedStateTag;
 
@@ -375,10 +225,80 @@ private:
 
     void EnterState(const FGameplayTag& NewStateTag);
     bool CanExecuteLocally() const;
-    // Returns true if the transition to TargetStateTag is permitted given the current state's
-    // bNonInterruptible flag and the transition's bCanBypassNonInterruptible flag.
     bool IsTransitionPermitted(const FGameplayTag& TargetStateTag) const;
 };
+```
+
+---
+
+## EnterState — GMS Broadcast
+
+```cpp
+void UStateMachineComponent::EnterState(const FGameplayTag& NewStateTag)
+{
+    const FGameplayTag PreviousState = Runtime.CurrentStateTag;
+
+    if (UStateNodeBase* OldNode = StateMachineAsset->FindNode(PreviousState))
+        OldNode->OnExit(this);
+
+    Runtime.CurrentStateTag = NewStateTag;
+    if (StateMachineAsset->HistorySize > 0)
+        Runtime.History.Insert(PreviousState, 0);
+    Runtime.CurrentStateEnterTime = GetWorld()->GetTimeSeconds();
+    Runtime.TransitionCount++;
+
+    if (UStateNodeBase* NewNode = StateMachineAsset->FindNode(NewStateTag))
+        NewNode->OnEnter(this);
+
+    // 1. Delegate — direct Blueprint bindings and intra-actor wiring.
+    OnStateChanged.Broadcast(this, PreviousState, NewStateTag);
+
+    // 2. GMS — all decoupled external systems listen here.
+    if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    {
+        FStateMachineStateChangedMessage Msg;
+        Msg.Component       = this;
+        Msg.OwnerActor      = GetOwner();
+        Msg.PreviousState   = PreviousState;
+        Msg.NewState        = NewStateTag;
+        Msg.StateMachineAsset = StateMachineAsset;
+        Bus->Broadcast(GameCoreEventTags::StateMachine_StateChanged, Msg);
+    }
+}
+```
+
+## IsTransitionPermitted — GMS Broadcast on Block
+
+```cpp
+bool UStateMachineComponent::IsTransitionPermitted(const FGameplayTag& TargetStateTag) const
+{
+    const UStateNodeBase* CurrentNode = StateMachineAsset->FindNode(Runtime.CurrentStateTag);
+    if (!CurrentNode || !CurrentNode->bNonInterruptible)
+        return true;
+
+    for (const FStateTransition& T : StateMachineAsset->Transitions)
+    {
+        if (T.FromState == Runtime.CurrentStateTag
+            && T.ToState == TargetStateTag
+            && T.bCanBypassNonInterruptible)
+            return true;
+    }
+
+    // Blocked — fire delegate and GMS broadcast.
+    OnTransitionBlocked.Broadcast(const_cast<UStateMachineComponent*>(this), TargetStateTag);
+
+    if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    {
+        FStateMachineTransitionBlockedMessage Msg;
+        Msg.Component          = const_cast<UStateMachineComponent*>(this);
+        Msg.OwnerActor         = GetOwner();
+        Msg.BlockedTargetState = TargetStateTag;
+        Msg.CurrentState       = Runtime.CurrentStateTag;
+        Bus->Broadcast(GameCoreEventTags::StateMachine_TransitionBlocked, Msg);
+    }
+
+    return false;
+}
 ```
 
 ---
@@ -387,17 +307,13 @@ private:
 
 | Authority Mode | Server Evaluates | Client Evaluates | What Replicates |
 | --- | --- | --- | --- |
-| `ServerOnly` | ✅ | ❌ | `ReplicatedStateTag` → clients receive `OnStateChanged` |
-| `ClientOnly` | ❌ | ✅ (owning client only) | Nothing |
+| `ServerOnly` | ✅ | ❌ | `ReplicatedStateTag` → clients receive `OnStateChanged` + GMS broadcast |
+| `ClientOnly` | ❌ | ✅ (owning client) | Nothing |
 | `Both` | ✅ (authoritative) | ✅ (predicted) | `ReplicatedStateTag` → client corrects on mismatch |
-
-`RequestTransition` and `EvaluateTransitions` are no-ops when called on the wrong authority side. No RPC is emitted — the owning system is responsible for calling these on the correct machine.
 
 ---
 
 # Extension Pattern
-
-Game code and game plugins subclass `UStateNodeBase`, `UTransitionRule`, and optionally `UStateMachineAsset`. GameCore is never modified.
 
 ```
 GameCore/
@@ -408,92 +324,49 @@ GameCore/
 
 Game / QuestPlugin/
   UQuestStateMachineAsset  : UStateMachineAsset
-  UQuestStateNode          : UStateNodeBase   (+ FQuestStateData USTRUCT payload)
+  UQuestStateNode          : UStateNodeBase
   UQuestTransitionRule     : UTransitionRule
 ```
-
-`FQuestStateData` is a plain USTRUCT embedded in `UQuestStateNode` as an `EditAnywhere` property. BP-editable in the asset Details panel. Zero overhead — no extra UObject, no asset reference.
-
----
-
-# Editor Graph
-
-A custom graph editor is provided in the `GameCoreEditor` module:
-
-- **Nodes** — one per `UStateNodeBase` instance. Color-coded by subclass via `GetNodeColor()`. Entry node has a fixed visual indicator.
-- **Edges** — one per `FStateTransition`. Label shows `UTransitionRule::GetRuleDescription()` per rule, joined by AND/OR.
-- **Details panel** — selecting a node or edge opens its `UStateNodeBase` or `UTransitionRule` properties inline, identical to editing a BT task.
-- **Any-state transitions** — displayed in a collapsible sidebar panel, not as graph edges, to avoid visual clutter.
-- **PIE highlight** — active state node is highlighted in real time. Read-only during PIE; no edits allowed.
-- **Validation** — dangling tags (transitions referencing non-existent states) shown as errors inline on the edge, matching the `IsDataValid` result.
-
----
-
-# Implementation Constraints
-
-- **`UTransitionRule::Evaluate` must be const and return immediately.** No async, no deferred results, no RPC calls from within.
-- **`UStateNodeBase::OnEnter` / `OnExit` must be non-reentrant.** Do not call `RequestTransition` from within `OnEnter` or `OnExit`. Post a deferred call if a follow-on transition is needed.
-- **State tags must be unique within an asset.** Enforced by `IsDataValid`. Duplicate tags are an authoring error, not a runtime error.
-- **The asset must not be modified at runtime.** It is shared across all components using it. All mutable state lives in `FStateMachineRuntime` on the component.
-- **`GrantedTags` on `UStateNodeBase` requires `ITaggedInterface` on the owning actor.** If the interface is absent, tag granting is silently skipped — no crash.
-- **`RequestTransition` is a forced move.** It does not validate that a transition edge exists. Use only when the calling system has already verified correctness. `EvaluateTransitions` is the rule-safe path.
-- **Blueprint subclasses of `UStateNodeBase` and `UTransitionRule` are supported** but carry a BP VM overhead on every `OnEnter`/`OnExit`/`Evaluate` call. Hot-path nodes (evaluated many times per second) should be C++.
-- **`AuthorityMode` is not changed at runtime.** Set it at design time on the component's default properties. Runtime changes have undefined behaviour.
-
----
-
-# Network Considerations
-
-The component has no RPC methods. It is a pure local evaluator with a single replicated property.
-
-| Concern | Approach |
-| --- | --- |
-| State replication | `ReplicatedStateTag` is a single `FGameplayTag`. Minimal bandwidth. |
-| Client correction (`Both` mode) | `OnRep_CurrentStateTag` calls `EnterState` locally, firing `OnStateChanged` and `OnEnter`/`OnExit` on the client. |
-| Transition authority | `RequestTransition` / `EvaluateTransitions` are no-ops on the wrong authority side. The owning system is responsible for calling them in the right context. |
-| No transition RPCs | The state machine does not emit RPCs. If the owning system needs to trigger a server-side transition from a client event, it handles that RPC itself and then calls `EvaluateTransitions` server-side. |
 
 ---
 
 # Known Limitations
 
-**Non-interruptible state contract.** When `bNonInterruptible = true` on `UStateNodeBase`, both `RequestTransition` and `EvaluateTransitions` will reject any transition attempt and fire `OnTransitionBlocked`. The only exception is a matching `FStateTransition` with `bCanBypassNonInterruptible = true` — reserved for hard resets (AnyState → Destroyed). Owning systems should no longer manually guard with `IsInState` checks for this purpose; the machine enforces it.
-
-**`Both` mode misprediction rollback contract.** When the server transitions to a different state than the client predicted, `OnRep_CurrentStateTag` fires `EnterState` on the client with the correct server state. This calls `OnExit` on the mispredicted state and `OnEnter` on the corrected state. **The owning system is responsible for all side-effect cleanup** — VFX, sounds, animation state, and any gameplay data mutated during the mispredicted `OnEnter` must be undone in that state's `OnExit` implementation. The recommended pattern is: keep `OnEnter` side effects idempotent or tag-gated, and implement `OnExit` defensively to always clean up regardless of whether the state completed normally or was rolled back.
-
-**History is not replicated.** Clients in `ServerOnly` and `Both` modes only receive the current state. If a client needs history (e.g., for UI "previous step" display), it must reconstruct it locally from `OnStateChanged` events.
-
-**Hierarchical FSMs are deferred.** Multiple state machines can communicate via `OnStateChanged` events and Gameplay Tags. Nested execution is not supported in this version.
+- **Non-interruptible state contract.** `bNonInterruptible` blocks all transitions except those with `bCanBypassNonInterruptible`.
+- **`Both` mode misprediction rollback.** `OnRep_CurrentStateTag` fires `EnterState` with the correct server state. Owning system is responsible for all side-effect cleanup in `OnExit`.
+- **History is not replicated.** Clients reconstruct from `OnStateChanged` / GMS events.
+- **Hierarchical FSMs deferred.** Multiple machines communicate via GMS state-changed events and Gameplay Tags.
 
 ---
 
 # File and Folder Structure
 
-```cpp
+```
 GameCore/
 └── Source/
-    ├── GameCore/                              ← Runtime module
+    ├── GameCore/
     │   └── StateMachine/
-    │       ├── StateMachineTypes.h            ← EStateMachineAuthority, ETransitionComposition,
-    │       │                                     FStateTransition, FStateMachineRuntime
-    │       ├── StateMachineAsset.h / .cpp     ← UStateMachineAsset
-    │       ├── StateNodeBase.h / .cpp         ← UStateNodeBase
-    │       ├── TransitionRule.h / .cpp        ← UTransitionRule
-    │       └── StateMachineComponent.h / .cpp ← UStateMachineComponent
-    │
-    └── GameCoreEditor/                        ← Editor-only module (not in packaged builds)
+    │       ├── StateMachineTypes.h
+    │       ├── StateMachineAsset.h / .cpp
+    │       ├── StateNodeBase.h / .cpp
+    │       ├── TransitionRule.h / .cpp
+    │       └── StateMachineComponent.h / .cpp
+    └── GameCoreEditor/
         └── StateMachine/
-            ├── StateMachineGraph.h / .cpp             ← UEdGraph subclass + schema
-            ├── StateMachineGraphNode.h / .cpp         ← UEdGraphNode per state
-            ├── StateMachineGraphNode_Entry.h / .cpp   ← Fixed entry node
-            ├── StateMachineGraphTransition.h / .cpp   ← UEdGraphNode for transition edges
-            └── StateMachineEditorToolkit.h / .cpp     ← FAssetEditorToolkit, opens on asset double-click
+            ├── StateMachineGraph.h / .cpp
+            ├── StateMachineGraphNode.h / .cpp
+            ├── StateMachineGraphNode_Entry.h / .cpp
+            ├── StateMachineGraphTransition.h / .cpp
+            └── StateMachineEditorToolkit.h / .cpp
 ```
 
-**Key decisions:**
+---
 
-`StateMachineTypes.h` is a single header for all enums and structs — included by the asset, component, and node files. Isolating it avoids cascade recompiles when struct fields change.
+# Implementation Constraints
 
-`GameCoreEditor` is a separate module. Graph tooling, Slate widgets, and editor-only validation must not be loaded in packaged builds.
-
-No `Public/Private` split. Feature-per-folder is sufficient at this scale.
+- **`UTransitionRule::Evaluate` must be const and return immediately.**
+- **`UStateNodeBase::OnEnter` / `OnExit` must be non-reentrant.** Do not call `RequestTransition` from within them — post a deferred call.
+- **State tags must be unique within an asset.**
+- **The asset must not be modified at runtime.**
+- **`RequestTransition` is a forced move** — use only when the caller has verified correctness.
+- **`AuthorityMode` is not changed at runtime.**
