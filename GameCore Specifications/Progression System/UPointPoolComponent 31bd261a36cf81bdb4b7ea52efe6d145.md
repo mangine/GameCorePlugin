@@ -2,11 +2,9 @@
 
 ## Overview
 
-`UPointPoolComponent` is a **standalone replicated `UActorComponent`** that tracks named point pools on an Actor. It is the single aggregation point for all spendable point currencies — skill points, attribute points, talent points, or any custom pool defined by a `FGameplayTag`.
+`UPointPoolComponent` is a replicated `UActorComponent` that manages one or more named point pools on an Actor. Each pool is identified by a `FGameplayTag` and tracks available (spendable) and consumed points separately. The component is a standalone state owner — it has no knowledge of `ULevelingComponent` or any other system. Any system may call `AddPoints` or `ConsumePoints` directly.
 
-It has **no knowledge of leveling**. Any system — `ULevelingComponent`, quest rewards, seasonal events, GM grants — simply calls `AddPoints(Tag, Amount)`. The component tracks available vs consumed and exposes spendable balance.
-
-All mutations are **server-only**. Clients receive delta-replicated pool state.
+All mutations are **server-only**. The client receives delta-replicated state via FastArray.
 
 ## Plugin Module
 
@@ -21,7 +19,8 @@ GameCore/Source/GameCore/Progression/
 
 ## Dependencies
 
-None. `UPointPoolComponent` is a leaf module — it does not depend on `ULevelingComponent` or any other GameCore system.
+- `IPersistableComponent` — implemented for binary save/load via the Serialization System.
+- `UGameCoreEventSubsystem` — broadcast target for cross-system pool change events.
 
 ---
 
@@ -29,99 +28,92 @@ None. `UPointPoolComponent` is a leaf module — it does not depend on `ULevelin
 
 ```cpp
 UCLASS(ClassGroup = (GameCore), meta = (BlueprintSpawnableComponent))
-class GAMECORE_API UPointPoolComponent : public UActorComponent
+class GAMECORE_API UPointPoolComponent : public UActorComponent, public IPersistableComponent
 {
     GENERATED_BODY()
 
 public:
-    UPointPoolComponent();
+    // ── Registration ─────────────────────────────────────────────────────────
 
-    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
-
-    // -------------------------------------------------------------------------
-    // Pool Configuration
-    // -------------------------------------------------------------------------
-
-    /**
-     * Registers a pool tag so it can receive points.
-     * Optional cap: 0 = no cap. Server-only.
-     */
     UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Points")
-    void RegisterPool(FGameplayTag PoolTag, int32 Cap = 0);
+    void RegisterPool(FGameplayTag PoolTag, int32 Cap = INDEX_NONE);
 
-    // -------------------------------------------------------------------------
-    // Mutations (server-only)
-    // -------------------------------------------------------------------------
+    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Points")
+    void UnregisterPool(FGameplayTag PoolTag);
 
-    /**
-     * Adds points to a pool. Clamps to cap if one is set.
-     * Returns EPointAddResult to inform caller if points were lost to cap.
-     * Server-only.
-     */
+    // ── Mutation ──────────────────────────────────────────────────────────────
+
     UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Points")
     EPointAddResult AddPoints(FGameplayTag PoolTag, int32 Amount);
 
-    /**
-     * Consumes (spends) points from a pool.
-     * Returns false if insufficient spendable points. Server-only.
-     */
     UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Points")
     bool ConsumePoints(FGameplayTag PoolTag, int32 Amount);
 
-    /**
-     * Sets the cap on an existing pool. 0 removes the cap. Server-only.
-     */
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Points")
-    void SetPoolCap(FGameplayTag PoolTag, int32 NewCap);
+    // ── Queries ───────────────────────────────────────────────────────────────
 
-    // -------------------------------------------------------------------------
-    // Queries (safe to call from client)
-    // -------------------------------------------------------------------------
+    UFUNCTION(BlueprintCallable, Category = "Points")
+    int32 GetSpendable(FGameplayTag PoolTag) const;
 
-    UFUNCTION(BlueprintPure, Category = "Points")
-    int32 GetAvailable(FGameplayTag PoolTag) const;
-
-    UFUNCTION(BlueprintPure, Category = "Points")
+    UFUNCTION(BlueprintCallable, Category = "Points")
     int32 GetConsumed(FGameplayTag PoolTag) const;
 
-    UFUNCTION(BlueprintPure, Category = "Points")
-    int32 GetSpendable(FGameplayTag PoolTag) const;  // Available - Consumed
-
-    UFUNCTION(BlueprintPure, Category = "Points")
-    int32 GetCap(FGameplayTag PoolTag) const;  // 0 = no cap
-
-    UFUNCTION(BlueprintPure, Category = "Points")
+    UFUNCTION(BlueprintCallable, Category = "Points")
     bool IsPoolRegistered(FGameplayTag PoolTag) const;
 
-    // -------------------------------------------------------------------------
-    // Persistence
-    // -------------------------------------------------------------------------
+    // ── Persistence ───────────────────────────────────────────────────────────
 
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence")
+    virtual void SerializeForSave(FArchive& Ar) override;
+    virtual void DeserializeFromSave(FArchive& Ar) override;
+
+    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence|Debug")
     FString SerializeToString() const;
 
-    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence")
+    UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "Persistence|Debug")
     void DeserializeFromString(const FString& Data);
 
-    // -------------------------------------------------------------------------
-    // Delegates
-    // -------------------------------------------------------------------------
+    // ── Delegates  (intra-system only) ────────────────────────────────────────
 
     // Fired whenever a pool's available or consumed count changes.
+    // External systems must use GMS channel GameCoreEvent.Progression.PointPoolChanged instead.
     UPROPERTY(BlueprintAssignable, Category = "Points|Delegates")
     FOnPointPoolChanged OnPoolChanged;
     // Signature: (FGameplayTag PoolTag, int32 NewSpendable, int32 Delta)
 
-    // -------------------------------------------------------------------------
-    // Private
-    // -------------------------------------------------------------------------
 private:
     UPROPERTY(Replicated)
     FPointPoolDataArray PoolData;
 
     FPointPoolData* FindPool(FGameplayTag Tag);
     const FPointPoolData* FindPool(FGameplayTag Tag) const;
+
+    // Broadcasts OnPoolChanged delegate and GMS message after any mutation.
+    void NotifyPoolChanged(FGameplayTag PoolTag, int32 NewSpendable, int32 Delta);
 };
+```
+
+---
+
+## Mutation and Notification Pattern
+
+All mutations route through `NotifyPoolChanged` after applying the change:
+
+```cpp
+void UPointPoolComponent::NotifyPoolChanged(FGameplayTag PoolTag, int32 NewSpendable, int32 Delta)
+{
+    // 1. Intra-system delegate.
+    OnPoolChanged.Broadcast(PoolTag, NewSpendable, Delta);
+
+    // 2. GMS broadcast for external consumers.
+    if (UGameCoreEventSubsystem* EventBus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    {
+        FProgressionPointPoolChangedMessage Msg;
+        Msg.PlayerState   = GetOwner<APlayerState>();
+        Msg.PoolTag       = PoolTag;
+        Msg.NewSpendable  = NewSpendable;
+        Msg.Delta         = Delta;
+        EventBus->Broadcast(GameCoreEventTags::Progression_PointPoolChanged, Msg);
+    }
+}
 ```
 
 ---
@@ -138,7 +130,7 @@ enum class EPointAddResult : uint8
 };
 ```
 
-The caller (e.g. `ULevelingComponent::GrantPointsForLevel`) should log a warning if `PartialCap` is returned, so designers know their progression grant curve is outpacing the configured cap.
+The caller logs a warning on `PartialCap` so designers know their grant curve outpaces the configured cap.
 
 ---
 
@@ -148,36 +140,28 @@ The caller (e.g. `ULevelingComponent::GrantPointsForLevel`) should log a warning
 | --- | --- | --- |
 | `PoolData` (available + consumed + cap) | `FFastArraySerializer` | Delta-compressed per-pool entry |
 | Mutation calls | `BlueprintAuthorityOnly` | Clients can never add or consume points |
+| Pool change notification (external) | `GameCoreEvent.Progression.PointPoolChanged` via GMS | Server broadcasts |
+| Pool change notification (internal) | `OnPoolChanged` delegate | Intra-system only |
 
 ---
 
 ## Design: Available vs Consumed Tracking
 
-Tracking `Available` and `Consumed` separately (rather than a single `Balance`) provides several advantages:
-
-- **Audit** — you always know total lifetime grants vs total spent.
-- **Refund support** — a respec system can zero `Consumed` without touching `Available`.
-- **Cap enforcement** — cap applies to `Available` only, not to `Consumed`; spending is always free of cap.
-- **UI** — the HUD can show both "earned" and "spent" separately for player clarity.
+- **Audit** — total lifetime grants vs total spent always visible.
+- **Refund support** — a respec system zeros `Consumed` without touching `Available`.
+- **Cap enforcement** — cap applies to `Available` only; spending is always cap-free.
+- **UI** — HUD can show both earned and spent separately.
 
 ---
 
 ## Multiple Grant Sources
 
-Any system calls `AddPoints` directly — no routing through `ULevelingComponent`:
-
 ```cpp
 // From a quest reward
-PoolComp->AddPoints(
-    FGameplayTag::RequestGameplayTag("Points.Skill"),
-    3
-);
+PoolComp->AddPoints(FGameplayTag::RequestGameplayTag("Points.Skill"), 3);
 
 // From a seasonal event
-PoolComp->AddPoints(
-    FGameplayTag::RequestGameplayTag("Points.Talent"),
-    1
-);
+PoolComp->AddPoints(FGameplayTag::RequestGameplayTag("Points.Talent"), 1);
 
 // From ULevelingComponent on level-up (internal)
 PoolComp->AddPoints(Grant.PoolTag, Grant.EvaluateForLevel(NewLevel));
@@ -192,31 +176,4 @@ PoolComp->AddPoints(Grant.PoolTag, Grant.EvaluateForLevel(NewLevel));
 | `Points.Skill` | General skill tree points |
 | `Points.Attribute` | Stat allocation points |
 | `Points.Talent` | Prestige / talent tree points |
-| `Points.Reputation.*` | Per-faction spend currency |
-
-Pool tags are project-defined — GameCore ships no tag values, only the infrastructure.
-
----
-
-## Usage Example
-
-```cpp
-// Setup (server, BeginPlay)
-PoolComp->RegisterPool(FGameplayTag::RequestGameplayTag("Points.Skill"), 0);    // No cap
-PoolComp->RegisterPool(FGameplayTag::RequestGameplayTag("Points.Attribute"), 50); // Max 50 unspent
-
-// Spending (server, from skill tree system)
-bool bSuccess = PoolComp->ConsumePoints(
-    FGameplayTag::RequestGameplayTag("Points.Skill"),
-    1
-);
-if (!bSuccess)
-{
-    // Not enough spendable points — reject the spend request
-}
-
-// Query (client-safe)
-int32 Spendable = PoolComp->GetSpendable(
-    FGameplayTag::RequestGameplayTag("Points.Skill")
-);
-```
+| `Points.Reputation.*` | Per-faction reputation points |
