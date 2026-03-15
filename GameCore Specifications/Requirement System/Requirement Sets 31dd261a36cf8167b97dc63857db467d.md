@@ -112,11 +112,21 @@ enum class ERequirementEvalAuthority : uint8
 
     // Client evaluates only. Server never checks.
     // Use for purely cosmetic or UI-gating checks (show tooltip, grey-out button).
+    // All requirements in a ClientOnly list must return ClientOnly or Both from
+    // GetDataAuthority(). A ServerOnly requirement here cannot be evaluated on the
+    // client — ValidateRequirements treats this as a design error at BeginPlay.
     ClientOnly UMETA(DisplayName = "Client Only"),
 
     // Client evaluates for responsiveness. On all-pass, client fires a Server RPC.
     // Server re-evaluates fully from its own context — never trusts the client result.
     // Use for player-facing unlocks where immediate UI feedback matters (quest available).
+    //
+    // IMPORTANT: All requirements in a ClientValidated list must return ClientOnly or
+    // Both from GetDataAuthority(). A ServerOnly requirement cannot be evaluated on
+    // the client — it would silently optimistic-pass, fire the RPC, and be rejected
+    // by the server with no predictable client-side signal. If any requirement needs
+    // server-only data, use a ServerOnly list instead.
+    // ValidateRequirements enforces this constraint at BeginPlay in development builds.
     ClientValidated UMETA(DisplayName = "Client Validated"),
 };
 ```

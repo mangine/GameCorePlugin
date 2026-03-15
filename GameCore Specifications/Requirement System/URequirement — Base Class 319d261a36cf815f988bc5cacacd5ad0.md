@@ -23,6 +23,31 @@ class GAMECORE_API URequirement : public UObject
     GENERATED_BODY()
 
 public:
+    // ── Data Authority ─────────────────────────────────────────────────────
+
+    // Declares where this requirement's data lives at runtime.
+    // Used by ValidateRequirements to detect invalid list/requirement authority
+    // combinations at BeginPlay in development builds.
+    //
+    //   ClientOnly  — reads only locally available data (replicated PlayerState,
+    //                 local component state, UI state). Safe in ClientOnly and
+    //                 ClientValidated lists.
+    //   ServerOnly  — reads data that only exists on the server (non-replicated
+    //                 subsystems, authoritative DB queries). Must only appear in
+    //                 ServerOnly lists. In ClientValidated or ClientOnly lists this
+    //                 requirement would optimistically pass on the client, which is
+    //                 a design error — ValidateRequirements will log an error.
+    //   Both        — has a meaningful, correct evaluation on both sides. The
+    //                 implementor is responsible for returning appropriate results
+    //                 from Evaluate() depending on whether called on server or client.
+    //
+    // Default: Both. This is the safe default — it forces authors of ServerOnly
+    // requirements to opt-in explicitly rather than silently misfiring.
+    virtual ERequirementDataAuthority GetDataAuthority() const
+    {
+        return ERequirementDataAuthority::Both;
+    }
+
     // ── Synchronous Evaluation ──────────────────────────────────────────────────
 
     // Evaluate this condition synchronously against the provided context.
@@ -62,6 +87,9 @@ public:
     //      The context is a stack variable at the call site — it may be
     //      destroyed before the callback fires. Capture specific values only.
     //
+    // Prefer MakeGuardedCallback() to wrap OnComplete — it enforces rules 1 and 3
+    // automatically and is null-safe if this object is GC'd before the callback fires.
+    //
     // Default implementation: calls Evaluate() synchronously and fires OnComplete
     // immediately. Subclasses with IsAsync() == true must override this.
     virtual void EvaluateAsync(
@@ -78,6 +106,55 @@ public:
     // to include the configured property values.
     virtual FString GetDescription() const;
 #endif
+
+protected:
+    // ── Async Helper ──────────────────────────────────────────────────────
+
+    // Wraps OnComplete with three safety guarantees:
+    //   1. Once-only: subsequent calls after the first are silent no-ops.
+    //   2. Timeout: if TimeoutSeconds elapse with no result, fires Fail(TimeoutReason)
+    //      automatically on the game thread.
+    //   3. Null-safe: if this URequirement is GC'd before the callback fires,
+    //      the timer is cancelled and OnComplete is never called.
+    //
+    // Always use this in EvaluateAsync implementations — do not manage these
+    // guarantees manually.
+    //
+    // TimeoutSeconds default (5.0f) is appropriate for backend round-trips. Reduce
+    // for requirements with tighter latency budgets (e.g. local cache queries).
+    TFunction<void(FRequirementResult)> MakeGuardedCallback(
+        TFunction<void(FRequirementResult)> OnComplete,
+        float TimeoutSeconds = 5.0f,
+        FText TimeoutReason = LOCTEXT("AsyncTimeout", "Requirement check timed out.")) const;
+};
+```
+
+---
+
+# `ERequirementDataAuthority`
+
+Defined in `Requirements/Requirement.h` alongside `URequirement`.
+
+```cpp
+UENUM()
+enum class ERequirementDataAuthority : uint8
+{
+    // Reads only locally available data: replicated PlayerState fields,
+    // replicated components, local UI state.
+    // Safe in ServerOnly, ClientOnly, and ClientValidated lists.
+    ClientOnly,
+
+    // Reads data that only exists on the server: non-replicated subsystems,
+    // authoritative DB state, server-only component fields.
+    // Must only appear in ServerOnly lists.
+    // In ClientValidated or ClientOnly lists this requirement cannot be evaluated
+    // on the client — ValidateRequirements treats this as a design error.
+    ServerOnly,
+
+    // Has a correct, meaningful evaluation on both server and client.
+    // The implementor handles any difference in available data inside Evaluate().
+    // Safe in any list authority.
+    Both,
 };
 ```
 
@@ -144,6 +221,12 @@ public:
         meta = (ClampMin = "1"))
     int32 MinLevel = 1;
 
+    // This data is replicated to the client — safe in any list authority.
+    virtual ERequirementDataAuthority GetDataAuthority() const override
+    {
+        return ERequirementDataAuthority::Both;
+    }
+
     virtual FRequirementResult Evaluate(const FRequirementContext& Context) const override
     {
         // Retrieve data from context fields or subsystem lookup.
@@ -175,13 +258,66 @@ public:
 
 # Implementing an Async Requirement
 
-See the Async Evaluation section of the [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md) main page for the full async pattern, constraints, and a complete example (`URequirement_BackendEntitlement`).
+Async requirements must use `MakeGuardedCallback` to wrap the `OnComplete` delegate. This eliminates the three most common async implementor mistakes: forgetting a timeout, accidentally calling `OnComplete` twice, and capturing a raw `this` pointer in a lambda.
+
+```cpp
+UCLASS(DisplayName = "Backend Entitlement")
+class URequirement_BackendEntitlement : public URequirement
+{
+    GENERATED_BODY()
+
+public:
+    UPROPERTY(EditDefaultsOnly, Category = "Requirement")
+    FName EntitlementId;
+
+    // Reads authoritative entitlement data — server-only.
+    // Must not appear in ClientOnly or ClientValidated lists.
+    virtual ERequirementDataAuthority GetDataAuthority() const override
+    {
+        return ERequirementDataAuthority::ServerOnly;
+    }
+
+    virtual bool IsAsync() const override { return true; }
+
+    virtual void EvaluateAsync(
+        const FRequirementContext& Context,
+        TFunction<void(FRequirementResult)> OnComplete) const override
+    {
+        // Wrap immediately — timeout and once-only guarantee are now handled.
+        auto SafeCallback = MakeGuardedCallback(MoveTemp(OnComplete), 5.0f);
+
+        // Capture only what the lambda needs. Never capture Context by reference.
+        FName CapturedId = EntitlementId;
+        APlayerState* PS = Context.PlayerState;
+
+        UEntitlementSubsystem* Subsystem = Context.World->GetSubsystem<UEntitlementSubsystem>();
+        if (!Subsystem)
+        {
+            SafeCallback(FRequirementResult::Fail(LOCTEXT("NoSubsystem", "Entitlement service unavailable.")));
+            return;
+        }
+
+        Subsystem->QueryAsync(PS, CapturedId, [SafeCallback](bool bGranted)
+        {
+            SafeCallback(bGranted
+                ? FRequirementResult::Pass()
+                : FRequirementResult::Fail(LOCTEXT("NotEntitled", "Entitlement not granted.")));
+        });
+    }
+
+#if WITH_EDITOR
+    virtual FString GetDescription() const override
+    {
+        return FString::Printf(TEXT("Entitlement: %s"), *EntitlementId.ToString());
+    }
+#endif
+};
+```
 
 Key points:
-
-- Override both `IsAsync()` (return `true`) and `EvaluateAsync`.
-- Override `Evaluate` to return a pending/checking result for client-side display — the async path is server-only for authoritative decisions.
-- `OnComplete` must be called exactly once, on the game thread, within a timeout.
+- Call `MakeGuardedCallback` **before** any early-return paths so the timeout starts immediately.
+- Capture specific values from `Context`, never the context struct itself by reference.
+- `GetDataAuthority()` returns `ServerOnly` — `ValidateRequirements` will catch this at BeginPlay if someone places it in a `ClientValidated` list.
 
 ---
 
@@ -221,10 +357,11 @@ Allowed as instance (configuration) variables:
 2. Add `DisplayName = "..."` and `Blueprintable` to the `UCLASS` macro.
 3. Add `"Requirements"` to `PublicDependencyModuleNames` in the module's `Build.cs`.
 4. Declare configuration properties as `EditDefaultsOnly BlueprintReadOnly UPROPERTY`.
-5. Override `Evaluate` (sync) or `IsAsync` + `EvaluateAsync` (async).
-6. Override `GetWatchedEvents_Implementation` to declare which `RequirementEvent.*` tags invalidate this requirement. Return empty if on-demand only.
-7. Set `bIsMonotonic = true` in the class CDO constructor if the condition can never revert once passed.
-8. Override `GetDescription()` inside `#if WITH_EDITOR`.
-9. Done — UE's reflection system discovers the subclass automatically when its module is loaded.
+5. Override `GetDataAuthority()` to return `ClientOnly`, `ServerOnly`, or `Both`. This is mandatory — `Both` is only correct if the requirement genuinely evaluates correctly on both sides from replicated data.
+6. Override `Evaluate` (sync) or `IsAsync` + `EvaluateAsync` (async). For async, wrap `OnComplete` with `MakeGuardedCallback`.
+7. Override `GetWatchedEvents_Implementation` to declare which `RequirementEvent.*` tags invalidate this requirement. Return empty if on-demand only.
+8. Set `bIsMonotonic = true` in the class CDO constructor if the condition can never revert once passed.
+9. Override `GetDescription()` inside `#if WITH_EDITOR`.
+10. Done — UE's reflection system discovers the subclass automatically when its module is loaded.
 
 **No central registry. No factory. No modification to `URequirement` itself.**
