@@ -90,6 +90,7 @@ Every `FEntityPersistencePayload` carries two flags set by `UPersistenceSubsyste
 | Queue ownership | `IKeyStorageService` owns write-behind queue | Clean layer separation — subsystem serializes, DB service queues and delivers |
 | Priority / flush control | `bCritical` + `bFlushImmediately` flags on payload | DB service owns policy; subsystem sets intent based on reason |
 | Logging | `ILoggingService` via `UGameCoreBackendSubsystem` | Decoupled alerting; routes to `UE_LOG` when not connected |
+| NPC / Mob persistence | Not registered by default | NPCs and Mobs are respawnable world state. Not registering them keeps `RegisteredEntities` bounded, which is a precondition for safe synchronous shutdown. Specific NPC types that require persistence (e.g. merchants with dynamic stock) may opt in via `UPersistenceRegistrationComponent` — revisit per-tag budgets if that set grows large. |
 
 ---
 
@@ -176,4 +177,4 @@ Games register tags and bind delegates at startup. The subsystem routes with no 
 ## Known Gaps & Future Work
 
 - **Critical event trigger component** — a collision/overlap component to fire `RequestFullSave` on specific gameplay events is not yet specified
-- **Per-tag budget control** — all tags share a single `ActorsPerFlushTick`; high-priority tags (players) may be starved by lower-priority actors
+- **Per-tag budget control** — resolved by design: NPCs and Mobs do not register by default, keeping `RegisteredEntities` bounded to players and key world objects. If a future NPC category opts in and grows the registry significantly, per-tag `ActorsPerFlushTick` budgets should be added at that point.

@@ -362,7 +362,9 @@ void UPersistenceSubsystem::RequestFullSave(AActor* Entity,
 
 ## RequestShutdownSave — All Actors
 
-Synchronous. Cancels all timers and serializes everything immediately. All payloads are marked `bCritical = true` and `bFlushImmediately = true`.
+Synchronous. Cancels all timers and serializes every entry in `RegisteredEntities` immediately. All payloads are marked `bCritical = true` and `bFlushImmediately = true`.
+
+This is safe because `RegisteredEntities` is intentionally bounded: NPCs and Mobs are respawnable world state and **must not** register with the persistence system by default. The registered set should contain only players, ships, and key world-state objects — a count that comfortably completes within OS shutdown timeout (typically 10–30 s). If a new entity category is added and opts into persistence, its expected count at peak load must be evaluated against this constraint before it is allowed to register.
 
 ```cpp
 void UPersistenceSubsystem::RequestShutdownSave()
@@ -625,7 +627,7 @@ GameCore/
 
 - `ActorsPerFlushTick` applies to **both** partial and full cycles. Full cycles snapshot `RegisteredEntities` at cycle start and spread across frames via `FullCycleTickTimer`.
 - If a new actor registers mid-full-cycle it will be picked up on the next full cycle — this is acceptable.
-- `RequestShutdownSave` is synchronous. All payloads are dispatched with `bFlushImmediately = true` so the DB service does not queue them — they go directly to the backend.
+- `RequestShutdownSave` is synchronous and safe **only** because `RegisteredEntities` is bounded by design. NPCs and Mobs must not register by default — they are respawnable world state. Any new entity category that opts into persistence must have its worst-case registered count evaluated before it is permitted. If the registered set ever grows unbounded, shutdown serialization must be revisited.
 - `LoadTimeoutSeconds` should exceed the worst-case DB round-trip. Default 30s is conservative.
 - `SaveCounter` is `uint32` and wraps at ~4 billion cycles. At one cycle per 300s this is ~40,000 years.
 - `ServerInstanceId` must be set via `DefaultGame.ini` or a `UGameInstance` override before `Initialize()`. If unset, a `UE_LOG Error` is emitted (using `UE_LOG` directly here, before the backend subsystem is guaranteed live).
@@ -636,7 +638,7 @@ GameCore/
 
 ## Future Improvements
 
-- Per-tag `ActorsPerFlushTick` budgets to prevent player saves being starved by mobs
+- Per-tag `ActorsPerFlushTick` budgets — only needed if a non-player entity category is permitted to register and grows large enough to cause starvation
 - `CriticalEvent` component key filter on `RequestFullSave`
 - PIE teardown guard in `EndPlay`
 - Metrics hooks: payload size, flush latency, dropped payload counter
