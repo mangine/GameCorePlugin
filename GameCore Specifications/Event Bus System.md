@@ -18,9 +18,11 @@ Delegates are the right tool for intra-system wiring — they are synchronous, t
 
 - **Delegates stay for intra-system wiring.** A component may still fire its own delegate and call `Broadcast` in the same mutation — the delegate is for systems inside the same module; GMS is for everything else.
 - **One struct per event type.** Never share a payload struct between two unrelated events.
-- **Channel tags follow `GameCoreEvent.<System>.<Event>`.** Defined in `DefaultGameplayTags.ini` inside the owning module. Never in a central tags file.
-- **Server-only unless stated otherwise.** All GameCore events originate on the server. Client-side listeners must be explicitly documented per channel.
+- **Channel tags follow `GameCoreEvent.<s>.<Event>`.** Defined in `DefaultGameplayTags.ini` inside the owning module. Never in a central tags file.
+- **Every channel must declare its scope.** The broadcaster decides scope — the bus enforces it. Document the scope in the channel's entry in `GameCore Event Messages.md`. Default is `ServerOnly`.
 - **Never call `UGameplayMessageSubsystem` directly** from GameCore module code. Always go through `UGameCoreEventSubsystem::Broadcast`.
+- **`ClientOnly` requires prior replication.** A client-side GMS broadcast is a notification layer only — the data it references must already exist on the client via `FFastArraySerializer` or a replicated property before the broadcast fires.
+- **Do not cache `UGameCoreEventSubsystem` as a member.** Subsystem lifetime is tied to the world; components may outlive a world transition. Use `UGameCoreEventSubsystem::Get(this)` inline at call sites.
 
 ---
 
@@ -37,6 +39,36 @@ GameCore/
 
 ---
 
+## Broadcast Scope
+
+```cpp
+/** Controls which machine(s) the GMS broadcast fires on.
+ *  The broadcaster (e.g. ULevelingComponent) decides scope — the bus enforces it.
+ *  This is not a replication mechanism; it is a guard against firing on the wrong machine.
+ */
+UENUM(BlueprintType)
+enum class EGameCoreEventScope : uint8
+{
+    /** Broadcast only when running with authority (server / standalone).
+     *  Use for all events that originate from server-side logic. Default. */
+    ServerOnly  UMETA(DisplayName = "Server Only"),
+
+    /** Broadcast only on a net client (NM_Client).
+     *  Use when data has already been replicated and the client fires its own notification.
+     *  No-op when called on the server. */
+    ClientOnly  UMETA(DisplayName = "Client Only"),
+
+    /** Broadcast unconditionally on whatever machine calls it.
+     *  Use only when the caller has already determined the correct machine context
+     *  (e.g. Both-authority state machine components). */
+    Both        UMETA(DisplayName = "Both"),
+};
+```
+
+> **Scope is a call-site guard, not a replication primitive.** It prevents accidental double-fires and wrong-machine broadcasts. It does not send data across the network.
+
+---
+
 ## `UGameCoreEventSubsystem`
 
 ```cpp
@@ -48,21 +80,39 @@ class GAMECORE_API UGameCoreEventSubsystem : public UWorldSubsystem
 public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 
-    // Primary broadcast entry point for all GameCore modules.
-    // Prefer this over calling GMS directly — future batching or rate-limiting
-    // can be added here without touching call sites.
+    /** Convenience accessor. Prefer over GetWorld()->GetSubsystem<>() at call sites.
+     *  Returns nullptr if WorldContext has no valid world. */
+    static UGameCoreEventSubsystem* Get(const UObject* WorldContext);
+
+    /** Primary broadcast entry point for all GameCore modules.
+     *  Scope controls which machine the broadcast fires on (default: ServerOnly).
+     *  Future batching or rate-limiting can be added here without touching call sites. */
     template<typename T>
-    void Broadcast(FGameplayTag Channel, const T& Message)
+    void Broadcast(FGameplayTag Channel, const T& Message, EGameCoreEventScope Scope = EGameCoreEventScope::ServerOnly)
     {
-        if (GMS)
+        if (!GMS) return;
+
+        switch (Scope)
         {
-            GMS->BroadcastMessage(Channel, Message);
+            case EGameCoreEventScope::ServerOnly:
+                if (GetWorld()->GetNetMode() < NM_Client)
+                    GMS->BroadcastMessage(Channel, Message);
+                break;
+
+            case EGameCoreEventScope::ClientOnly:
+                if (GetWorld()->GetNetMode() == NM_Client)
+                    GMS->BroadcastMessage(Channel, Message);
+                break;
+
+            case EGameCoreEventScope::Both:
+                GMS->BroadcastMessage(Channel, Message);
+                break;
         }
     }
 
-    // Registers a listener for a typed message on a channel.
-    // Returns a handle that MUST be stored by the caller.
-    // Call StopListening with the handle when the listener is no longer valid.
+    /** Registers a listener for a typed message on a channel.
+     *  Returns a handle that MUST be stored by the caller.
+     *  Call StopListening with the handle when the listener is no longer valid. */
     template<typename T, typename TOwner>
     FGameplayMessageListenerHandle StartListening(
         FGameplayTag Channel,
@@ -93,7 +143,7 @@ private:
 };
 ```
 
-### Initialize
+### Initialize & Get
 
 ```cpp
 void UGameCoreEventSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -104,6 +154,14 @@ void UGameCoreEventSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     Collection.InitializeDependency<UGameplayMessageSubsystem>();
     GMS = GetWorld()->GetSubsystem<UGameplayMessageSubsystem>();
     check(GMS); // Always valid after InitializeDependency
+}
+
+UGameCoreEventSubsystem* UGameCoreEventSubsystem::Get(const UObject* WorldContext)
+{
+    if (!WorldContext) return nullptr;
+    if (UWorld* World = GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull))
+        return World->GetSubsystem<UGameCoreEventSubsystem>();
+    return nullptr;
 }
 ```
 
@@ -116,19 +174,19 @@ void UGameCoreEventSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 ### Broadcasting (inside a GameCore module)
 
 ```cpp
-// Get the subsystem inline — it holds a cached GMS ptr, so cost is one pointer dereference.
-if (UGameCoreEventSubsystem* EventBus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+// Use Get() instead of GetWorld()->GetSubsystem<>().
+if (UGameCoreEventSubsystem* Bus = UGameCoreEventSubsystem::Get(this))
 {
     FProgressionLevelUpMessage Msg;
     Msg.PlayerState    = OwnerPS;
     Msg.ProgressionTag = ProgressionTag;
     Msg.OldLevel       = OldLevel;
     Msg.NewLevel       = NewLevel;
-    EventBus->Broadcast(GameCoreEventTags::Progression_LevelUp, Msg);
+
+    // LevelUp fires server-side only (default). The client reacts via replicated data.
+    Bus->Broadcast(GameCoreEventTags::Progression_LevelUp, Msg, EGameCoreEventScope::ServerOnly);
 }
 ```
-
-> **Do not cache `UGameCoreEventSubsystem` itself as a member.** Subsystem lifetime is tied to the world; components may outlive a world transition. Call `GetWorld()->GetSubsystem<>()` inline — the actual GMS broadcast is already cached inside.
 
 ### Listening (from any system)
 
@@ -137,9 +195,9 @@ FGameplayMessageListenerHandle LevelUpHandle;
 
 void UMySystem::BeginPlay()
 {
-    if (UGameCoreEventSubsystem* EventBus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    if (UGameCoreEventSubsystem* Bus = UGameCoreEventSubsystem::Get(this))
     {
-        LevelUpHandle = EventBus->StartListening<FProgressionLevelUpMessage>(
+        LevelUpHandle = Bus->StartListening<FProgressionLevelUpMessage>(
             GameCoreEventTags::Progression_LevelUp,
             this,
             &UMySystem::OnLevelUp);
@@ -148,9 +206,9 @@ void UMySystem::BeginPlay()
 
 void UMySystem::EndPlay(const EEndPlayReason::Type Reason)
 {
-    if (UGameCoreEventSubsystem* EventBus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    if (UGameCoreEventSubsystem* Bus = UGameCoreEventSubsystem::Get(this))
     {
-        EventBus->StopListening(LevelUpHandle);
+        Bus->StopListening(LevelUpHandle);
     }
 }
 
@@ -180,17 +238,19 @@ PublicDependencyModuleNames.AddRange(new string[]
 
 ## Channel Tag Conventions
 
-All GameCore channels follow `GameCoreEvent.<System>.<Event>`. Defined per-module in `DefaultGameplayTags.ini`.
+All GameCore channels follow `GameCoreEvent.<s>.<Event>`. Defined per-module in `DefaultGameplayTags.ini`.
+
+Every channel entry in `GameCore Event Messages.md` must declare its **Scope** and **Origin machine**.
 
 ```
 GameCoreEvent
   ├── Progression
-  │     ├── LevelUp
-  │     ├── XPChanged
-  │     └── PointPoolChanged
+  │     ├── LevelUp          [ServerOnly]
+  │     ├── XPChanged        [ServerOnly]
+  │     └── PointPoolChanged [ServerOnly]
   └── StateMachine
-        ├── StateChanged
-        └── TransitionBlocked
+        ├── StateChanged     [Both — depends on component AuthorityMode]
+        └── TransitionBlocked[Both — depends on component AuthorityMode]
 ```
 
 ---
@@ -202,8 +262,10 @@ When flush timers or per-channel rate limiting are needed, the implementation li
 ```cpp
 // Future: per-channel buffered broadcast
 template<typename T>
-void Broadcast(FGameplayTag Channel, const T& Message)
+void Broadcast(FGameplayTag Channel, const T& Message, EGameCoreEventScope Scope = EGameCoreEventScope::ServerOnly)
 {
+    if (!PassesScopeGuard(Scope)) return;
+
     if (ShouldBuffer(Channel))
     {
         PendingMessages.Add({ Channel, MakeShared<T>(Message) });
@@ -221,5 +283,7 @@ void Broadcast(FGameplayTag Channel, const T& Message)
 ## Known Limitations
 
 - **GMS is synchronous.** `BroadcastMessage` calls all listeners inline before returning. Heavy listener logic on a hot-path broadcast (e.g. `XPChanged`) should be deferred by the listener, not by the bus.
+- **`XPChanged` and `PointPoolChanged` can be high-frequency.** If fired per individual XP grant during combat, batching must be applied at the call site (accumulate server-side, broadcast once per frame or threshold). The bus does not throttle.
+- **Scope is not a replication primitive.** `ClientOnly` events require data to already be present on the client via replication before the broadcast fires.
 - **No cross-world channels.** Each `UGameCoreEventSubsystem` instance is world-scoped. Broadcasts do not cross world boundaries.
 - **Blueprint support is limited.** The template API is C++ only. Blueprint systems that need to react to GameCore events should use thin Blueprint-callable wrappers in game-layer code.
