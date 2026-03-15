@@ -105,12 +105,18 @@ public:
     //   - If bRequireSync == true: no async requirements anywhere in the array or
     //     any nested composite tree. Use bRequireSync = true for interaction entries
     //     and any system that cannot tolerate async evaluation on its hot path.
+    //   - If ListAuthority is ClientOnly or ClientValidated: no requirement in the
+    //     array (including nested composite children) may return ServerOnly from
+    //     GetDataAuthority(). A ServerOnly requirement in a client-evaluated list
+    //     cannot be evaluated on the client and would silently optimistic-pass,
+    //     producing a misleading result. This is always a design error.
     //
     // Only compiled in development builds (WITH_EDITOR || !UE_BUILD_SHIPPING).
     // In shipping builds this function is a no-op returning true.
     static bool ValidateRequirements(
         const TArray<URequirement*>& Requirements,
-        bool bRequireSync = false);
+        bool bRequireSync = false,
+        ERequirementEvalAuthority ListAuthority = ERequirementEvalAuthority::ServerOnly);
 };
 ```
 
@@ -169,8 +175,8 @@ void UMySystem::OnRequirementsResolved(FRequirementResult Result)
 
 # Known Limitations
 
-**`EvaluateAllAsync` has no cancellation token.** If the consuming system is destroyed before `OnComplete` fires, the delegate fires on a stale object. Guard with `TWeakObjectPtr` capture in the lambda, or bind via `CreateUObject` which automatically becomes a no-op if the object is GC'd before the callback.
+**`EvaluateAllAsync` has no cancellation token.** If the consuming system is destroyed before `OnComplete` fires, the delegate fires on a stale object. Use `MakeGuardedCallback` in your `EvaluateAsync` implementation, or bind via `CreateUObject` at the `EvaluateAllAsync` call site which automatically becomes a no-op if the object is GC'd.
 
-**`EvaluateAllAsync` has no global timeout.** Each async requirement is responsible for its own timeout. If an async requirement stalls indefinitely, `OnComplete` never fires. The consuming system has no built-in escape hatch. Future improvement: add a timeout parameter to `EvaluateAllAsync`.
+**`EvaluateAllAsync` has no global timeout.** Each async requirement is responsible for its own timeout via `MakeGuardedCallback`. If an async requirement does not use `MakeGuardedCallback` and stalls indefinitely, `OnComplete` never fires.
 
 **`EvaluateAll` silently degrades on async requirements.** Calling `EvaluateAll` on an array containing async requirements calls their `Evaluate()` override, which returns `Fail` by default. This looks like a failed requirement but is actually a missing async evaluation. `ValidateRequirements` with `bRequireSync = true` catches this at setup time in development builds.
