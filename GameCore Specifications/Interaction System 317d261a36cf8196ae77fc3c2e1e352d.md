@@ -83,6 +83,7 @@ These principles are the constraints everything else is built around. When in do
 - **Validation is layered.** Tag checks are the fast pre-filter (bitset AND, evaluated on both client and server). Entry requirements (`URequirement_Composite`) are the authoritative condition gate — evaluated client-side for display, server-side for authority.
 - **UI configuration is optional and self-contained.** Each `UInteractionComponent` carries an optional `UInteractionIconDataAsset`. If unset, icon resolution returns null. The widget handles this gracefully.
 - **One `UInteractionComponent` per actor.** The scanner finds one component per actor via `FindComponentByClass`. Multiple interaction options are expressed as entries within that single component, not as multiple components.
+- **HISM instances are not Actors — do not extend this system to treat them as such.** See the HISM note in Future Work.
 
 ---
 
@@ -266,6 +267,7 @@ Full specification: [UInteractionIconDataAsset](Interaction%20System/UInteractio
 - **GAS actors** implement `ITaggedInterface` by forwarding to their `UAbilitySystemComponent`. The interaction system never imports GAS headers.
 - **Icons are optional.** `IconDataAsset` may be null on any component. Widgets must handle null icon results gracefully — no crash, no broken reference.
 - **One `UInteractionComponent` per actor.** Adding a second instance to the same actor is unsupported and flagged as an editor error. Use multiple entries to express multiple interaction options.
+- **HISM instances are not Actors and cannot host a `UInteractionComponent` directly.** Do not attempt to subclass or extend this system to handle HISM internally — see the HISM note in Future Work for the correct approach.
 
 ---
 
@@ -341,7 +343,18 @@ GameCore/
 
 # Future Work
 
-**HISM Support — P1, deferred.** `UInteractionComponent` is designed for standard Actors. Supporting individual `UHierarchicalInstancedStaticMeshComponent` instance interactions (resource nodes, foliage) requires a separate design pass. Recommended approach: use `GetInstancesOverlappingSphere()` to find in-range instances during the scan, maintain a lightweight Actor pool (one pooled Actor with `UInteractionComponent` per active HISM instance within relevancy range), and manage per-instance state via `SetEntryState`. Design this once core interaction is shipping and stable.
+**HISM Support — P1, deferred.** `UInteractionComponent` is designed for standard Actors. HISM instances are not Actors — they share a single `UHierarchicalInstancedStaticMeshComponent` and have no individual identity the interaction system can address.
+
+**Do not attempt to handle HISM by subclassing `UInteractionComponent` or extending the scanner.** Integrating HISM awareness into this system would require changing the scanner's scoring interface, the distance check signature, and the server validation path — breaking the generic Actor abstraction for all other users and coupling the interaction system to a rendering strategy it has no business knowing about.
+
+**The correct approach is a dedicated HISM Proxy Actor system, external to GameCore's interaction system.** That system's sole responsibility is to maintain a pool of lightweight proxy Actors — each a standard Actor with a `UInteractionComponent` — positioned at HISM instance locations within player relevancy range. From the interaction system's perspective, these proxy Actors are indistinguishable from any other interactable Actor. No scanner changes. No validation changes. No new base classes.
+
+Key design points for the proxy system (to be specified separately):
+
+- **Proximity-driven pool activation.** Proxies are activated for instances within player range and returned to the pool when instances leave range. The pool is pre-allocated at world init — no runtime Actor spawning on the hot path.
+- **Instance eligibility is decided externally via a filter delegate.** The proxy system exposes a bindable delegate — "should this instance index receive a proxy?" — that any external system (harvesting, resource, fishing) can bind to. The proxy system itself has no knowledge of game-specific instance state.
+- **Per-instance state (harvested, on cooldown, etc.) belongs to the owning game system**, not to the proxy or the interaction system. When an instance becomes non-interactable, the owning system calls `SetEntryServerEnabled(false)` on the proxy's `UInteractionComponent` — the same API used on any regular interactable Actor.
+- **The pool lives on the HISM Actor** via a `UHISMInteractionBridgeComponent`. One bridge component per HISM Actor, one pool per bridge. This keeps lifecycle tied to the HISM Actor and makes the setup visible and debuggable in the editor.
 
 [Core Data Structures](Interaction%20System/Core%20Data%20Structures%20317d261a36cf80758e45dcfaa0a634ee.md)
 
