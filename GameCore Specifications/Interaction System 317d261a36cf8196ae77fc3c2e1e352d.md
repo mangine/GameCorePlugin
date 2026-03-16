@@ -10,7 +10,7 @@ The Interaction System is a decoupled, tag-driven, priority-resolved interaction
 
 | Unit | Class / Interface | Lives On |
 | --- | --- | --- |
-| Interaction Host | `UInteractionComponent` | Any interactable Actor |
+| Interaction Host | `UInteractionComponent` | Any interactable Actor (max one per actor) |
 | Interaction Scanner | `UInteractionManagerComponent` | Player Pawn (owning client only) |
 | Tag Authority | `ITaggedInterface`  • `UGameplayTagComponent` | Any Actor needing tag state |
 | Condition Authority | `URequirement_Composite` on `FInteractionEntryConfig` | Per entry (data asset or inline) |
@@ -82,6 +82,7 @@ These principles are the constraints everything else is built around. When in do
 - **Game systems are never imported.** The interaction system extends exclusively via the Requirement System and tag interfaces — it never references the resource system, quest system, ability system, or any game-specific code directly.
 - **Validation is layered.** Tag checks are the fast pre-filter (bitset AND, evaluated on both client and server). Entry requirements (`URequirement_Composite`) are the authoritative condition gate — evaluated client-side for display, server-side for authority.
 - **UI configuration is optional and self-contained.** Each `UInteractionComponent` carries an optional `UInteractionIconDataAsset`. If unset, icon resolution returns null. The widget handles this gracefully.
+- **One `UInteractionComponent` per actor.** The scanner finds one component per actor via `FindComponentByClass`. Multiple interaction options are expressed as entries within that single component, not as multiple components.
 
 ---
 
@@ -149,16 +150,14 @@ The array is evaluated at two call sites with different authority:
 **Designers author conditions directly in the Data Asset.** Each slot in the `EntryRequirements` array has a class picker in the Details panel showing all loaded `URequirement` subclasses. Simple conditions (tag check, level gate) are added directly. Complex AND/OR/NOT trees use `URequirement_Composite` as the slot type.
 
 > **Why `TArray<URequirement*>` and not a single `URequirement_Composite` root?** The array is the canonical pattern across all consuming systems (quests, abilities, crafting). A flat AND list is the common case — adding a composite root for every entry that only needs AND would be unnecessary overhead for designers. When OR or NOT is needed, one composite element handles it. This keeps the simple case simple and the complex case possible.
-> 
 
 > **`FRequirementContext` construction.** On the client, `Context.Instigator` is the local pawn and `Context.PlayerState` is the local PlayerState. On the server, both are derived from the RPC connection — the server never trusts client-provided subject references. `Context.World` is `GetWorld()` in both cases.
-> 
 
 ---
 
 # `UInteractionComponent`
 
-The **interaction host** — added to any actor that can be interacted with. It owns the entry definitions (DataAsset references and inline configs), the replicated runtime state array, and the server-side request validation and confirmation logic.
+The **interaction host** — added to any actor that can be interacted with, maximum one per actor. It owns the entry definitions (DataAsset references and inline configs), the replicated runtime state array, and the server-side request validation and confirmation logic.
 
 Game systems interact with this component in two directions. Outbound: bind to `OnInteractionConfirmed` (server-side) to execute the interaction when the server approves a request. Inbound: call `SetEntryState` to reflect gameplay conditions (occupied, on cooldown, available), and `SetEntryServerEnabled` for administrative enable/disable independent of gameplay state.
 
@@ -266,12 +265,13 @@ Full specification: [UInteractionIconDataAsset](Interaction%20System/UInteractio
 - **Hold execution belongs to game systems.** The interaction system is a proxy and trigger only. Animation, sound, world state changes, and ability activation are the receiving system's responsibility.
 - **GAS actors** implement `ITaggedInterface` by forwarding to their `UAbilitySystemComponent`. The interaction system never imports GAS headers.
 - **Icons are optional.** `IconDataAsset` may be null on any component. Widgets must handle null icon results gracefully — no crash, no broken reference.
+- **One `UInteractionComponent` per actor.** Adding a second instance to the same actor is unsupported and flagged as an editor error. Use multiple entries to express multiple interaction options.
 
 ---
 
 # Known Limitations
 
-**Server distance check uses actor origin-to-origin measurement.** The scanner finds candidates via collision overlap, so a player may be physically close to a large actor's geometry while the actor's pivot is far away. The server checks `Pawn.Location` vs `Owner->GetActorLocation()` (pivot), producing false `OutOfRange` rejections for large actors like ships or buildings. **Mitigation:** set `UInteractionComponent::InteractionRadiusOverride` on large actors. A future improvement would measure against the closest point on actor bounds, at the cost of additional per-validation computation.
+**Distance check uses `GetInteractionLocation()` on both client and server.** The client scan measures from the hit collider's location (via `Hit.Component->GetComponentLocation()`), while the server measures from `ComponentRef->GetInteractionLocation()` which defaults to the actor pivot. For most actors the interaction collider is placed at or near the pivot and these agree. If they diverge significantly, override `GetInteractionLocation()` on the component to return the correct world position. The 75cm server-side tolerance absorbs normal latency desync — it is not a substitute for correct placement.
 
 **Requirements on the client must not depend on server-only state.** Requirements that gate on data not present in replicated state will produce optimistic `Pass` on the client and a server rejection the player cannot predict. Design requirement types used in interaction entries to be fully evaluable from locally available replicated data.
 

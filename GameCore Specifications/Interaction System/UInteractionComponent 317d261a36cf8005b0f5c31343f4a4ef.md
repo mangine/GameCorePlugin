@@ -4,6 +4,8 @@
 
 `UInteractionComponent` is a **data container, state broadcaster, and execution dispatcher** — added to any actor that can be interacted with. It owns the entry definitions, the replicated runtime state, and the per-entry execution delegates that game systems bind to.
 
+> **One `UInteractionComponent` per actor maximum.** Multiple interaction entries exist precisely so a single component can represent all the things an actor offers (e.g. a chest that can be Opened, Examined, or Locked-picked). Adding a second `UInteractionComponent` to the same actor is not supported — the scanner finds one component per actor via `FindComponentByClass`, and a second would be silently ignored. If an actor needs distinct interaction surfaces, use entries with different group tags.
+
 Game systems that need to react to an interaction (open a shop, start dialogue, grant a resource) bind to `UInteractionComponent::OnInteractionExecuted` on the interactable actor itself — **not** on the player pawn's manager. This keeps execution ownership on the interactable, which is the correct authority direction.
 
 `UInteractionManagerComponent` on the initiating pawn still owns scanning, validation, and the full interaction lifecycle. After server validation passes it calls `UInteractionComponent::ExecuteEntry`, which dispatches `OnInteractionExecuted` with the instigator and entry index.
@@ -52,8 +54,7 @@ public:
 
     // Maximum distance at which this component can be interacted with.
     // Authoritative on both the client manager (overlap filter) and the server (validation).
-    // Default 300cm suits most human-scale actors. Increase for large actors (ships, buildings,
-    // resource nodes) where the interaction collider extends beyond the actor pivot.
+    // Both measure from GetInteractionLocation(), which defaults to the actor pivot.
     // ClampMax 2000cm prevents accidental global-reach values that undermine distance security.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Interaction",
         meta = (ClampMin = "50.0", ClampMax = "2000.0"))
@@ -121,6 +122,18 @@ public:
 
     // ── Query API (any machine) ───────────────────────────────────────────────
 
+    // Returns the world location used for distance checks on both client and server.
+    // Defaults to the actor pivot. Override in subclasses or Blueprint when the meaningful
+    // interaction point differs from the pivot (e.g. a component offset, a socket location).
+    // Both the client scan filter and the server validation use this method — they will always
+    // agree as long as the override is deterministic and identical on all machines.
+    UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "Interaction")
+    FVector GetInteractionLocation() const;
+    virtual FVector GetInteractionLocation_Implementation() const
+    {
+        return GetOwner() ? GetOwner()->GetActorLocation() : FVector::ZeroVector;
+    }
+
     // Returns the icon DataAsset if assigned and loaded, or nullptr.
     UFUNCTION(BlueprintCallable, Category = "Interaction")
     const UInteractionIconDataAsset* GetIconDataAsset() const;
@@ -149,10 +162,8 @@ private:
 ```
 
 > **No RPCs, no validation logic.** This component does not perform distance checks or requirement evaluation — that is `UInteractionManagerComponent`'s responsibility. What it *does* own is the execution dispatch: once the manager confirms the interaction server-side, it calls `ExecuteEntry` here, which broadcasts `OnInteractionExecuted` to any bound game system listeners on this actor.
-> 
 
 > **`SetAllEntriesState` / `SetAllEntriesServerEnabled` use a single `MarkArrayDirty` call.** Looping `SetEntryState` across N entries generates N `MarkItemDirty` calls and N separate replication deltas. The bulk variants mutate all items then call `MarkArrayDirty()` once — one packet regardless of entry count.
-> 
 
 ---
 
@@ -274,7 +285,6 @@ void UInteractionComponent::SetAllEntriesServerEnabled(bool bEnabled)
 ```
 
 > **`MarkItemDirty` vs `MarkArrayDirty`.** `MarkItemDirty` sends only the changed item in the next delta. `MarkArrayDirty` evaluates all items in one pass — use for bulk mutations where multiple items change simultaneously.
-> 
 
 ---
 
@@ -389,8 +399,24 @@ void UInteractionComponent::PostEditChangeProperty(FPropertyChangedEvent& Event)
 {
     Super::PostEditChangeProperty(Event);
     ValidateInteractionCollider();
+    ValidateSingleComponent();
     ValidateEntryCount();
     ValidateDataAssetEntries();
+}
+
+void UInteractionComponent::ValidateSingleComponent()
+{
+    AActor* Owner = GetOwner();
+    if (!Owner) return;
+    TArray<UInteractionComponent*> Components;
+    Owner->GetComponents(Components);
+    if (Components.Num() > 1)
+        FMessageLog("PIE").Error(FText::Format(
+            NSLOCTEXT("GC", "MultipleInteractionComponents",
+                "[InteractionComponent] '{0}' has {1} UInteractionComponent instances. "
+                "Only one is allowed per actor — use multiple entries instead."),
+            FText::FromString(Owner->GetName()),
+            FText::AsNumber(Components.Num())));
 }
 
 void UInteractionComponent::ValidateInteractionCollider()
@@ -470,12 +496,13 @@ void UInteractionComponent::ExecuteEntry(uint8 EntryIndex, APawn* Instigator)
 ```
 
 > **`ExecuteEntry` is the only call game systems need to respond to.** Bind `OnInteractionExecuted` on the interactable actor at `BeginPlay`. The delegate carries the instigating `APawn*` and the `EntryIndex` so the handler can resolve which action was triggered and who triggered it. Example: an ore node binds its `OnMine` handler here; a shop NPC binds `OnOpenShop`; a chest binds `OnOpen`.
-> 
 
 ---
 
 # Known Constraints
 
-**Pivot-based distance check.** The manager compares pawn location to the actor pivot. For large actors, increase `MaxInteractionDistance` to compensate. The 75cm server-side tolerance covers latency desync — it is not a substitute for correct distance configuration.
+**One component per actor.** The scanner finds exactly one `UInteractionComponent` per actor via `FindComponentByClass`. A second component on the same actor is silently ignored by the scanner. Use multiple entries to represent multiple interaction options on a single actor.
+
+**`GetInteractionLocation()` must be deterministic and identical on all machines.** Both the client scan distance filter and the server validation distance check call this method. If the override reads from replicated state, that state must be in sync before either call is made. Reading from static transform data (component offsets, socket positions) is always safe.
 
 **Entry arrays frozen after `BeginPlay`.** Do not add, remove, or reorder entries at runtime. Use `SetEntryServerEnabled(false)` or `SetEntryState(Disabled)` to suppress entries dynamically.
