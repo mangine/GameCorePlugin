@@ -22,6 +22,7 @@ Concrete implementations must:
 - Dispatch in chunks of at most `MaxBatchSize` entries per backend call.
 - Implement retry with exponential backoff on dispatch failure. Retry logic, threading, and connection management are entirely the implementation's responsibility.
 - Maintain two internal lanes: a **priority lane** for entries enqueued with `bCritical = true`, and a **normal lane** for all other entries. Priority lane entries are always flushed first and are never dropped on queue overflow — only normal lane entries are dropped.
+- **Never block the calling thread.** All I/O, including `bFlushImmediately` dispatches, must be performed on the service's own internal thread. The calling thread (including the game thread) must return immediately from any `IKeyStorageService` call.
 
 This design means `UPersistenceSubsystem` requires no queue, no flush timer, and no priority queue of its own. It simply calls `Set(...)` with the appropriate flags and the DB service handles everything downstream.
 
@@ -68,6 +69,22 @@ struct GAMECORE_API FKeyStorageConfig
 
 ---
 
+## EStorageRequestResult
+
+Passed to all async read callbacks in place of `bool bSuccess`. Implementations must map their internal error states to one of these values.
+
+```cpp
+enum class EStorageRequestResult : uint8
+{
+    Success,    // Data returned successfully.
+    Failure,    // Backend error or key not found.
+    Cancelled,  // Cancel() was called for this request handle before the backend responded.
+    TimedOut,   // Implementation-defined timeout elapsed before the backend responded.
+};
+```
+
+---
+
 ## Interface Declaration
 
 ```cpp
@@ -85,29 +102,33 @@ public:
     // --- Single Record Ops ---
 
     // Enqueue a write into the write-behind queue.
-    // bFlushImmediately: bypass the queue and dispatch to the backend synchronously.
-    //   Use for time-critical single-entity saves (e.g. logout, zone transfer).
+    // bFlushImmediately: bypass the queue and dispatch on the service's internal thread.
+    //   The calling thread is never blocked. Use for time-critical saves (e.g. logout, zone transfer).
     // bCritical: place this entry in the priority lane — never dropped on overflow,
     //   always flushed before normal entries.
     virtual void Set(
-        FGameplayTag        StorageTag,
-        const FGuid&        Key,
+        FGameplayTag         StorageTag,
+        const FGuid&         Key,
         const TArray<uint8>& Data,
-        bool                bFlushImmediately = false,
-        bool                bCritical         = false) = 0;
+        bool                 bFlushImmediately = false,
+        bool                 bCritical         = false) = 0;
 
     virtual void SetWithTTL(
-        FGameplayTag        StorageTag,
-        const FGuid&        Key,
+        FGameplayTag         StorageTag,
+        const FGuid&         Key,
         const TArray<uint8>& Data,
-        int32               TTLSeconds,
-        bool                bFlushImmediately = false,
-        bool                bCritical         = false) = 0;
+        int32                TTLSeconds,
+        bool                 bFlushImmediately = false,
+        bool                 bCritical         = false) = 0;
 
-    virtual void Get(
+    // Returns a request handle that can be passed to Cancel().
+    // The callback always fires — with Cancelled or TimedOut on failure — so callers
+    // do not need to handle "callback never arrives" as a separate code path.
+    // Callbacks are invoked on the game thread.
+    virtual FGuid Get(
         FGameplayTag    StorageTag,
         const FGuid&    Key,
-        TFunction<void(bool bSuccess, const TArray<uint8>& Data)> Callback) = 0;
+        TFunction<void(EStorageRequestResult Result, const TArray<uint8>& Data)> Callback) = 0;
 
     virtual void Delete(
         FGameplayTag    StorageTag,
@@ -117,30 +138,44 @@ public:
 
     // bCritical applies to all entries in the batch.
     virtual void BatchSet(
-        FGameplayTag                                        StorageTag,
-        const TArray<TPair<FGuid, TArray<uint8>>>&          Pairs,
-        bool                                               bFlushImmediately = false,
-        bool                                               bCritical         = false) = 0;
+        FGameplayTag                               StorageTag,
+        const TArray<TPair<FGuid, TArray<uint8>>>& Pairs,
+        bool                                       bFlushImmediately = false,
+        bool                                       bCritical         = false) = 0;
 
-    virtual void BatchGet(
+    // Returns a request handle that can be passed to Cancel().
+    // Missing keys are absent from the result map — implementations must not error on missing keys.
+    // Callbacks are invoked on the game thread.
+    virtual FGuid BatchGet(
         FGameplayTag                                        StorageTag,
         const TArray<FGuid>&                               Keys,
-        TFunction<void(const TMap<FGuid, TArray<uint8>>&)> Callback) = 0;
+        TFunction<void(EStorageRequestResult Result, const TMap<FGuid, TArray<uint8>>& Data)> Callback) = 0;
 
     virtual void BatchDelete(
-        FGameplayTag            StorageTag,
-        const TArray<FGuid>&    Keys) = 0;
+        FGameplayTag         StorageTag,
+        const TArray<FGuid>& Keys) = 0;
 
     // --- Server-Side Function Execution ---
     // For atomic or complex operations that must not be performed at game level.
     // FunctionName maps to a registered script/procedure on the backend (e.g. a Lua
     // script in Redis, a stored procedure in a document store).
     // Args and result are serialized as JSON strings.
-    virtual void ExecuteFunction(
-        FGameplayTag            StorageTag,
-        const FString&          FunctionName,
-        const FString&          ArgsJson,
-        TFunction<void(bool bSuccess, const FString& ResultJson)> Callback) = 0;
+    // Returns a request handle that can be passed to Cancel().
+    // Callbacks are invoked on the game thread.
+    virtual FGuid ExecuteFunction(
+        FGameplayTag    StorageTag,
+        const FString&  FunctionName,
+        const FString&  ArgsJson,
+        TFunction<void(EStorageRequestResult Result, const FString& ResultJson)> Callback) = 0;
+
+    // --- Cancellation ---
+
+    // Cancel a pending Get, BatchGet, or ExecuteFunction request.
+    // If the request has already completed, this is a no-op.
+    // The callback will fire with EStorageRequestResult::Cancelled if cancellation succeeds.
+    // Implementations are not required to abort in-flight network calls —
+    // cancellation prevents the callback from being acted on, not necessarily the wire call.
+    virtual void Cancel(FGuid RequestHandle) = 0;
 };
 ```
 
@@ -170,13 +205,14 @@ public:
             *Key.ToString());
     }
 
-    virtual void Get(FGameplayTag, const FGuid& Key,
-        TFunction<void(bool, const TArray<uint8>&)> Callback) override
+    virtual FGuid Get(FGameplayTag, const FGuid& Key,
+        TFunction<void(EStorageRequestResult, const TArray<uint8>&)> Callback) override
     {
         UE_LOG(LogGameCore, Warning,
             TEXT("[NullKeyStorage] Get called for key %s — returning failure."),
             *Key.ToString());
-        Callback(false, {});
+        Callback(EStorageRequestResult::Failure, {});
+        return FGuid{};
     }
 
     virtual void Delete(FGameplayTag, const FGuid& Key) override
@@ -191,11 +227,12 @@ public:
         UE_LOG(LogGameCore, Warning, TEXT("[NullKeyStorage] BatchSet called — no backend connected."));
     }
 
-    virtual void BatchGet(FGameplayTag, const TArray<FGuid>&,
-        TFunction<void(const TMap<FGuid, TArray<uint8>>&)> Callback) override
+    virtual FGuid BatchGet(FGameplayTag, const TArray<FGuid>&,
+        TFunction<void(EStorageRequestResult, const TMap<FGuid, TArray<uint8>>&)> Callback) override
     {
         UE_LOG(LogGameCore, Warning, TEXT("[NullKeyStorage] BatchGet called — returning empty results."));
-        Callback({});
+        Callback(EStorageRequestResult::Failure, {});
+        return FGuid{};
     }
 
     virtual void BatchDelete(FGameplayTag, const TArray<FGuid>&) override
@@ -203,14 +240,20 @@ public:
         UE_LOG(LogGameCore, Warning, TEXT("[NullKeyStorage] BatchDelete called — no backend connected."));
     }
 
-    virtual void ExecuteFunction(FGameplayTag, const FString& FunctionName,
+    virtual FGuid ExecuteFunction(FGameplayTag, const FString& FunctionName,
         const FString&,
-        TFunction<void(bool, const FString&)> Callback) override
+        TFunction<void(EStorageRequestResult, const FString&)> Callback) override
     {
         UE_LOG(LogGameCore, Warning,
             TEXT("[NullKeyStorage] ExecuteFunction '%s' called — no backend connected."),
             *FunctionName);
-        Callback(false, TEXT("{}"));
+        Callback(EStorageRequestResult::Failure, TEXT("{}"));
+        return FGuid{};
+    }
+
+    virtual void Cancel(FGuid) override
+    {
+        // No-op — null service has no pending requests.
     }
 };
 ```
@@ -253,6 +296,37 @@ void UMyGameServerSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 ---
 
+## Cancellation Pattern
+
+Store the request handle when cancellation may be needed (e.g. login, zone transfer). If the requesting object is destroyed before the backend responds, call `Cancel` then let the object die — the callback will not fire.
+
+```cpp
+// In a session manager or login handler:
+FGuid LoadHandle = Storage->Get(TAG_Persistence_Player, PlayerId,
+    [this, WeakSelf = TWeakObjectPtr<UMySessionManager>(this)]
+    (EStorageRequestResult Result, const TArray<uint8>& Data)
+    {
+        if (!WeakSelf.IsValid()) return;
+
+        if (Result == EStorageRequestResult::Success)
+        {
+            // Deserialize and continue login flow.
+        }
+        else
+        {
+            // Result is Failure, Cancelled, or TimedOut — treat as session-breaking event.
+            UE_LOG(LogGame, Error, TEXT("Player load failed: %s"),
+                *UEnum::GetValueAsString(Result));
+            AbortLogin();
+        }
+    });
+
+// On session manager destruction or login abort:
+Storage->Cancel(LoadHandle);
+```
+
+---
+
 ## TTL Use Cases
 
 `SetWithTTL` is intended for ephemeral data that must not persist beyond a session or window:
@@ -281,9 +355,12 @@ Args and result use JSON strings. The implementation is responsible for type map
 
 - `StorageTag` serves as namespace/collection discriminator. Implementations may route to different collections, key prefixes, or Redis databases.
 - `Connect()` is public for interface technical reasons but **must only be called by `UGameCoreBackendSubsystem`**.
-- All `Get` / `BatchGet` callbacks must be assumed asynchronous. Never capture raw `UObject*` — use `TWeakObjectPtr`.
+- All async callbacks (`Get`, `BatchGet`, `ExecuteFunction`) are always invoked — callers never need to handle "callback never arrives." On cancellation or timeout the callback fires with the appropriate `EStorageRequestResult`.
+- All callbacks are invoked on the game thread. Implementations must marshal results from their internal thread before invoking.
 - `BatchGet` returns only found keys. Missing GUIDs are absent from the result map — implementations must not error on missing keys.
 - `Delete` and `BatchDelete` are fire-and-forget. If confirmation is needed, use `ExecuteFunction` with a conditional delete script.
 - The write-behind queue is keyed by `(StorageTag, Key)` — newer writes replace pending writes for the same key. This is the correct behavior for entity persistence: we always want the most recent state dispatched to the backend, never duplicates.
 - `bCritical = true` entries are never dropped on queue overflow and are always flushed before normal entries. Use for logout, zone transfer, and server shutdown saves.
-- `bFlushImmediately = true` bypasses the queue entirely and dispatches synchronously. Use sparingly — only when the caller cannot tolerate any flush delay (e.g. immediate logout on the hot path).
+- `bFlushImmediately = true` dispatches on the service's internal thread — the calling thread is never blocked. Implementations must assert this if in doubt: `check(!IsInGameThread())` inside the flush dispatch path.
+- Cancellation does not guarantee the wire call is aborted — it guarantees the callback is suppressed. Implementations may abort in-flight calls as an optimization.
+- If the request handle from `Get`/`BatchGet`/`ExecuteFunction` is discarded, cancellation is simply unavailable for that call. This is acceptable for fire-and-forget reads where the caller does not need to cancel.
