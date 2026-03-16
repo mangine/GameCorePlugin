@@ -15,7 +15,7 @@ The State Machine System is a data-driven, event-driven, graph-based finite stat
 | Transition Rule | `UTransitionRule` | Instanced `UObject` evaluating a single condition. Subclassed per system. |
 | Transition Definition | `FStateTransition` | USTRUCT linking FromState → ToState with a rule and composition mode. |
 | Runtime Snapshot | `FStateMachineRuntime` | USTRUCT holding current state, history, and timestamps. Lives on the component. |
-| Runtime Driver | `UStateMachineComponent` | Actor component that hosts an asset and drives execution. |
+| Runtime Driver | `UStateMachineComponent` | Actor component that hosts an asset and drives execution. Implements `IPersistableComponent`. |
 | Authority Mode | `EStateMachineAuthority` | Enum declaring server-only, client-only, or replicated execution per component. |
 
 ---
@@ -28,6 +28,7 @@ The State Machine System is a data-driven, event-driven, graph-based finite stat
 - **Only current state replicates.** A single `FGameplayTag` travels over the wire.
 - **No cross-system imports at the core layer.** `UStateNodeBase` and `UTransitionRule` have zero dependencies on game systems.
 - **Subclassing is the extension mechanism.** No central registry.
+- **Persistence is opt-in per component.** `bPersistState` defaults to `true`. Set it `false` on purely cosmetic or ephemeral machines (UI state, VFX flows) that must never write to the persistence system.
 
 ---
 
@@ -41,7 +42,7 @@ The State Machine System is a data-driven, event-driven, graph-based finite stat
 - `RequestTransition(TargetStateTag)` — forced move, owning system has already validated.
 - `EvaluateTransitions(ContextObject)` — machine checks its rules; first passing rule wins.
 
-**State change.** On transition: `OnExit` → runtime update → `OnEnter` → `OnStateChanged` delegate fires → GMS broadcast fires.
+**State change.** On transition: `OnExit` → runtime update → `OnEnter` → `OnStateChanged` delegate fires → GMS broadcast fires → `NotifyDirty` called (if `bPersistState`).
 
 **Client reception.** Clients with `AuthorityMode == Both` receive the replicated `FGameplayTag`. `OnStateChanged` fires locally for cosmetics and UI sync.
 
@@ -170,6 +171,8 @@ struct GAMECORE_API FStateMachineRuntime
 
 # `UStateMachineComponent`
 
+`UStateMachineComponent` implements `IPersistableComponent`. The owning actor must have a `UPersistenceRegistrationComponent` for persistence to be active. If no registration component is present, `NotifyDirty` silently no-ops — the machine functions normally, it simply does not persist.
+
 ```cpp
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
     FOnStateChanged,
@@ -183,7 +186,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
     FGameplayTag, BlockedTargetState);
 
 UCLASS(ClassGroup = (GameCore), meta = (BlueprintSpawnableComponent))
-class GAMECORE_API UStateMachineComponent : public UActorComponent
+class GAMECORE_API UStateMachineComponent : public UActorComponent, public IPersistableComponent
 {
     GENERATED_BODY()
 public:
@@ -192,6 +195,20 @@ public:
 
     UPROPERTY(EditDefaultsOnly, Category = "State Machine")
     EStateMachineAuthority AuthorityMode = EStateMachineAuthority::ServerOnly;
+
+    // Controls whether this component participates in the persistence system.
+    // Set false for purely cosmetic or ephemeral machines (UI, VFX) that must
+    // never write to the save queue. Ignored if the owning actor has no
+    // UPersistenceRegistrationComponent.
+    UPROPERTY(EditDefaultsOnly, Category = "State Machine|Persistence")
+    bool bPersistState = true;
+
+    // Optional stable name used as the persistence blob key.
+    // Required only when an actor hosts more than one UStateMachineComponent.
+    // Must never be renamed after shipping — it is the blob identifier.
+    // When left as NAME_None, defaults to "StateMachine".
+    UPROPERTY(EditDefaultsOnly, Category = "State Machine|Persistence")
+    FName PersistenceKeyOverride = NAME_None;
 
     // ── Delegates — intra-system / Blueprint convenience ──────────────────────
 
@@ -220,11 +237,25 @@ public:
     UFUNCTION()
     void OnRep_CurrentStateTag();
 
+    // ── IPersistableComponent ─────────────────────────────────────────────────
+
+    virtual FName    GetPersistenceKey()    const override;
+    virtual uint32   GetSchemaVersion()     const override { return 1; }
+    virtual void     Serialize_Save(FArchive& Ar) override;
+    virtual void     Serialize_Load(FArchive& Ar, uint32 SavedVersion) override;
+    // Migrate() is no-op at v1. History array growth is the most likely future migration target.
+
 private:
     FStateMachineRuntime Runtime;
 
     void EnterState(const FGameplayTag& NewStateTag);
+    // RestoreState re-applies a persisted state tag without firing OnExit/OnEnter/delegates/GMS.
+    // Used exclusively by Serialize_Load. Not a transition — no side effects.
+    void RestoreState(const FGameplayTag& SavedStateTag);
     bool CanExecuteLocally() const;
+    // Pure predicate — no side effects. Returns true if the transition to TargetStateTag is
+    // permitted given the current non-interruptible state. Blocked-transition events are fired
+    // by the caller (RequestTransition / EvaluateTransitions), never inside this function.
     bool IsTransitionPermitted(const FGameplayTag& TargetStateTag) const;
 };
 ```
@@ -257,17 +288,25 @@ void UStateMachineComponent::EnterState(const FGameplayTag& NewStateTag)
     if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
     {
         FStateMachineStateChangedMessage Msg;
-        Msg.Component       = this;
-        Msg.OwnerActor      = GetOwner();
-        Msg.PreviousState   = PreviousState;
-        Msg.NewState        = NewStateTag;
+        Msg.Component         = this;
+        Msg.OwnerActor        = GetOwner();
+        Msg.PreviousState     = PreviousState;
+        Msg.NewState          = NewStateTag;
         Msg.StateMachineAsset = StateMachineAsset;
         Bus->Broadcast(GameCoreEventTags::StateMachine_StateChanged, Msg);
     }
+
+    // 3. Persistence dirty mark — only on server, only when opted in.
+    if (bPersistState && GetOwner()->HasAuthority())
+        NotifyDirty(this);
 }
 ```
 
-## IsTransitionPermitted — GMS Broadcast on Block
+## IsTransitionPermitted — Pure Predicate
+
+`IsTransitionPermitted` is a **pure predicate**. It evaluates the non-interruptible guard and returns a `bool`. It has no side effects.
+
+Blocked-transition events (`OnTransitionBlocked` delegate and `GameCoreEvent.StateMachine.TransitionBlocked` GMS broadcast) are fired by the **call site** (`RequestTransition` / `EvaluateTransitions`) after this function returns `false`.
 
 ```cpp
 bool UStateMachineComponent::IsTransitionPermitted(const FGameplayTag& TargetStateTag) const
@@ -284,22 +323,127 @@ bool UStateMachineComponent::IsTransitionPermitted(const FGameplayTag& TargetSta
             return true;
     }
 
-    // Blocked — fire delegate and GMS broadcast.
-    OnTransitionBlocked.Broadcast(const_cast<UStateMachineComponent*>(this), TargetStateTag);
-
-    if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
-    {
-        FStateMachineTransitionBlockedMessage Msg;
-        Msg.Component          = const_cast<UStateMachineComponent*>(this);
-        Msg.OwnerActor         = GetOwner();
-        Msg.BlockedTargetState = TargetStateTag;
-        Msg.CurrentState       = Runtime.CurrentStateTag;
-        Bus->Broadcast(GameCoreEventTags::StateMachine_TransitionBlocked, Msg);
-    }
-
     return false;
 }
 ```
+
+## RequestTransition / EvaluateTransitions — Blocked Event Fire Site
+
+```cpp
+void UStateMachineComponent::RequestTransition(const FGameplayTag& TargetStateTag)
+{
+    if (!CanExecuteLocally()) return;
+
+    if (!IsTransitionPermitted(TargetStateTag))
+    {
+        // Fire blocked events here — never inside IsTransitionPermitted.
+        OnTransitionBlocked.Broadcast(this, TargetStateTag);
+
+        if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+        {
+            FStateMachineTransitionBlockedMessage Msg;
+            Msg.Component          = this;
+            Msg.OwnerActor         = GetOwner();
+            Msg.BlockedTargetState = TargetStateTag;
+            Msg.CurrentState       = Runtime.CurrentStateTag;
+            Bus->Broadcast(GameCoreEventTags::StateMachine_TransitionBlocked, Msg);
+        }
+        return;
+    }
+
+    EnterState(TargetStateTag);
+}
+```
+
+> `EvaluateTransitions` follows the same pattern: call `IsTransitionPermitted` on the candidate, fire blocked events at the call site on `false`, call `EnterState` on `true`.
+
+---
+
+## Persistence — Serialization Contract
+
+`UStateMachineComponent` implements `IPersistableComponent`. The component serializes the full `FStateMachineRuntime` snapshot: current state, history, enter time, and transition count.
+
+**Schema version: 1**
+
+```cpp
+FName UStateMachineComponent::GetPersistenceKey() const
+{
+    if (PersistenceKeyOverride != NAME_None)
+        return PersistenceKeyOverride;
+    return FName("StateMachine");
+}
+
+void UStateMachineComponent::Serialize_Save(FArchive& Ar)
+{
+    // Ar is in write mode. Runtime must not be mutated here.
+    Ar << Runtime.CurrentStateTag;
+
+    int32 HistoryCount = FMath::Min(Runtime.History.Num(), StateMachineAsset->HistorySize);
+    Ar << HistoryCount;
+    for (int32 i = 0; i < HistoryCount; ++i)
+        Ar << Runtime.History[i];
+
+    Ar << Runtime.CurrentStateEnterTime;
+    Ar << Runtime.TransitionCount;
+}
+
+void UStateMachineComponent::Serialize_Load(FArchive& Ar, uint32 SavedVersion)
+{
+    FGameplayTag SavedStateTag;
+    Ar >> SavedStateTag;
+
+    int32 HistoryCount = 0;
+    Ar >> HistoryCount;
+    TArray<FGameplayTag> SavedHistory;
+    SavedHistory.SetNum(HistoryCount);
+    for (int32 i = 0; i < HistoryCount; ++i)
+        Ar >> SavedHistory[i];
+
+    float SavedEnterTime   = 0.f;
+    int32 SavedTransitions = 0;
+    Ar >> SavedEnterTime;
+    Ar >> SavedTransitions;
+
+    // Validate the saved state tag still exists in the asset.
+    // If content was updated and the tag was removed, fall back to entry state
+    // and log a warning so designers are alerted during testing.
+    if (StateMachineAsset->FindNode(SavedStateTag))
+    {
+        RestoreState(SavedStateTag);
+    }
+    else
+    {
+        UE_LOG(LogGameCore, Warning,
+            TEXT("UStateMachineComponent [%s]: Saved state tag '%s' no longer exists in asset '%s'. "
+                 "Falling back to entry state."),
+            *GetOwner()->GetName(),
+            *SavedStateTag.ToString(),
+            *StateMachineAsset->GetName());
+        RestoreState(StateMachineAsset->EntryStateTag);
+    }
+
+    // Restore metadata regardless of state tag validity.
+    Runtime.History           = MoveTemp(SavedHistory);
+    Runtime.CurrentStateEnterTime = SavedEnterTime;
+    Runtime.TransitionCount   = SavedTransitions;
+}
+```
+
+### RestoreState
+
+`RestoreState` applies a state tag directly to `Runtime.CurrentStateTag` without triggering `OnExit`, `OnEnter`, delegates, GMS broadcasts, or `NotifyDirty`. It is the restore path — not a transition.
+
+```cpp
+void UStateMachineComponent::RestoreState(const FGameplayTag& SavedStateTag)
+{
+    Runtime.CurrentStateTag = SavedStateTag;
+    // No OnExit / OnEnter. No delegates. No GMS. No dirty mark.
+    // The owning system is responsible for any post-load side-effect
+    // reconciliation if the game requires it (e.g. re-applying GrantedTags).
+}
+```
+
+> **Post-load reconciliation note.** If a state grants tags or activates abilities (via `GrantedTags` on `UStateNodeBase`), the owning system must re-apply those grants after loading. `RestoreState` does not replay `OnEnter`. Document this contract in any game-layer extension that uses `GrantedTags`.
 
 ---
 
@@ -336,6 +480,7 @@ Game / QuestPlugin/
 - **`Both` mode misprediction rollback.** `OnRep_CurrentStateTag` fires `EnterState` with the correct server state. Owning system is responsible for all side-effect cleanup in `OnExit`.
 - **History is not replicated.** Clients reconstruct from `OnStateChanged` / GMS events.
 - **Hierarchical FSMs deferred.** Multiple machines communicate via GMS state-changed events and Gameplay Tags.
+- **Post-load `GrantedTags` reconciliation is caller responsibility.** `RestoreState` does not replay `OnEnter`. Any state that grants tags or activates abilities must be re-applied by the owning system after loading. See Persistence section above.
 
 ---
 
@@ -365,8 +510,12 @@ GameCore/
 # Implementation Constraints
 
 - **`UTransitionRule::Evaluate` must be const and return immediately.**
+- **`IsTransitionPermitted` is a pure predicate — no side effects.** All blocked-transition events (`OnTransitionBlocked` delegate and GMS broadcast) must be fired at the `RequestTransition` / `EvaluateTransitions` call site after the permission check returns `false`, never inside the predicate itself.
 - **`UStateNodeBase::OnEnter` / `OnExit` must be non-reentrant.** Do not call `RequestTransition` from within them — post a deferred call.
 - **State tags must be unique within an asset.**
 - **The asset must not be modified at runtime.**
 - **`RequestTransition` is a forced move** — use only when the caller has verified correctness.
 - **`AuthorityMode` is not changed at runtime.**
+- **`GetPersistenceKey()` must never be renamed after shipping** — it is the blob identifier in saved payloads. If an actor hosts multiple `UStateMachineComponent` instances, each must have a unique `PersistenceKeyOverride` set.
+- **`Serialize_Save` must be strictly read-only** — no state mutation during serialization.
+- **`NotifyDirty` is called only on the server** (`HasAuthority()`) inside `EnterState`, gated by `bPersistState`.
