@@ -141,10 +141,14 @@ void ULevelingComponent::ApplyXP(FGameplayTag ProgressionTag, int32 WarXP, int32
     OnXPChanged.Broadcast(ProgressionTag, NewXP, FinalXP);
 
     // 2. GMS — all external consumers listen here.
+    //    Instigator (the player) is not known at this level — it is carried in the
+    //    message by the subsystem before calling ApplyXP, or listeners derive it
+    //    from the Subject's owner chain if needed.
     if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
     {
         FProgressionXPChangedMessage Msg;
-        Msg.PlayerState    = GetOwner<APlayerState>();
+        Msg.Instigator     = nullptr;           // Populated by UProgressionSubsystem before broadcast.
+        Msg.Subject        = GetOwner();        // The Actor whose LevelingComponent was mutated.
         Msg.ProgressionTag = ProgressionTag;
         Msg.NewXP          = NewXP;
         Msg.Delta          = FinalXP;
@@ -152,6 +156,8 @@ void ULevelingComponent::ApplyXP(FGameplayTag ProgressionTag, int32 WarXP, int32
     }
 }
 ```
+
+> **Note:** `Instigator` is set by `UProgressionSubsystem::GrantXP` on the message struct before `ApplyXP` is called, or alternatively the subsystem broadcasts the message itself post-`ApplyXP`. Either pattern keeps `ULevelingComponent` free of any `APlayerState` knowledge. Prefer the subsystem-broadcasts pattern to keep the component fully self-contained.
 
 ## ProcessLevelUp Logic
 
@@ -169,13 +175,69 @@ void ULevelingComponent::ProcessLevelUp(FProgressionLevelData& Data, ULevelProgr
     if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
     {
         FProgressionLevelUpMessage Msg;
-        Msg.PlayerState    = GetOwner<APlayerState>();
+        Msg.Instigator     = nullptr;           // Populated by UProgressionSubsystem.
+        Msg.Subject        = GetOwner();        // The Actor that leveled up.
         Msg.ProgressionTag = Data.ProgressionTag;
         Msg.OldLevel       = OldLevel;
         Msg.NewLevel       = Data.Level;
         Bus->Broadcast(GameCoreEventTags::Progression_LevelUp, Msg);
     }
 }
+```
+
+---
+
+## GMS Message Structs
+
+```cpp
+USTRUCT(BlueprintType)
+struct FProgressionXPChangedMessage
+{
+    GENERATED_BODY()
+
+    // The player who triggered the grant (for UI, watcher evaluation, analytics).
+    // May be nullptr for server-initiated grants with no player instigator.
+    UPROPERTY()
+    TObjectPtr<APlayerState> Instigator;
+
+    // The Actor whose ULevelingComponent was mutated.
+    // May be the player's pawn, an NPC, a ship crew member, etc.
+    UPROPERTY()
+    TObjectPtr<AActor> Subject;
+
+    UPROPERTY()
+    FGameplayTag ProgressionTag;
+
+    UPROPERTY()
+    int32 NewXP = 0;
+
+    UPROPERTY()
+    int32 Delta = 0;
+};
+
+USTRUCT(BlueprintType)
+struct FProgressionLevelUpMessage
+{
+    GENERATED_BODY()
+
+    // The player who triggered the grant.
+    // May be nullptr for server-initiated grants with no player instigator.
+    UPROPERTY()
+    TObjectPtr<APlayerState> Instigator;
+
+    // The Actor that leveled up.
+    UPROPERTY()
+    TObjectPtr<AActor> Subject;
+
+    UPROPERTY()
+    FGameplayTag ProgressionTag;
+
+    UPROPERTY()
+    int32 OldLevel = 0;
+
+    UPROPERTY()
+    int32 NewLevel = 0;
+};
 ```
 
 ---

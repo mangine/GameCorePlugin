@@ -21,8 +21,8 @@ GameCore/Source/GameCore/Progression/
 
 ## Dependencies
 
-- `ULevelingComponent` — resolved at runtime via `PS->GetPawn()->FindComponentByClass`. Never stored as a hard reference.
-- `UAbilitySystemComponent` — queried for personal XP multiplier attribute. Soft dependency; skipped if ASC absent.
+- `ULevelingComponent` — resolved at runtime from `Target` via `FindComponentByClass`. Never stored as a hard reference.
+- `UAbilitySystemComponent` — queried on `Instigator` for personal XP multiplier attribute. Soft dependency; skipped if ASC absent.
 - `FGameCoreBackend` — audit dispatch via `FGameCoreBackend::GetAudit(TAG_Audit_Progression)`.
 
 > **Removed dependency:** `URequirementWatcherManager` is no longer a direct dependency. Watcher notification is decoupled via the `GameCoreEvent.Progression.LevelUp` GMS channel.
@@ -42,15 +42,37 @@ public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 
     /**
-     * Grants XP to a player's progression track.
-     * Resolves multipliers, delegates final XP to ULevelingComponent, dispatches audit.
+     * Grants XP to any Actor that owns a ULevelingComponent.
+     *
+     * @param Instigator  The player driving this grant. Always required — used for
+     *                    multiplier resolution (GlobalXP × ASC personal multiplier)
+     *                    and audit attribution.
+     * @param Target      The Actor whose ULevelingComponent receives the XP.
+     *                    Pass nullptr to default to Instigator->GetPawn().
+     *                    Can be an NPC, ship crew member, or any Actor with a
+     *                    ULevelingComponent.
+     * @param ProgressionTag  The progression track to credit.
+     * @param BaseAmount      Raw XP before multipliers.
+     * @param ContentLevel    Used by UXPReductionPolicy to scale XP for level-gap.
+     * @param Source          Audit source identifier.
+     *
      * Server-only — no-op on client.
      */
     void GrantXP(
-        APlayerState* PS,
-        FGameplayTag ProgressionTag,
-        int32 BaseAmount,
-        int32 ContentLevel,
+        APlayerState* Instigator,
+        AActor*        Target,
+        FGameplayTag   ProgressionTag,
+        int32          BaseAmount,
+        int32          ContentLevel,
+        TScriptInterface<ISourceIDInterface> Source
+    );
+
+    /** Convenience overload — Target defaults to Instigator->GetPawn(). */
+    void GrantXP(
+        APlayerState* Instigator,
+        FGameplayTag  ProgressionTag,
+        int32         BaseAmount,
+        int32         ContentLevel,
         TScriptInterface<ISourceIDInterface> Source
     );
 
@@ -58,7 +80,12 @@ public:
     float GetGlobalXPMultiplier() const { return GlobalXPMultiplier; }
 
 private:
-    float ResolveMultiplier(APlayerState* PS) const;
+    /**
+     * Resolves the combined XP multiplier for the Instigator.
+     * GlobalXPMultiplier × personal GAS attribute multiplier (if ASC present).
+     * Always keyed to the player — NPCs and other target Actors do not contribute multipliers.
+     */
+    float ResolveMultiplier(APlayerState* Instigator) const;
     float GlobalXPMultiplier = 1.f;
 
     // Intra-system: bound to ULevelingComponent::OnLevelUp for audit only.
@@ -71,8 +98,12 @@ private:
 ## GrantXP Flow
 
 ```
-GrantXP(PS, Tag, BaseAmount, ContentLevel, Source)
-  └── ResolveMultiplier (GlobalXPMultiplier × GAS personal multiplier)
+GrantXP(Instigator, Target, Tag, BaseAmount, ContentLevel, Source)
+  └── Target = (Target != nullptr) ? Target : Instigator->GetPawn()
+  └── LevelingComp = Target->FindComponentByClass<ULevelingComponent>()
+  └── if (!LevelingComp) return   // silent no-op — Target has no leveling
+  └── ResolveMultiplier(Instigator)   ← always player-driven
+        GlobalXPMultiplier × GAS personal multiplier on Instigator's ASC
   └── LevelingComp->ApplyXP(Tag, WarXP, ContentLevel)
         ├── Applies UXPReductionPolicy
         ├── Mutates ProgressionData
@@ -102,9 +133,11 @@ void UProgressionSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UProgressionSubsystem::OnPlayerRegistered(APlayerState* PS)
 {
+    // Bind audit to the player's own pawn's LevelingComponent.
+    // For NPCs / other targets, audit fires via the anonymous HandleLevelUpForAudit
+    // delegate bound at GrantXP time (not needed — see Note below).
     if (ULevelingComponent* LC = PS->GetPawn()->FindComponentByClass<ULevelingComponent>())
     {
-        // Intra-system binding: audit only.
         LC->OnLevelUp.AddUObject(this, &UProgressionSubsystem::HandleLevelUpForAudit);
     }
 }
@@ -115,6 +148,25 @@ void UProgressionSubsystem::HandleLevelUpForAudit(FGameplayTag ProgressionTag, i
     // Do NOT notify WatcherManager here — that coupling is intentionally removed.
 }
 ```
+
+---
+
+## Convenience Overload Implementation
+
+```cpp
+void UProgressionSubsystem::GrantXP(
+    APlayerState* Instigator,
+    FGameplayTag  ProgressionTag,
+    int32         BaseAmount,
+    int32         ContentLevel,
+    TScriptInterface<ISourceIDInterface> Source)
+{
+    GrantXP(Instigator, Instigator ? Instigator->GetPawn() : nullptr,
+            ProgressionTag, BaseAmount, ContentLevel, Source);
+}
+```
+
+Existing call sites that pass only a `APlayerState*` continue to compile unchanged.
 
 ---
 
@@ -132,4 +184,6 @@ Server-side policy only — not replicated. Clients informed via game-layer even
 ## Notes
 
 - `GrantXP` is not `BlueprintCallable` — C++ server-side API only.
+- Multipliers are **always resolved from the Instigator** (the player). Target Actors such as NPCs or crew members never contribute their own multipliers — the player's progression bonuses are what scale the reward.
 - The watcher system integrates via a thin adapter that listens to `GameCoreEvent.Progression.LevelUp` on GMS and calls `URequirementWatcherManager::NotifyPlayerEvent`. That adapter lives in the game layer or a dedicated integration module — never inside the Progression module.
+- Call sites are responsible for resolving the correct `Target` Actor. The Progression System does not perform any routing — it applies XP to whatever `ULevelingComponent` it finds on the Target.

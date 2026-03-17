@@ -10,7 +10,7 @@ The system is composed of two decoupled components that live on the same Actor, 
 | --- | --- |
 | `ULevelingComponent` | Owns progression states (XP, level per tag). Applies final XP after reduction. Fires level-up grants. |
 | `UPointPoolComponent` | Owns point pools (available vs consumed per pool tag). Accepts grants from any source. |
-| `UProgressionSubsystem` | Server-only entry point. Resolves multipliers, dispatches audit via `FGameCoreBackend`, notifies the Watcher system. |
+| `UProgressionSubsystem` | Server-only entry point. Resolves multipliers (always from the player Instigator), dispatches audit via `FGameCoreBackend`. |
 | `UXPReductionPolicy` | Abstract base for level-gap XP reduction policies. `UXPReductionPolicyCurve` is the default curve-based implementation. |
 
 Components communicate in one direction only: `ULevelingComponent` calls into `UPointPoolComponent` on level-up. `UPointPoolComponent` has no knowledge of leveling. All external XP grants flow through `UProgressionSubsystem`.
@@ -37,7 +37,8 @@ GameCore/
 - **Data-driven definitions** — each progression type is defined in a `ULevelProgressionDefinition` DataAsset, not in code.
 - **Decoupled point pools** — `UPointPoolComponent` is standalone. Events, quests, achievements, and GM tools can all grant points without touching the leveling component.
 - **Server-authoritative** — all mutations are server-only. The client receives replicated state and delegates only.
-- **Subsystem as policy layer** — `UProgressionSubsystem` is the sole external entry point for XP grants. Components remain pure state owners; all policy (multipliers, audit, watcher notification) lives in the subsystem.
+- **Subsystem as policy layer** — `UProgressionSubsystem` is the sole external entry point for XP grants. Components remain pure state owners; all policy (multipliers, audit) lives in the subsystem.
+- **Instigator / Target split** — `GrantXP` takes an `Instigator` (`APlayerState*`) for multiplier resolution and audit, and a separate `Target` (`AActor*`) for component resolution. This allows XP to be granted to any Actor with a `ULevelingComponent` (NPCs, crew members, ships) while multipliers remain player-driven. Routing the correct Target is the call site's responsibility.
 - **Component applies final XP** — the subsystem resolves war XP (base × multipliers); the component applies the per-progression `UXPReductionPolicy` and produces the final amount. Server authority is preserved throughout.
 - **Audit via FGameCoreBackend** — `UProgressionSubsystem` calls `FGameCoreBackend::GetAudit(TAG_Audit_Progression)` post-mutation. No custom audit interface.
 
@@ -45,21 +46,23 @@ GameCore/
 
 ```
 [Gameplay Code / RewardResolver]
-    UProgressionSubsystem::GrantXP(PS, ProgressionTag, BaseAmount, ContentLevel, Source)
+    UProgressionSubsystem::GrantXP(Instigator, Target, ProgressionTag, BaseAmount, ContentLevel, Source)
     │
-    ├─ ResolveMultipliers: GlobalXPMultiplier × GAS personal multiplier (ASC attribute)
+    ├─ Target = (Target != nullptr) ? Target : Instigator->GetPawn()
+    ├─ LevelingComp = Target->FindComponentByClass<ULevelingComponent>()   ← silent no-op if absent
+    ├─ ResolveMultipliers(Instigator): GlobalXPMultiplier × GAS personal multiplier on Instigator
     │  → WarXP = BaseAmount × CombinedMultiplier
     │
     ▼
     ULevelingComponent::ApplyXP(ProgressionTag, WarXP, ContentLevel)  ← internal, server-only
-    │  Samples Definition->ReductionPolicy->Evaluate(PlayerLevel, ContentLevel)
+    │  Samples Definition->ReductionPolicy->Evaluate(TargetLevel, ContentLevel)
     │  FinalXP = WarXP × ReductionMultiplier
     │  Pure state mutation — FastArray replication kicks in
     │  OnLevelUp / OnXPChanged delegates fire
     │
     ▼ (back in GrantXP, after ApplyXP returns)
     DispatchAudit → FGameCoreBackend::GetAudit(TAG_Audit_Progression)->RecordEvent(...)
-    NotifyWatcher → URequirementWatcherManager::NotifyPlayerEvent(PS, TAG_RequirementEvent_Progression)
+                    Payload includes both Instigator and Target for full traceability
 ```
 
 ## Sub-pages
