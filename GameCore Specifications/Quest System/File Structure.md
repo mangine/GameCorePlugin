@@ -6,53 +6,59 @@
 
 ## Module Location
 
-The Quest System lives in the **game module**, not the GameCore plugin. It depends on GameCore but introduces no plugin-level coupling in reverse.
+The Quest System lives in the **game module** (or a dedicated quest module), not the GameCore plugin.
 
 ```
 PirateGame/
 └── Source/
-    └── PirateGame/                        ← game module (or a dedicated Quest module)
+    └── PirateGame/
         └── Quest/
             ├── Quest.Build.cs
             ├── Enums/
-            │   └── QuestEnums.h                   ← all quest enums
+            │   └── QuestEnums.h                        ← all quest enums incl. shared quest enums
             ├── Data/
-            │   ├── QuestDefinition.h / .cpp
+            │   ├── QuestDefinition.h / .cpp            ← base solo quest definition
+            │   ├── SharedQuestDefinition.h / .cpp      ← group extension
             │   ├── QuestStageDefinition.h / .cpp
             │   ├── QuestDisplayData.h
             │   ├── QuestProgressTrackerDef.h
             │   └── QuestMarkerDataAsset.h / .cpp
             ├── Runtime/
-            │   └── QuestRuntime.h                 ← FQuestRuntime, FQuestTrackerEntry, FQuestRuntimeArray
+            │   └── QuestRuntime.h                      ← FQuestRuntime, FQuestTrackerEntry, FQuestRuntimeArray
             ├── Components/
-            │   ├── QuestComponent.h / .cpp
-            │   └── PartyQuestCoordinator.h / .cpp
+            │   ├── QuestComponent.h / .cpp             ← solo quest component (base)
+            │   ├── SharedQuestComponent.h / .cpp       ← group extension component
+            │   └── SharedQuestCoordinator.h / .cpp     ← shared tracker authority on group actor
             ├── Subsystems/
             │   └── QuestRegistrySubsystem.h / .cpp
             ├── Requirements/
-            │   ├── Requirement_KillCount.h / .cpp
             │   ├── Requirement_QuestCompleted.h / .cpp
             │   ├── Requirement_QuestCooldown.h / .cpp
-            │   ├── Requirement_GroupSize.h / .cpp
             │   └── Requirement_ActiveQuestCount.h
-            └── Events/
-                └── QuestEventPayloads.h           ← all GMS payload structs
+            ├── Events/
+            │   └── QuestEventPayloads.h
+            └── Integration/
+                └── QuestTrackerBridge.h / .cpp         ← game-module bridge: subscribes to
+                                                          combat/gathering GMS events, calls
+                                                          UQuestComponent::Server_IncrementTracker
+                                                          NOT part of the quest system itself
 ```
 
 ---
 
 ## GameCore Plugin Changes
 
-These files are modified or added in the **GameCore plugin**:
-
 ```
 GameCore/
 └── Source/
     └── GameCore/
+        ├── Interfaces/
+        │   └── GroupProvider.h                     ← NEW: IGroupProvider interface
         └── Requirements/
-            ├── RequirementPayload.h            ← NEW: FRequirementPayload
-            ├── RequirementContext.h             ← MODIFIED: add PersistedData field
-            └── RequirementPersisted.h / .cpp    ← NEW: URequirement_Persisted
+            ├── RequirementPayload.h                ← NEW: FRequirementPayload
+            ├── RequirementContext.h                ← MODIFIED: add PersistedData field
+            ├── RequirementPersisted.h / .cpp       ← NEW: URequirement_Persisted
+            └── RequirementWatcher.h / .cpp         ← MODIFIED: ContextBuilder on RegisterSet
 ```
 
 ---
@@ -60,55 +66,75 @@ GameCore/
 ## Build.cs Dependencies
 
 ```csharp
-// Quest/Quest.Build.cs  (or inside PirateGame.Build.cs)
+// Quest/Quest.Build.cs
 PublicDependencyModuleNames.AddRange(new string[]
 {
     "Core",
     "CoreUObject",
     "Engine",
     "GameplayTags",
-    "GameCore",           // URequirement, URequirementList, UStateMachineAsset,
-                          // URequirementWatcherComponent, UGameCoreEventSubsystem,
-                          // IPersistableComponent
-    "NetCore",            // FFastArraySerializer
-});
-
-PrivateDependencyModuleNames.AddRange(new string[]
-{
-    "DeveloperSettings",
+    "GameCore",     // URequirement, URequirementList, UStateMachineAsset,
+                    // URequirementWatcherComponent, UGameCoreEventSubsystem,
+                    // IPersistableComponent, IGroupProvider
+    "NetCore",      // FFastArraySerializer
 });
 ```
 
 ---
 
-## Config: DefaultGameplayTags.ini (Quest Module)
+## Actor Setup
+
+### APlayerState
+
+```
+APlayerState
+  ├── UQuestComponent                     ← solo quest runtime + persistence
+  │   OR
+  ├── USharedQuestComponent               ← drop-in replacement; inherits UQuestComponent
+  ├── URequirementWatcherComponent        ← always required (existing GameCore component)
+  └── implements IGroupProvider           ← optional; required only for shared quest group
+                                              validation. Implemented by the party system.
+```
+
+### Group Actor (party, ship, squad — game-specific)
+
+```
+AGroupActor (game-specific)
+  ├── USharedQuestCoordinator             ← shared tracker authority
+  └── implements IGroupProvider           ← provides GetGroupSize, IsGroupLeader,
+                                              GetGroupMembers to coordinator
+```
+
+---
+
+## Config: DefaultGameplayTags.ini
 
 ```ini
-; ── Quest identity tags ─────────────────────────────────────────────────────────────────
-+GameplayTagList=(Tag="Quest.Id",               DevComment="Namespace for quest identity tags")
-+GameplayTagList=(Tag="Quest.Completed",        DevComment="Namespace for quest completion tags")
-+GameplayTagList=(Tag="Quest.Payload",          DevComment="Namespace for FRequirementContext payload keys")
-+GameplayTagList=(Tag="Quest.Counter",          DevComment="Namespace for counter keys within a payload")
-+GameplayTagList=(Tag="Quest.Counter.LastCompleted", DevComment="Float: last completion Unix timestamp")
+; ── Identity ──────────────────────────────────────────────────────────────────
++GameplayTagList=(Tag="Quest.Id")
++GameplayTagList=(Tag="Quest.Completed")
++GameplayTagList=(Tag="Quest.Payload")
++GameplayTagList=(Tag="Quest.Counter")
++GameplayTagList=(Tag="Quest.Counter.LastCompleted")
 
-; ── Quest categories (expand as needed) ───────────────────────────────────────────────
-+GameplayTagList=(Tag="Quest.Category.Story",     DevComment="Main story quests")
-+GameplayTagList=(Tag="Quest.Category.SideQuest", DevComment="Optional side quests")
-+GameplayTagList=(Tag="Quest.Category.Daily",     DevComment="Daily repeatable quests")
-+GameplayTagList=(Tag="Quest.Category.Weekly",    DevComment="Weekly repeatable quests")
-+GameplayTagList=(Tag="Quest.Category.Dungeon",   DevComment="Instanced dungeon quests")
-+GameplayTagList=(Tag="Quest.Category.Event",     DevComment="Time-limited event quests")
-+GameplayTagList=(Tag="Quest.Category.NPC",       DevComment="NPC-given quests")
+; ── Categories ────────────────────────────────────────────────────────────────
++GameplayTagList=(Tag="Quest.Category.Story")
++GameplayTagList=(Tag="Quest.Category.SideQuest")
++GameplayTagList=(Tag="Quest.Category.Daily")
++GameplayTagList=(Tag="Quest.Category.Weekly")
++GameplayTagList=(Tag="Quest.Category.Dungeon")
++GameplayTagList=(Tag="Quest.Category.Event")
++GameplayTagList=(Tag="Quest.Category.NPC")
 
-; ── Quest marker types (add new markers here, map to icons in UQuestMarkerDataAsset) ──
-+GameplayTagList=(Tag="Quest.Marker.MainStory",   DevComment="Gold star marker")
-+GameplayTagList=(Tag="Quest.Marker.SideQuest",   DevComment="Silver marker")
-+GameplayTagList=(Tag="Quest.Marker.Daily",       DevComment="Clock icon marker")
-+GameplayTagList=(Tag="Quest.Marker.Dungeon",     DevComment="Skull marker")
-+GameplayTagList=(Tag="Quest.Marker.Event",       DevComment="Event flag marker")
-+GameplayTagList=(Tag="Quest.Marker.NPC",         DevComment="NPC exclamation marker")
+; ── Markers ──────────────────────────────────────────────────────────────────
++GameplayTagList=(Tag="Quest.Marker.MainStory")
++GameplayTagList=(Tag="Quest.Marker.SideQuest")
++GameplayTagList=(Tag="Quest.Marker.Daily")
++GameplayTagList=(Tag="Quest.Marker.Dungeon")
++GameplayTagList=(Tag="Quest.Marker.Event")
++GameplayTagList=(Tag="Quest.Marker.NPC")
 
-; ── GMS event channels ──────────────────────────────────────────────────────────────────────
+; ── GMS event channels ─────────────────────────────────────────────────────────────
 +GameplayTagList=(Tag="GameCoreEvent.Quest.Started")
 +GameplayTagList=(Tag="GameCoreEvent.Quest.Completed")
 +GameplayTagList=(Tag="GameCoreEvent.Quest.Failed")
@@ -123,7 +149,7 @@ PrivateDependencyModuleNames.AddRange(new string[]
 +GameplayTagList=(Tag="GameCoreEvent.Quest.PartyInvite")
 +GameplayTagList=(Tag="GameCoreEvent.Quest.MemberLeft")
 
-; ── Requirement invalidation events ───────────────────────────────────────────────────────
+; ── Requirement invalidation events ───────────────────────────────────────────────
 +GameplayTagList=(Tag="RequirementEvent.Quest.TrackerUpdated")
 +GameplayTagList=(Tag="RequirementEvent.Quest.StageChanged")
 +GameplayTagList=(Tag="RequirementEvent.Quest.Completed")
@@ -131,31 +157,12 @@ PrivateDependencyModuleNames.AddRange(new string[]
 
 ---
 
-## Actor Setup
-
-### APlayerState
-
-```
-APlayerState
-  ├── UQuestComponent                    ← quest runtime, persistence
-  └── URequirementWatcherComponent       ← unlock + completion watching
-       (already required by other systems)
-```
-
-### Party Actor
-
-```
-APartyActor (game-specific)
-  └── UPartyQuestCoordinator             ← shared tracker authority
-```
-
----
-
 ## Key Constraints and Notes
 
-- **Quest definitions are never instantiated per player.** `UQuestDefinition` is a shared read-only asset. Mutable state is always in `FQuestRuntime`.
-- **`UStateMachineComponent` is NOT used for quest stages.** The quest system reads the `UStateMachineAsset` graph directly for stage/transition definitions and reuses `UStateNodeBase` / `UTransitionRule` as base classes for quest-specific subclasses. `UStateMachineComponent` is not added to `APlayerState` — the quest component drives stage transitions itself by tracking `CurrentStageTag` and evaluating transition rules from the asset.
-- **`bReEvaluateOnly` trackers have no `FQuestTrackerEntry`.** They are not allocated in `FQuestRuntime::Trackers`. Requirements referencing them evaluate against live world state (inventory, tags, etc.) using non-persisted `URequirement` subclasses. The quest system does not store them.
-- **`MaxActiveQuests` is enforced server-side only.** Client may display a capacity warning pre-accept by reading the replicated `ActiveQuests` count, but the server is the authoritative gate.
-- **Abandon is always permitted** except for `GroupOnly` quests — the designer may add a `URequirement_GroupSize` check on the `UnlockRequirements` but abandon is not blocked at the system level.
-- **`SingleAttempt` quests are permanently closed on the first fail or completion.** The `QuestCompletedTag` is added to `CompletedQuestTags` in both cases. Both are treated as terminal closed states in the unlock watcher pre-filter.
+- **`UStateMachineComponent` is NOT added to `APlayerState`.** The quest component reads `UStateMachineAsset` directly for stage transition logic. `FQuestRuntime::CurrentStageTag` is the runtime state.
+- **`bReEvaluateOnly` trackers have no `FQuestTrackerEntry`.** They are not allocated in `FQuestRuntime::Trackers`. Requirements reading them evaluate live world state each time.
+- **`UQuestComponent` has zero GMS subscriptions.** All tracker increments arrive via `Server_IncrementTracker` called by external integration layers.
+- **`USharedQuestComponent` also has zero GMS subscriptions.** The integration layer calls `OnGroupMemberTrackerContribution` or `Server_IncrementTracker` directly.
+- **`bEnabled = false` removal is non-destructive.** No `QuestCompletedTag` is added. Re-enabling a quest makes it available again on next login.
+- **`USharedQuestDefinition` registers under the same `"QuestDefinition"` asset type.** The registry loads both identically. `USharedQuestComponent` upcasts; base `UQuestComponent` never does.
+- **`MaxActiveQuests` is enforced server-side only.** Client reads `ActiveQuests.Items.Num()` for pre-validation UI hints.
