@@ -2,7 +2,7 @@
 
 **Sub-page of:** [HISM Proxy Actor System](HISM%20Proxy%20Actor%20System.md)
 
-`AHISMProxyActor` is the **minimal base class** for all proxy actors managed by `UHISMProxyBridgeComponent`. It is deliberately thin — almost all gameplay behaviour lives in Blueprint subclasses. The base class exists only to define the activation/deactivation contract and expose the bound instance index.
+`AHISMProxyActor` is the **minimal base class** for all proxy actors managed by `UHISMProxyBridgeComponent`. It is deliberately thin — almost all gameplay behaviour lives in Blueprint subclasses. The base class defines the activation/deactivation contract and exposes the bound instance index.
 
 **Files:** `HISMProxy/HISMProxyActor.h / .cpp`
 
@@ -10,9 +10,11 @@
 
 ## Design Intent
 
-Proxy actors are **standard AActor subclasses**. They replicate to clients via UE's Actor relevancy exactly like any hand-placed world Actor. They can carry `UInteractionComponent`, `UStaticMeshComponent`, GAS components, or anything else an AActor can host. The system imposes no restrictions.
+Proxy actors are standard `AActor` subclasses. They replicate to clients via UE's Actor relevancy exactly like any hand-placed world Actor. They can carry `UInteractionComponent`, `UStaticMeshComponent`, GAS components, or anything else an `AActor` can host.
 
-The pool pre-allocates them at `BeginPlay` spawned hidden at the world origin. Activation is a transform set + visibility toggle — not a `SpawnActor` call. The base class's virtual hooks let game code react to these lifecycle events without subclassing the bridge component.
+The pool pre-allocates them at `BeginPlay` spawned hidden near the host actor below terrain. Activation is a transform set + visibility toggle — not a `SpawnActor` call.
+
+> **`Abstract` note:** The base class is marked `Abstract` to prevent it from being used directly in `ProxyClass` or placed in the world. Only concrete Blueprint subclasses are valid. `UHISMProxyBridgeComponent::SpawnPoolActor` calls `SpawnActor` with the configured `ProxyClass` (a concrete subclass) — it never passes the base class. `ValidateSetup` checks this at editor time.
 
 ---
 
@@ -26,7 +28,7 @@ class GAMECORE_API AHISMProxyActor : public AActor
 public:
     AHISMProxyActor();
 
-    // ── State ─────────────────────────────────────────────────────────────────
+    // ── State ──────────────────────────────────────────────────────────────
 
     // The HISM instance index this proxy currently represents.
     // INDEX_NONE when the proxy is in the pool (inactive).
@@ -35,19 +37,19 @@ public:
 
     // ── Lifecycle Hooks — called by UHISMProxyBridgeComponent ────────────────
 
-    // Called on the server when the proxy is pulled from the pool and assigned
-    // to InstanceIndex. Transform has already been set before this call.
-    // Subclasses should initialise gameplay state here (load resource data,
-    // configure InteractionComponent entries, set mesh, etc.).
+    // Called on the server after the proxy is positioned and made visible.
+    // Subclasses initialise gameplay state here: query resource data,
+    // configure InteractionComponent entries, bind delegates, etc.
     virtual void OnProxyActivated(int32 InstanceIndex, const FTransform& InstanceTransform);
 
     // Called on the server just before the proxy is hidden and returned to pool.
-    // Subclasses should clean up any transient state here.
+    // Subclasses must clean up here: unbind delegates, flush partial state
+    // to external game system storage, clear timers.
     virtual void OnProxyDeactivated();
 
 protected:
-    // Blueprint-implementable events mirror the C++ virtuals.
-    // C++ subclasses override the virtual; Blueprint subclasses override these.
+    // Blueprint-implementable mirrors of the C++ virtuals.
+    // C++ subclasses: override the virtual. Blueprint subclasses: implement these events.
     UFUNCTION(BlueprintImplementableEvent, Category = "HISM Proxy",
               meta = (DisplayName = "On Proxy Activated"))
     void BP_OnProxyActivated(int32 InstanceIndex);
@@ -65,11 +67,11 @@ protected:
 ```cpp
 AHISMProxyActor::AHISMProxyActor()
 {
-    // Proxies replicate like normal Actors — clients see them via relevancy.
+    // Proxies replicate to clients via standard Actor relevancy.
     bReplicates = true;
 
-    // No per-frame tick needed on the base class.
-    // Subclasses may enable tick if required.
+    // Tick is off on the base class. Enable in Blueprint subclasses only if needed.
+    // Be aware that many ticking proxies is a CPU cost at MMO densities.
     PrimaryActorTick.bCanEverTick = false;
 }
 
@@ -91,61 +93,41 @@ void AHISMProxyActor::OnProxyDeactivated()
 
 ## Blueprint Subclass Pattern
 
-This is the standard pattern for a game-specific proxy actor. The example shows an oak tree harvesting proxy.
-
-**Blueprint class:** `BP_OakTreeProxy` (parent: `AHISMProxyActor`)
+**Blueprint class:** `BP_OakTreeProxy` — parent: `AHISMProxyActor`
 
 **Components added in the Blueprint:**
-- `UInteractionComponent` — with a `Harvest` entry
-- `UStaticMeshComponent` (optional) — only if a different LOD or material is needed on the proxy vs. the HISM mesh
+- `UInteractionComponent` with a Harvest entry
+- `UStaticMeshComponent` (optional — only if the proxy needs a different mesh or LOD than the HISM)
 
-**Event Graph — `On Proxy Activated`:**
-
+**Event: `On Proxy Activated(InstanceIndex)`**
 ```
-Event BP_OnProxyActivated (InstanceIndex)
-  |
-  v
-  Get Game Instance Subsystem (UHarvestSubsystem)
-  |
-  v
-  Query resource state for InstanceIndex
-  |
-  +-- Is on cooldown? --> SetEntryServerEnabled(HarvestEntry, false)
-  |
-  +-- Is available?  --> SetEntryServerEnabled(HarvestEntry, true)
-                          Bind OnInteractionExecuted → Harvest_OnInteract
+Get HarvestSubsystem
+  → QueryInstanceState(InstanceIndex)
+    → Harvested:  InteractionComp.SetEntryServerEnabled(0, false)
+    → Available:  InteractionComp.SetEntryServerEnabled(0, true)
+                  Bind InteractionComp.OnInteractionExecuted → OnHarvestInteracted
 ```
 
-**Event Graph — `On Proxy Deactivated`:**
-
+**Event: `On Proxy Deactivated`**
 ```
-Event BP_OnProxyDeactivated
-  |
-  v
-  Unbind OnInteractionExecuted delegates
-  Clear any running timers (e.g. respawn countdown UI)
+Unbind all delegates on InteractionComp
+Clear any active timers (cooldown countdowns, etc.)
+Flush any partial interaction state to HarvestSubsystem storage
 ```
 
-**Event Graph — `Harvest_OnInteract` (bound in OnProxyActivated):**
-
+**Function: `OnHarvestInteracted(Instigator, EntryIndex)`**
 ```
-Harvest_OnInteract (Instigator, EntryIndex)
-  |
-  v
-  Notify UHarvestSubsystem → HarvestInstance(BoundInstanceIndex, Instigator)
-  |
-  v
-  SetEntryServerEnabled(HarvestEntry, false)  [disable until respawn]
+HarvestSubsystem.HarvestTree(BoundInstanceIndex, Instigator)
+InteractionComp.SetEntryServerEnabled(0, false)
 ```
 
 ---
 
 ## Notes
 
-- **`Abstract` + `Blueprintable`**: the base class cannot be placed or assigned directly in a config asset — only concrete Blueprint subclasses can. This prevents accidentally assigning the raw base class in `UHISMProxyConfig::ProxyClasses`.
-- **Replication**: `bReplicates = true` by default. Clients will see the proxy appear and disappear through UE's standard Actor relevancy and `SetActorHiddenInGame`. No custom replication is needed.
-- **Collision**: the bridge enables/disables collision via `SetActorEnableCollision`. Subclasses must not override this in `BeginPlay` — configure collision channel responses on components in the Blueprint defaults, and let the bridge manage the enabled state.
-- **No state should persist across activations.** `OnProxyActivated` must fully reinitialise the actor for the new `InstanceIndex`. Do not assume any state from the previous activation persists.
-- **Transform is set before `OnProxyActivated` is called.** Subclasses may read `GetActorTransform()` normally inside `BP_OnProxyActivated`.
-- **Tick is off by default.** Enable it in the Blueprint if needed (e.g. for a respawn countdown). Be mindful that many active proxies with per-frame tick is a CPU concern at MMO densities.
-- **C++ game systems** that need more control can subclass `AHISMProxyActor` in C++ and override the virtual methods instead of using Blueprint events. Both approaches are fully supported.
+- **`Abstract` prevents direct use.** Only concrete Blueprint subclasses can be assigned to `FHISMProxyInstanceType::ProxyClass`. `ValidateSetup` in `AHISMProxyHostActor` checks that `ProxyClass` is not the base class itself and is not null.
+- **Replication is on by default.** Clients see proxies appear and disappear through standard Actor relevancy. No custom replication code needed.
+- **Collision is managed by the bridge.** The bridge calls `SetActorEnableCollision(true/false)` on activation/deactivation. Do not call `SetActorEnableCollision` from `BeginPlay` inside the proxy Blueprint — it will be overridden. Configure collision channel responses in component defaults.
+- **No state persists across pool cycles.** `OnProxyActivated` must fully re-initialise the actor for the new `InstanceIndex`. The proxy may have been used for a completely different instance previously.
+- **Transform is set before `OnProxyActivated`.** `GetActorTransform()` returns the correct world transform inside `BP_OnProxyActivated`.
+- **C++ subclasses** override the virtual methods. Blueprint subclasses implement the `BP_` events. Both approaches work; both call the same bridge contract.
