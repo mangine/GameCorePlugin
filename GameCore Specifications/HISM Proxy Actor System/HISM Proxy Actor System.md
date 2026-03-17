@@ -2,9 +2,9 @@
 
 **Part of: GameCore Plugin** | **Status: Active Specification** | **UE Version: 5.7**
 
-The HISM Proxy Actor System bridges the gap between `UHierarchicalInstancedStaticMeshComponent` (HISM) rendering and full gameplay Actor functionality. HISM instances are not Actors — they have no individual identity, cannot host components, and are invisible to systems like the Interaction System, physics callbacks, or ability targeting. This system solves that by maintaining a **pre-allocated pool of proxy Actors** (`AHISMProxyActor`) that are activated for HISM instances when players are nearby, and returned to the pool when they are not.
+The HISM Proxy Actor System bridges the gap between `UHierarchicalInstancedStaticMeshComponent` (HISM) rendering and full gameplay Actor functionality. HISM instances are not Actors — they have no individual identity, cannot host components, and are invisible to gameplay systems like the Interaction System, physics callbacks, or ability targeting.
 
-From every other GameCore system's perspective, a proxy Actor is indistinguishable from any handplaced world Actor. No scanner changes. No validation changes. No new interfaces.
+This system solves that by maintaining a **pre-allocated pool of proxy Actors** (`AHISMProxyActor`) that are activated for HISM instances when players are nearby, and returned to the pool when they are not. From every other GameCore system's perspective, a proxy Actor is indistinguishable from any hand-placed world Actor.
 
 ---
 
@@ -12,10 +12,14 @@ From every other GameCore system's perspective, a proxy Actor is indistinguishab
 
 | Unit | Class | Responsibility |
 |---|---|---|
-| Config Asset | `UHISMProxyConfig` | Designer-authored radii, delay, pool size, tag→class map |
+| Host Actor | `AHISMProxyHostActor` | Level-placed actor; owns all HISM+bridge pairs; editor entry point |
+| Instance Type | `FHISMProxyInstanceType` | Per-mesh-type config: mesh, proxy class, pool size, radii |
+| Config Asset | `UHISMProxyConfig` | Shared proximity/timing config; referenced by each instance type |
 | Spatial Grid | `FHISMInstanceSpatialGrid` | O(1) bucketed lookup of instances near a world position |
-| Bridge Component | `UHISMProxyBridgeComponent` | Owns pool, drives proximity checks, manages slot lifecycle |
-| Proxy Actor Base | `AHISMProxyActor` | Lightweight AActor base; game-specific BP subclasses do the rest |
+| Bridge Component | `UHISMProxyBridgeComponent` | Owns pool for one HISM component; drives proximity checks |
+| Proxy Actor Base | `AHISMProxyActor` | Minimal AActor base; game-specific BP subclasses add all gameplay |
+| Host Actor Details | `UHISMProxyHostActorDetails` | Editor-only Details panel customization (GameCoreEditor module) |
+| Foliage Converter | `UHISMFoliageConversionUtility` | Editor utility to import Foliage Tool instances into the host actor |
 
 ---
 
@@ -23,51 +27,102 @@ From every other GameCore system's perspective, a proxy Actor is indistinguishab
 
 ```
 GameCore Specifications/HISM Proxy Actor System/
-  HISM Proxy Actor System.md          <- this file (overview + integration)
-  UHISMProxyConfig.md                 <- config data asset
-  FHISMInstanceSpatialGrid.md         <- spatial acceleration structure
-  UHISMProxyBridgeComponent.md        <- pool owner and proximity driver
-  AHISMProxyActor.md                  <- proxy actor base class
+  HISM Proxy Actor System.md              <- this file (overview + architecture)
+  AHISMProxyHostActor.md                  <- host actor + FHISMProxyInstanceType
+  UHISMProxyConfig.md                     <- shared proximity config asset
+  FHISMInstanceSpatialGrid.md             <- spatial acceleration structure
+  UHISMProxyBridgeComponent.md            <- pool owner and proximity driver
+  AHISMProxyActor.md                      <- proxy actor base class
+  Editor Tooling.md                       <- Details panel + foliage converter
+  Developer Guide.md                      <- end-to-end workflow reference
 ```
 
-Source lives under:
+Runtime source lives under:
 
 ```
 GameCore/Source/GameCore/Public/HISMProxy/
+  HISMProxyHostActor.h
+  HISMProxyInstanceType.h
   HISMProxyConfig.h
   HISMInstanceSpatialGrid.h
   HISMProxyBridgeComponent.h
   HISMProxyActor.h
 
 GameCore/Source/GameCore/Private/HISMProxy/
+  HISMProxyHostActor.cpp
   HISMInstanceSpatialGrid.cpp
   HISMProxyBridgeComponent.cpp
   HISMProxyActor.cpp
 ```
 
----
-
-## How the Pieces Connect
+Editor source lives under:
 
 ```
-AMyHISMHostActor (level-placed)
-  └── UHierarchicalInstancedStaticMeshComponent  (renders N tree/rock/barrel instances)
-  └── UHISMProxyBridgeComponent
-        │  reads UHISMProxyConfig
-        │  builds FHISMInstanceSpatialGrid at BeginPlay (server only)
-        │  runs proximity tick every 0.5s (server only)
-        │
-        ├── On instance enters range:
-        │     acquire AHISMProxyActor from pool by type tag
-        │     set transform to instance world transform
-        │     hide HISM instance via PerInstanceCustomData
-        │     call OnProxyActivated(InstanceIndex)
-        │
-        └── On all players leave range (after DeactivationDelay):
-              call OnProxyDeactivated()
-              hide proxy Actor (SetActorHiddenInGame + collision off)
-              restore HISM instance visibility
-              return slot to free list
+GameCore/Source/GameCoreEditor/Public/HISMProxy/
+  HISMProxyHostActorDetails.h
+  HISMFoliageConversionUtility.h
+
+GameCore/Source/GameCoreEditor/Private/HISMProxy/
+  HISMProxyHostActorDetails.cpp
+  HISMFoliageConversionUtility.cpp
+```
+
+---
+
+## Architecture Overview
+
+```
+AHISMProxyHostActor  (one per forest/prop-cluster, level-placed)
+  │
+  ├── FHISMProxyInstanceType[0]  (e.g. Oak)
+  │     ├── UHierarchicalInstancedStaticMeshComponent  "HISM_Oak"
+  │     │     StaticMesh = SM_Oak
+  │     │     NumCustomDataFloats = 2   <- slot 0: hide flag, slot 1: type index
+  │     │     [instance 0] transform + CustomData[0]=0, [1]=0.0
+  │     │     [instance 1] transform + CustomData[0]=0, [1]=0.0
+  │     │     ...
+  │     └── UHISMProxyBridgeComponent  "Bridge_Oak"
+  │           TargetHISM → HISM_Oak
+  │           Config → DA_Forest_ProxyConfig
+  │           pool: N x BP_OakProxy actors (hidden at origin)
+  │
+  ├── FHISMProxyInstanceType[1]  (e.g. Pine)
+  │     ├── UHierarchicalInstancedStaticMeshComponent  "HISM_Pine"
+  │     └── UHISMProxyBridgeComponent  "Bridge_Pine"
+  │
+  └── FHISMProxyInstanceType[2]  (e.g. Birch)
+        ├── UHierarchicalInstancedStaticMeshComponent  "HISM_Birch"
+        └── UHISMProxyBridgeComponent  "Bridge_Birch"
+```
+
+**Size variation** is per-instance transform scale — not separate HISM components. A forest of Oak trees at four sizes uses one `HISM_Oak` component where each instance has a different scale baked into its transform (e.g. 0.6x, 0.8x, 1.0x, 1.3x). The proxy actor inherits this scale via `SetActorTransform`. No additional components required.
+
+---
+
+## Runtime Flow
+
+```
+Default state (no players nearby):
+  500 oak instances rendered by HISM_Oak — 1 draw call
+  0 proxy Actors live in the world
+
+Player approaches instance #42:
+  Bridge_Oak proximity tick fires (every 0.5s)
+  Spatial grid query returns instance #42 as candidate
+  PerInstanceCustomData[0] for #42 set to 1.0 → HISM hides it
+  BP_OakProxy actor pulled from pool, placed at instance #42 world transform
+  BP_OakProxy.OnProxyActivated(42) called
+  Interaction system, harvest system etc. see a normal Actor
+
+Player leaves:
+  DeactivationDelay timer starts (e.g. 5s)
+  New player enters before timer fires:
+    Timer cancelled, proxy stays active
+  No new player — timer fires:
+    BP_OakProxy.OnProxyDeactivated() called
+    Proxy hidden + collision off, returned to pool
+    PerInstanceCustomData[0] for #42 set to 0.0 → HISM shows it again
+    Back to 500 HISM instances, 0 proxy Actors
 ```
 
 ---
@@ -75,92 +130,33 @@ AMyHISMHostActor (level-placed)
 ## Design Principles
 
 - **Server-only logic.** Pool allocation, proximity checks, and slot management run exclusively on the server. Proxy Actors replicate to clients via UE's standard Actor relevancy — no manual per-client visibility management.
-- **No runtime spawning on the hot path.** The pool is pre-allocated at `BeginPlay`. Activation is a `SetActorTransform` + `SetActorHiddenInGame(false)` call, not a `SpawnActor` call.
-- **Delegate-driven eligibility.** The bridge component has zero knowledge of game-specific instance state. External systems bind `OnQueryInstanceEligibility` and `OnQueryInstanceType` to tell it which instances are eligible and what proxy class to use.
-- **Hysteresis is per-slot.** Each slot tracks `PlayerRefCount` independently. A new player entering range cancels any pending deactivation timer for that slot.
-- **HISM instance hiding via `PerInstanceCustomData`.** When a proxy is live, the HISM instance is hidden by writing a hide flag into `PerInstanceCustomData[0]`. The HISM material reads this value and discards the instance in the pixel shader. This avoids removing/re-adding instance transforms.
-- **One bridge per HISM Actor.** Do not add multiple `UHISMProxyBridgeComponent` instances to the same Actor. One component manages one `UHierarchicalInstancedStaticMeshComponent`.
-- **Static instances only.** HISM instances managed by this system must be static (positions baked at level load). Dynamic HISM (procedurally repositioned instances) is out of scope — use normal Actors for those.
-
----
-
-## Quick Setup
-
-### 1. Prepare the HISM Material
-
-The material must read `PerInstanceCustomData[0]` and clip the pixel when it equals `1.0`:
-
-```
-// In Material Graph (pseudo-HLSL)
-float hideFlag = GetPerInstanceCustomData(0, 0.0f);
-clip(hideFlag > 0.5f ? -1 : 1);
-```
-
-This is a one-time material setup shared across all HISM actors using this system.
-
-### 2. Create a Proxy Config Asset
-
-In the editor: right-click in Content Browser → **GameCore → HISM Proxy Config**.
-
-Fill in:
-- `ActivationRadius` — distance at which instances get a proxy
-- `DeactivationRadiusBonus` — hysteresis band added on top
-- `DeactivationDelay` — seconds to wait after all players leave before deactivating
-- `PoolSize` — max concurrent live proxies
-- `ProxyClasses` — array of `{ Tag, Class }` pairs
-
-### 3. Set Up the HISM Host Actor
-
-```
-AMyForestActor
-  └── UHierarchicalInstancedStaticMeshComponent  (StaticMesh = OakTree, instances added)
-  └── UHISMProxyBridgeComponent
-        Config = DA_OakTree_ProxyConfig
-```
-
-In `BeginPlay` of the host actor (or a game-specific manager):
-
-```cpp
-UHISMProxyBridgeComponent* Bridge = GetComponentByClass<UHISMProxyBridgeComponent>();
-
-Bridge->OnQueryInstanceEligibility.BindUObject(
-    HarvestSystem, &UHarvestSystem::IsTreeEligible);
-
-Bridge->OnQueryInstanceType.BindUObject(
-    HarvestSystem, &UHarvestSystem::GetTreeProxyType);
-```
-
-### 4. Create a Proxy Actor Blueprint
-
-Create a Blueprint subclass of `AHISMProxyActor`. Add:
-- `UInteractionComponent` with harvest entry
-- `UStaticMeshComponent` (optional — only if you need a different LOD mesh on the proxy)
-- Override `BP_OnProxyActivated` to initialize state from the owning game system
-- Override `BP_OnProxyDeactivated` to clean up
-
-Register the BP class in the config asset under the appropriate `ProxyTypeTag`.
+- **No runtime spawning on the hot path.** The pool is pre-allocated at `BeginPlay`. Activation is `SetActorTransform` + `SetActorHiddenInGame(false)`, never `SpawnActor`.
+- **One HISM component per mesh type.** HISM can only batch identical meshes. Having separate components per type is both correct and necessary — it matches what the Foliage System does internally.
+- **Size is per-instance scale, not per-component.** Size variants of the same mesh share one HISM component. The proxy actor inherits the instance's scale from its transform.
+- **Type metadata lives in `PerInstanceCustomData[1]`.** The host actor writes a float type index when adding instances. The bridge reads it to select the correct proxy class. No external delegate binding is needed for homogeneous HISM sets.
+- **Slot 0 of PerInstanceCustomData is reserved** as the hide flag. Game-specific data starts at slot 2. `NumCustomDataFloats` is set to 2 minimum by the host actor.
+- **Hysteresis is per-slot.** Each slot independently tracks `PlayerRefCount`. A new player cancels any pending deactivation timer for that specific slot.
+- **Static instances only.** Instance positions are baked at level load and never move. Use normal Actors for anything that repositions at runtime.
 
 ---
 
 ## Integration with the Interaction System
 
-Proxies are standard Actors. Add `UInteractionComponent` to the proxy Blueprint exactly as you would any other interactable Actor. The Interaction System's scanner will discover it via overlap without any changes.
-
-When the owning game system changes the instance's interactability (e.g. a tree was harvested and is on cooldown), call:
+Proxies are standard Actors. Add `UInteractionComponent` to the proxy Blueprint exactly as any other interactable Actor. The Interaction System's scanner discovers it via overlap with no changes to the scanner.
 
 ```cpp
-// On the proxy Actor's InteractionComponent:
-InteractionComp->SetEntryServerEnabled(0, false);
-
-// Or notify the bridge to force-deactivate the proxy entirely:
+// When a harvest completes and the instance should go on cooldown:
 Bridge->NotifyInstanceStateChanged(InstanceIndex);
+
+// Or to disable just the interaction entry without deactivating the proxy:
+Proxy->GetInteractionComponent()->SetEntryServerEnabled(0, false);
 ```
 
 ---
 
 ## Limitations
 
-- **Static instances only.** Dynamic HISM repositioning is not supported.
-- **One HISM component per bridge.** Multiple mesh types need multiple host Actors or future extension.
-- **Pool exhaustion silently skips activation.** If all pool slots are occupied, the instance does not get a proxy. Log warnings are emitted. Size the pool to your expected concurrent density.
-- **PerInstanceCustomData slot 0 is reserved.** Game-specific custom data must use slots 1+.
+- **Static instances only.** Instances that reposition at runtime are not supported.
+- **`PerInstanceCustomData` slot 0** is always the hide flag. Slot 1 is the type index when managed by `AHISMProxyHostActor`. Game custom data starts at slot 2.
+- **Pool exhaustion silently skips activation** with a logged warning. Size pools to worst-case concurrent player proximity, not average.
+- **One `UHISMProxyBridgeComponent` per HISM component.** Each bridge manages exactly one HISM. The host actor enforces this automatically.
