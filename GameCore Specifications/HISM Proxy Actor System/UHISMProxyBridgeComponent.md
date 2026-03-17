@@ -34,8 +34,9 @@ enum class EHISMProxySlotState : uint8
 };
 
 // Plain struct — no GENERATED_BODY, not a UPROPERTY.
-// ProxyActor GC safety is handled by UHISMProxyBridgeComponent::AllPooledActors
-// (a UPROPERTY TArray that holds the GC reference for every pooled actor).
+// GC safety is provided by UHISMProxyBridgeComponent::AllPooledActors
+// (a UPROPERTY TArray) which holds the GC-visible reference for every actor.
+// FHISMProxySlot::ProxyActor is a raw convenience pointer only.
 struct FHISMProxySlot
 {
     int32                 InstanceIndex  = INDEX_NONE;
@@ -45,8 +46,6 @@ struct FHISMProxySlot
     int32                 PlayerRefCount = 0;
 };
 ```
-
-> **GC safety:** `FHISMProxySlot` is a plain struct. `ProxyActor` is a raw pointer with no GC visibility. The component holds `AllPooledActors` — a `UPROPERTY() TArray<AHISMProxyActor*>` — which keeps every pooled actor rooted for the GC. `FHISMProxySlot::ProxyActor` and `AllPooledActors[i]` always point to the same actor; the slot pointer is a convenience accessor only.
 
 ---
 
@@ -61,7 +60,6 @@ public:
     UHISMProxyBridgeComponent();
 
     // ── Configuration ─────────────────────────────────────────────────────────
-    // Set automatically by AHISMProxyHostActor. Set manually for standalone use.
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "HISM Proxy")
     TObjectPtr<UHierarchicalInstancedStaticMeshComponent> TargetHISM;
@@ -127,18 +125,29 @@ private:
     // GC ownership lives in AllPooledActors.
     TArray<FHISMProxySlot> Slots;
 
-    // GC root for all pooled actors. Every actor spawned by BuildPool/GrowPool
-    // is added here and removed only in EndPlay.
+    // GC root for all pooled actors. Every spawned actor is added here
+    // and cleared only in EndPlay.
     UPROPERTY()
     TArray<TObjectPtr<AHISMProxyActor>> AllPooledActors;
 
+    // Instance index → slot index. Active and PendingRemoval entries only.
     TMap<int32, int32> InstanceToSlotMap;
+
+    // Free list: indices into Slots[] that are currently Inactive.
     TArray<int32> FreeSlotIndices;
+
+    // Pre-allocated scratch buffers for TickProximityCheck.
+    // Declared as members to avoid per-tick heap allocation.
+    TMap<int32, int32> TickInstancePlayerCount;
+    TArray<FVector>    TickPlayerPositions;
+    TArray<int32>      TickCandidates;
+    TArray<int32>      TickSlotsToDeactivate;
+    TArray<int32>      TickSlotsToRevive;
 
     FTimerHandle ProximityTickHandle;
 
-    // Set in BeginPlay before BuildPool is called.
-    // Pool actors spawn here: near host actor, 1km below terrain.
+    // Set in BeginPlay before BuildPool. Pool actors spawn here:
+    // near host actor XY, 1km below terrain Z.
     FVector PoolSpawnLocation = FVector::ZeroVector;
 };
 ```
@@ -163,9 +172,7 @@ void UHISMProxyBridgeComponent::BeginPlay()
     }
 
     // PoolSpawnLocation MUST be set before BuildPool is called.
-    // Pool actors are spawned at this location: in the same streaming cell
-    // as the host, but 1km below terrain so they do not affect navmesh
-    // generation, collision queries, or rendering.
+    // Actors here are in the same streaming cell as the host but 1km below terrain.
     PoolSpawnLocation = GetOwner()->GetActorLocation() + FVector(0.f, 0.f, -100000.f);
 
     SpatialGrid.Build(TargetHISM, Config->GridCellSize);
@@ -202,12 +209,7 @@ AHISMProxyActor* UHISMProxyBridgeComponent::SpawnPoolActor()
 
     Actor->SetActorHiddenInGame(true);
     Actor->SetActorEnableCollision(false);
-
-    // Register in the GC-visible array. This is what prevents the actor
-    // from being garbage collected. The raw pointer in FHISMProxySlot is
-    // only a convenience accessor and carries no GC weight.
-    AllPooledActors.Add(Actor);
-
+    AllPooledActors.Add(Actor); // GC root
     return Actor;
 }
 
@@ -236,14 +238,14 @@ bool UHISMProxyBridgeComponent::GrowPool()
     {
         UE_LOG(LogGameCore, Error,
             TEXT("UHISMProxyBridgeComponent [%s]: MaxPoolSize (%d) reached. "
-                 "Increase MinPoolSize to avoid runtime spawning."),
+                 "Increase MinPoolSize."),
             *GetName(), MaxPoolSize);
         return false;
     }
 
     UE_LOG(LogGameCore, Warning,
-        TEXT("UHISMProxyBridgeComponent [%s]: pool exhausted (%d slots used). "
-             "Growing by %d. Consider increasing MinPoolSize."),
+        TEXT("UHISMProxyBridgeComponent [%s]: pool exhausted (%d used). "
+             "Growing by %d. Increase MinPoolSize to eliminate runtime spawning."),
         *GetName(), CurrentSize, GrowthBatchSize);
 
     const int32 ToAdd = (MaxPoolSize > 0)
@@ -275,8 +277,6 @@ AHISMProxyActor* UHISMProxyBridgeComponent::GetActiveProxy(int32 InstanceIndex) 
     if (const int32* SlotIdx = InstanceToSlotMap.Find(InstanceIndex))
     {
         const FHISMProxySlot& Slot = Slots[*SlotIdx];
-        // Return the proxy only if it is genuinely live, not pending removal.
-        // Callers should not interact with a proxy that is about to deactivate.
         if (Slot.State == EHISMProxySlotState::Active ||
             Slot.State == EHISMProxySlotState::PendingRemoval)
         {
@@ -291,9 +291,11 @@ AHISMProxyActor* UHISMProxyBridgeComponent::GetActiveProxy(int32 InstanceIndex) 
 
 ## Implementation — `TickProximityCheck`
 
-**Key design:** Deferred deactivation. `InstanceToSlotMap` is never modified while being iterated. All state changes are collected into local arrays and applied after the loop.
+Scratch buffers (`TickInstancePlayerCount`, `TickPlayerPositions`, etc.) are **member arrays** cleared at tick start. This eliminates per-tick heap allocation from local `TMap`/`TArray` construction, which at 0.5s intervals across many bridge components would produce significant allocator pressure.
 
-**Key design:** `BeginDeactivation` binds `SlotIdx` by value into the timer delegate. This is safe because slot indices are stable — the `Slots` array only grows (never shrinks or reorders), so `SlotIdx` always addresses the same slot for the lifetime of the component.
+Deferred deactivation: `InstanceToSlotMap` is never modified while being iterated. State changes are collected and applied after the iteration loop.
+
+`SlotIdx` is captured by value in the timer delegate. This is safe because `Slots[]` only grows — a given index always addresses the same slot for the component lifetime.
 
 ```cpp
 void UHISMProxyBridgeComponent::TickProximityCheck()
@@ -302,67 +304,67 @@ void UHISMProxyBridgeComponent::TickProximityCheck()
 
     const float ActRadiusSq = FMath::Square(Config->ActivationRadius);
 
-    // 1. Gather all player pawn positions.
-    TArray<FVector> PlayerPositions;
+    // 1. Gather player positions — reuse member buffer.
+    TickPlayerPositions.Reset();
     for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator();
          It; ++It)
     {
         const APlayerController* PC = It->Get();
         if (PC && PC->GetPawn())
-            PlayerPositions.Add(PC->GetPawn()->GetActorLocation());
+            TickPlayerPositions.Add(PC->GetPawn()->GetActorLocation());
     }
-    if (PlayerPositions.IsEmpty()) { return; }
+    if (TickPlayerPositions.IsEmpty()) { return; }
 
-    // 2. Query spatial grid for all in-range instances.
-    TMap<int32, int32> InstancePlayerCount;
-    for (const FVector& PlayerPos : PlayerPositions)
+    // 2. Spatial grid query — reuse member map and candidate buffer.
+    TickInstancePlayerCount.Reset();
+    for (const FVector& PlayerPos : TickPlayerPositions)
     {
-        TArray<int32> Candidates;
-        SpatialGrid.QueryRadius(PlayerPos, Config->ActivationRadius, Candidates);
-        for (int32 Idx : Candidates)
+        TickCandidates.Reset();
+        SpatialGrid.QueryRadius(PlayerPos, Config->ActivationRadius, TickCandidates);
+        for (int32 Idx : TickCandidates)
         {
             if (FVector::DistSquared(PlayerPos, SpatialGrid.GetInstancePosition(Idx))
                     <= ActRadiusSq)
             {
-                InstancePlayerCount.FindOrAdd(Idx)++;
+                TickInstancePlayerCount.FindOrAdd(Idx)++;
             }
         }
     }
 
-    // 3. Evaluate managed slots — DEFERRED: do not modify InstanceToSlotMap here.
-    TArray<int32> SlotsToBeginDeactivation;
-    TArray<int32> SlotsToRevive;
+    // 3. Evaluate managed slots — deferred: collect, do not modify map here.
+    TickSlotsToDeactivate.Reset();
+    TickSlotsToRevive.Reset();
 
     for (const auto& [InstanceIdx, SlotIdx] : InstanceToSlotMap)
     {
         FHISMProxySlot& Slot = Slots[SlotIdx];
-        Slot.PlayerRefCount = InstancePlayerCount.FindRef(InstanceIdx);
+        Slot.PlayerRefCount = TickInstancePlayerCount.FindRef(InstanceIdx);
 
         if (Slot.PlayerRefCount > 0 &&
             Slot.State == EHISMProxySlotState::PendingRemoval)
         {
-            SlotsToRevive.Add(SlotIdx);
+            TickSlotsToRevive.Add(SlotIdx);
         }
         else if (Slot.PlayerRefCount == 0 &&
                  Slot.State == EHISMProxySlotState::Active)
         {
-            SlotsToBeginDeactivation.Add(SlotIdx);
+            TickSlotsToDeactivate.Add(SlotIdx);
         }
     }
 
     // 4. Apply deferred state changes — safe to modify map now.
-    for (int32 SlotIdx : SlotsToRevive)
+    for (int32 SlotIdx : TickSlotsToRevive)
     {
         GetWorld()->GetTimerManager().ClearTimer(Slots[SlotIdx].DeactivationTimer);
         Slots[SlotIdx].State = EHISMProxySlotState::Active;
     }
-    for (int32 SlotIdx : SlotsToBeginDeactivation)
+    for (int32 SlotIdx : TickSlotsToDeactivate)
     {
         BeginDeactivation(SlotIdx);
     }
 
     // 5. Activate proxies for newly in-range instances.
-    for (const auto& [InstanceIdx, Count] : InstancePlayerCount)
+    for (const auto& [InstanceIdx, Count] : TickInstancePlayerCount)
     {
         if (InstanceToSlotMap.Contains(InstanceIdx)) { continue; }
 
@@ -413,8 +415,8 @@ void UHISMProxyBridgeComponent::BeginDeactivation(int32 SlotIdx)
 {
     Slots[SlotIdx].State = EHISMProxySlotState::PendingRemoval;
 
-    // SlotIdx is captured by value. Safe because Slots[] only grows —
-    // a given SlotIdx always addresses the same slot for the component lifetime.
+    // SlotIdx captured by value. Safe: Slots[] only grows, index is stable
+    // for the component lifetime.
     FTimerDelegate D;
     D.BindUObject(this, &UHISMProxyBridgeComponent::OnDeactivationTimerFired, SlotIdx);
     GetWorld()->GetTimerManager().SetTimer(
@@ -467,18 +469,15 @@ void UHISMProxyBridgeComponent::EndPlay(EEndPlayReason::Type Reason)
 {
     GetWorld()->GetTimerManager().ClearTimer(ProximityTickHandle);
 
-    // Iterate Slots[] directly, not InstanceToSlotMap, so DeactivateSlotImmediate
-    // can safely modify the map without invalidating this loop.
+    // Iterate Slots[] directly — not InstanceToSlotMap — so
+    // DeactivateSlotImmediate can modify the map without invalidating this loop.
     for (int32 i = 0; i < Slots.Num(); ++i)
     {
         if (Slots[i].State != EHISMProxySlotState::Inactive)
             DeactivateSlotImmediate(i);
     }
 
-    // AllPooledActors will be cleared by GC after this component is destroyed.
-    // Explicit clearing here ensures deterministic destruction order.
     AllPooledActors.Empty();
-
     Super::EndPlay(Reason);
 }
 ```
@@ -496,15 +495,15 @@ void UHISMProxyBridgeComponent::NotifyInstanceStateChanged(int32 InstanceIndex)
 }
 ```
 
-Safe to call from within `OnProxyActivated` — step 5 of `TickProximityCheck` (which calls `ActivateProxyForInstance`) runs after all `InstanceToSlotMap` iteration is complete.
+Safe to call from within `OnProxyActivated` — `ActivateProxyForInstance` runs after all `InstanceToSlotMap` iteration is complete within `TickProximityCheck`.
 
 ---
 
 ## Notes
 
-- **GC safety via `AllPooledActors`.** `FHISMProxySlot::ProxyActor` is a raw pointer for performance. The GC root is `AllPooledActors` (a `UPROPERTY TArray`). Both always point to the same actor; only `AllPooledActors` keeps it alive.
-- **`PoolSpawnLocation` must be set before `BuildPool`.** `BeginPlay` sets it first; this ordering is enforced. Do not call `BuildPool` from subclass constructors.
-- **`Slots[]` only grows; indices are stable.** `BeginDeactivation` captures `SlotIdx` by value into the timer delegate safely because the slot it addresses never moves.
-- **`ResolveProxyClass` has been removed.** The previous spec declared it as a virtual override point but it had no call site. Subclassers who need heterogeneous proxy types should create multiple `UHISMProxyBridgeComponent` instances (one per type), which is the intended architecture.
-- **`EndPlay` iterates `Slots[]` not `InstanceToSlotMap`** so `DeactivateSlotImmediate`'s map mutation does not invalidate the loop.
-- **Pool growth is a warning-level event.** Monitor logs. Raise `MinPoolSize` if growth triggers in production.
+- **GC safety via `AllPooledActors`.** `FHISMProxySlot::ProxyActor` is a raw pointer. The GC root is `AllPooledActors` (a `UPROPERTY TArray`). Both point to the same actor; only `AllPooledActors` keeps it alive.
+- **No per-tick heap allocation.** `TickInstancePlayerCount`, `TickPlayerPositions`, `TickCandidates`, `TickSlotsToDeactivate`, `TickSlotsToRevive` are member arrays. They are `Reset()` at tick start (clears count, retains capacity) — no allocator involvement after first tick.
+- **`PoolSpawnLocation` set before `BuildPool`.** Ordering enforced in `BeginPlay`. Do not call `BuildPool` from subclass constructors.
+- **`Slots[]` only grows; indices are stable.** Timer delegate captures `SlotIdx` by value safely.
+- **`EndPlay` iterates `Slots[]` not `InstanceToSlotMap`.** Map mutation inside `DeactivateSlotImmediate` does not invalidate the loop.
+- **Pool growth is a warning-level event.** Raise `MinPoolSize` if it appears in production logs.

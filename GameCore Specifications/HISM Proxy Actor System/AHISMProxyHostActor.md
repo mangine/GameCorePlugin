@@ -52,7 +52,8 @@ struct GAMECORE_API FHISMProxyInstanceType
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
     TObjectPtr<UHISMProxyBridgeComponent> Bridge = nullptr;
 
-    // Always derived from array index. Never trust the serialized value.
+    // Always derived from array index at editor time and on load.
+    // Never trust the serialized value as the sole source of truth.
     UPROPERTY(VisibleAnywhere)
     int32 TypeIndex = INDEX_NONE;
 };
@@ -89,14 +90,22 @@ protected:
     virtual void BeginPlay() override;
 
 private:
+    // Re-entry guard for RebuildTypeIndices.
+    // Declared outside WITH_EDITOR to avoid UHT layout mismatch between
+    // editor and non-editor builds. Use WITH_EDITORONLY_DATA if zero
+    // shipping cost is required.
+    UPROPERTY()
+    bool bIsRebuilding = false;
+
 #if WITH_EDITOR
     void CreateComponentsForEntry(FHISMProxyInstanceType& Entry, int32 EntryIndex);
     void DestroyOrphanedComponents();
     void RebuildTypeIndices();
-    bool bIsRebuilding = false; // re-entry guard for OnConstruction
 #endif
 };
 ```
+
+> **Why `bIsRebuilding` is not inside `#if WITH_EDITOR`:** Member variables inside `#if WITH_EDITOR` in a `UCLASS` body are not safe because UHT generates serialization and reflection code that expects a consistent class layout between editor and non-editor builds. Using a `UPROPERTY()` bool outside the guard is the correct approach; it costs 1 byte in shipping builds. Alternatively, `UPROPERTY()` with `WITH_EDITORONLY_DATA` may be used if the strict zero-cost requirement applies.
 
 ---
 
@@ -126,22 +135,22 @@ void AHISMProxyHostActor::PostEditChangeProperty(
     RebuildTypeIndices();
     MarkPackageDirty();
 }
+#endif // WITH_EDITOR
 ```
 
 ---
 
 ## `DestroyOrphanedComponents` — Tag-Based Ownership
 
-Previous implementations used name-prefix matching (`"HISM_"`, `"Bridge_"`) to identify managed components, risking false positives if a user added a component with a similar name. The correct approach is to **tag components at creation time** and check the tag at cleanup time.
-
 ```cpp
-// Component tag written by CreateComponentsForEntry.
-// Identifies a component as owned by the HISM Proxy system on this actor.
+#if WITH_EDITOR
+// Static tag written to every component created by this system.
+// Used by DestroyOrphanedComponents to identify managed components
+// without relying on fragile name-prefix matching.
 static const FName HISMProxyManagedTag = TEXT("HISMProxyManaged");
 
 void AHISMProxyHostActor::DestroyOrphanedComponents()
 {
-    // Build the live set from current InstanceTypes.
     TSet<UActorComponent*> LiveComponents;
     for (const FHISMProxyInstanceType& Entry : InstanceTypes)
     {
@@ -149,7 +158,6 @@ void AHISMProxyHostActor::DestroyOrphanedComponents()
         if (Entry.Bridge) LiveComponents.Add(Entry.Bridge);
     }
 
-    // Find components tagged as managed by this system that are no longer live.
     TArray<UActorComponent*> ToDestroy;
     for (UActorComponent* Comp : GetComponents())
     {
@@ -174,9 +182,9 @@ void AHISMProxyHostActor::CreateComponentsForEntry(
             HISMName, RF_Transactional);
 
     NewHISM->SetStaticMesh(Entry.Mesh);
-    NewHISM->NumCustomDataFloats = 2;  // slot 0: hide flag, slot 1: type index
+    NewHISM->NumCustomDataFloats = 2;
     NewHISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    NewHISM->ComponentTags.Add(HISMProxyManagedTag); // ownership marker
+    NewHISM->ComponentTags.Add(HISMProxyManagedTag);
 
     NewHISM->RegisterComponent();
     NewHISM->AttachToComponent(
@@ -195,21 +203,23 @@ void AHISMProxyHostActor::CreateComponentsForEntry(
     NewBridge->MaxPoolSize     = Entry.MaxPoolSize;
     NewBridge->GrowthBatchSize = Entry.GrowthBatchSize;
     NewBridge->ProxyClass      = Entry.ProxyClass;
-    NewBridge->ComponentTags.Add(HISMProxyManagedTag); // ownership marker
+    NewBridge->ComponentTags.Add(HISMProxyManagedTag);
 
     NewBridge->RegisterComponent();
     Entry.Bridge    = NewBridge;
     Entry.TypeIndex = EntryIndex;
 }
+#endif // WITH_EDITOR
 ```
 
 ---
 
 ## `RebuildTypeIndices` — With Re-entry Guard
 
-`OnConstruction` fires on every viewport drag and property edit. Without a guard, `RebuildTypeIndices` would call `SetCustomDataValue` hundreds of times per second while dragging the actor, causing editor hitching.
+`OnConstruction` fires on every viewport drag. The re-entry guard `bIsRebuilding` prevents recursive calls. The fast path exits early based on the cached `TypeIndex` field — **no `GetCustomDataValue` is used** because that API does not exist on `UInstancedStaticMeshComponent` in UE5 (custom data is write-only to GPU). The slow path rewrites `PerInstanceCustomData[1]` for all instances of an entry when the cached `TypeIndex` does not match the expected position.
 
 ```cpp
+#if WITH_EDITOR
 void AHISMProxyHostActor::RebuildTypeIndices()
 {
     if (bIsRebuilding) { return; }
@@ -217,62 +227,49 @@ void AHISMProxyHostActor::RebuildTypeIndices()
 
     for (int32 i = 0; i < InstanceTypes.Num(); ++i)
     {
-        // Check if the index is already correct before doing any work.
-        if (InstanceTypes[i].TypeIndex == i
-            && InstanceTypes[i].HISM != nullptr)
-        {
-            // Verify the first instance's CustomData to detect actual staleness.
-            // If it matches, skip the full rewrite (fast path).
-            if (InstanceTypes[i].HISM->GetInstanceCount() == 0)
-            {
-                InstanceTypes[i].TypeIndex = i;
-                continue;
-            }
+        FHISMProxyInstanceType& Entry = InstanceTypes[i];
 
-            // Sample slot 1 of instance 0. If it matches, assume all are correct.
-            // Full correctness guaranteed by PostEditChangeProperty on reorder.
-            float StoredIndex = 0.f;
-            InstanceTypes[i].HISM->GetCustomDataValue(0, 1, StoredIndex);
-            if (FMath::RoundToInt(StoredIndex) == i)
-            {
-                InstanceTypes[i].TypeIndex = i;
-                continue; // fast path: no rewrite needed
-            }
+        // Fast path: TypeIndex already matches array position.
+        // This is the common case during viewport drags and minor edits.
+        if (Entry.TypeIndex == i)
+        {
+            continue;
         }
 
-        // Slow path: rewrite all instance custom data for this entry.
-        InstanceTypes[i].TypeIndex = i;
-        if (!InstanceTypes[i].HISM) { continue; }
+        // Slow path: TypeIndex is stale (entry was reordered, loaded with
+        // a different array position, or newly created).
+        // Rewrite PerInstanceCustomData[1] for all instances.
+        Entry.TypeIndex = i;
 
-        const int32 NumInstances = InstanceTypes[i].HISM->GetInstanceCount();
+        if (!Entry.HISM) { continue; }
+
+        const int32 NumInstances = Entry.HISM->GetInstanceCount();
         for (int32 j = 0; j < NumInstances; ++j)
         {
-            InstanceTypes[i].HISM->SetCustomDataValue(
-                j, 1, static_cast<float>(i), /*bMarkRenderStateDirty=*/false);
+            Entry.HISM->SetCustomDataValue(
+                j, /*CustomDataIndex=*/1,
+                static_cast<float>(i),
+                /*bMarkRenderStateDirty=*/false);
         }
-        InstanceTypes[i].HISM->MarkRenderStateDirty();
+        Entry.HISM->MarkRenderStateDirty();
     }
 }
 
 void AHISMProxyHostActor::PostLoad()
 {
     Super::PostLoad();
-#if WITH_EDITOR
     RebuildTypeIndices();
-#endif
 }
 
 void AHISMProxyHostActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
-#if WITH_EDITOR
-    // RebuildTypeIndices has a fast path that exits early if indices are correct.
-    // The re-entry guard prevents recursion if OnConstruction fires during rebuild.
     RebuildTypeIndices();
-#endif
 }
 #endif // WITH_EDITOR
 ```
+
+> **Note on fast path correctness:** The fast path relies on `TypeIndex` being correct in the serialized data. This is guaranteed because every structural change (add, remove, reorder) calls `RebuildTypeIndices` via `PostEditChangeProperty`, which runs the slow path and updates `TypeIndex` before saving. `PostLoad` also runs the slow path unconditionally on load, which handles any edge case where a save was made with a stale index.
 
 ---
 
@@ -292,9 +289,11 @@ void AHISMProxyHostActor::AddInstanceForType(
         return;
     }
 
+    // AddInstance with bWorldSpace=true handles the actor-to-world transform
+    // conversion internally. No manual GetRelativeTransform needed.
     const int32 NewIdx = Entry.HISM->AddInstance(WorldTransform, /*bWorldSpace=*/true);
-    Entry.HISM->SetCustomDataValue(NewIdx, 0, 0.f,              false);
-    Entry.HISM->SetCustomDataValue(NewIdx, 1, (float)TypeIndex, false);
+    Entry.HISM->SetCustomDataValue(NewIdx, 0, 0.f,              /*bMarkRenderStateDirty=*/false);
+    Entry.HISM->SetCustomDataValue(NewIdx, 1, (float)TypeIndex, /*bMarkRenderStateDirty=*/false);
     Entry.HISM->MarkRenderStateDirty();
     MarkPackageDirty();
 }
@@ -305,7 +304,7 @@ int32 AHISMProxyHostActor::FindTypeIndexByMesh(const UStaticMesh* Mesh) const
         if (InstanceTypes[i].Mesh == Mesh) { return i; }
     return INDEX_NONE;
 }
-#endif
+#endif // WITH_EDITOR
 ```
 
 ---
@@ -332,16 +331,19 @@ void AHISMProxyHostActor::ValidateSetup() const
             Log.Error(FText::FromString(Prefix + TEXT(" ProxyClass is null.")));
         else if (Entry.ProxyClass == AHISMProxyActor::StaticClass())
             Log.Error(FText::FromString(Prefix +
-                TEXT(" ProxyClass is the abstract base AHISMProxyActor. Assign a concrete Blueprint subclass.")));
+                TEXT(" ProxyClass is the abstract base AHISMProxyActor. "
+                     "Assign a concrete Blueprint subclass.")));
         if (!Entry.Config)
             Log.Error(FText::FromString(Prefix + TEXT(" Config is null.")));
         if (!Entry.HISM)
-            Log.Error(FText::FromString(Prefix + TEXT(" HISM component missing — resave the actor.")));
+            Log.Error(FText::FromString(
+                Prefix + TEXT(" HISM component missing — resave the actor.")));
         else
         {
             if (Entry.HISM->NumCustomDataFloats < 2)
                 Log.Error(FText::FromString(Prefix +
-                    TEXT(" NumCustomDataFloats < 2. Hide flag and type index will not work.")));
+                    TEXT(" NumCustomDataFloats < 2. "
+                         "Hide flag and type index will not work.")));
             if (Entry.HISM->GetInstanceCount() == 0)
                 Log.Warning(FText::FromString(Prefix + TEXT(" Has 0 instances.")));
         }
@@ -356,7 +358,7 @@ void AHISMProxyHostActor::ValidateSetup() const
 
     Log.Open(EMessageSeverity::Info, /*bOpenLog=*/true);
 }
-#endif
+#endif // WITH_EDITOR
 ```
 
 ---
@@ -401,7 +403,7 @@ void AHISMProxyHostActor::BeginPlay()
                 *GetName(), i, *Entry.TypeName.ToString());
 
         UE_LOG(LogGameCore, Verbose,
-            TEXT("AHISMProxyHostActor [%s] entry %d (%s): OK — %d instances, pool %d-%d."),
+            TEXT("AHISMProxyHostActor [%s] entry %d (%s): OK — %d instances, pool %d–%d."),
             *GetName(), i, *Entry.TypeName.ToString(),
             Entry.HISM->GetInstanceCount(), Entry.MinPoolSize, Entry.MaxPoolSize);
     }
@@ -419,13 +421,13 @@ MaxPerPlayer    = PI * RadiusM² * InstanceDensity
 MinPoolSize     = ceil(MaxPerPlayer * ExpectedConcurrentPlayers * 1.2)
 ```
 
-**Example:** 500 oaks, 200m×200m area, radius=15m, 64 players:
+**Example:** 500 oaks, 200m×200m, radius=15m, 64 players:
 ```
 Density      = 0.0125 /m²
 MaxPerPlayer = PI * 225 * 0.0125 ≈ 8.8
 MinPoolSize  = ceil(8.8 * 64 * 1.2) = 676
 ```
-Set `MaxPoolSize = 676`. Players cluster, so `MinPoolSize = 300–400` is often sufficient. Raise it if growth warnings appear.
+Set `MaxPoolSize = 676`. In practice `MinPoolSize = 300–400` is often sufficient due to player clustering. Raise it if growth warnings appear in logs.
 
 ---
 
@@ -439,15 +441,15 @@ Create `MF_HISMProxyHide` at `Content/GameCore/Materials/Functions/MF_HISMProxyH
       |
 [Clip]
 ```
-Call this in every HISM material. No per-material manual wiring needed.
+Call this in every HISM material. Eliminates per-material manual clip wiring.
 
 ---
 
 ## Notes
 
-- **Component ownership is tag-based.** `CreateComponentsForEntry` writes `HISMProxyManagedTag` to every managed component. `DestroyOrphanedComponents` checks this tag, not name prefixes, eliminating false positives.
-- **`RebuildTypeIndices` has a fast path.** It samples `PerInstanceCustomData` slot 1 of instance 0 and skips the full rewrite if the index is already correct. This makes `OnConstruction` calls during viewport drags cheap.
-- **`bIsRebuilding` guard prevents re-entry.** `OnConstruction` could otherwise be triggered during the rebuild itself.
-- **`ProxyClass` must be a concrete subclass.** `ValidateSetup` now explicitly checks for `AHISMProxyActor::StaticClass()` and reports an error.
-- **Partial proxy state is lost by design.** `DeactivationDelay` is the window for game systems to flush sub-completion state before `OnProxyDeactivated` fires.
+- **Component ownership is tag-based.** `CreateComponentsForEntry` writes `HISMProxyManagedTag` to every managed component. `DestroyOrphanedComponents` checks this tag, eliminating false positives from user-added components with similar names.
+- **`RebuildTypeIndices` fast path uses `TypeIndex` field only.** `GetCustomDataValue` does not exist on `UInstancedStaticMeshComponent` in UE5 — custom data is write-only from the CPU. The fast path correctly exits on `TypeIndex == i` without any HISM API call.
+- **`bIsRebuilding` is a `UPROPERTY()` outside `#if WITH_EDITOR`.** This avoids UHT layout mismatch between editor and non-editor builds. It is zero-initialized and has no runtime cost in non-editor paths.
+- **`ProxyClass` must be a concrete subclass.** `ValidateSetup` checks for `AHISMProxyActor::StaticClass()` directly.
+- **Partial proxy state is lost by design.** `DeactivationDelay` gives game systems time to flush sub-completion state before `OnProxyDeactivated` fires.
 - **Multiple host actors** per level are fully supported.

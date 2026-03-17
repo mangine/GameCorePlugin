@@ -2,17 +2,16 @@
 
 **Sub-page of:** [HISM Proxy Actor System](HISM%20Proxy%20Actor%20System.md)
 
-Editor tooling for the HISM Proxy Actor System lives in the `GameCoreEditor` module, loaded only in editor builds. It consists of two components:
+Editor tooling lives in the `GameCoreEditor` module, loaded only in editor builds.
 
 1. **`FHISMProxyHostActorDetails`** — Details panel customization for `AHISMProxyHostActor`.
-2. **`UHISMFoliageConversionUtility`** — Editor utility that imports Foliage Tool instances into a target `AHISMProxyHostActor`.
+2. **`UHISMFoliageConversionUtility`** — Editor utility that imports Foliage Tool instances into a host actor.
 
 ---
 
 ## Module Setup
 
 ```cpp
-// GameCoreEditor.cpp
 void FGameCoreEditorModule::StartupModule()
 {
     FPropertyEditorModule& PropertyModule =
@@ -43,14 +42,9 @@ void FGameCoreEditorModule::ShutdownModule()
 ```csharp
 PrivateDependencyModuleNames.AddRange(new string[]
 {
-    "GameCore",
-    "UnrealEd",
-    "PropertyEditor",
-    "SlateCore",
-    "Slate",
-    "Foliage",
-    "EditorSubsystem",
-    "EditorFramework"
+    "GameCore", "UnrealEd", "PropertyEditor",
+    "SlateCore", "Slate", "Foliage",
+    "EditorSubsystem", "EditorFramework"
 });
 ```
 
@@ -60,9 +54,7 @@ PrivateDependencyModuleNames.AddRange(new string[]
 
 **Files:** `GameCoreEditor/Public/HISMProxy/HISMProxyHostActorDetails.h / .cpp`
 
-Adds to the Details panel:
-- **Validate Setup** button (top of HISM Proxy category)
-- Per-entry row: instance count (read-only) + **Add Instance at Pivot** button
+Adds to the Details panel: **Validate Setup** button and per-entry rows with instance count + **Add Instance at Pivot** button.
 
 ```cpp
 class GAMECOREDITOR_API FHISMProxyHostActorDetails : public IDetailCustomization
@@ -99,7 +91,11 @@ void FHISMProxyHostActorDetails::CustomizeDetails(IDetailLayoutBuilder& DetailBu
     [
         SNew(SButton)
         .Text(FText::FromString("Validate Setup"))
-        .OnClicked_Raw(this, &FHISMProxyHostActorDetails::OnValidateClicked, HostActor)
+        .OnClicked(FOnClicked::CreateLambda([HostActor]()
+        {
+            if (HostActor) { HostActor->ValidateSetup(); }
+            return FReply::Handled();
+        }))
     ];
 
     AddInstanceTypeRows(DetailBuilder, HostActor);
@@ -115,6 +111,13 @@ void FHISMProxyHostActorDetails::AddInstanceTypeRows(
         const FHISMProxyInstanceType& Entry = HostActor->InstanceTypes[i];
         const int32 Count = Entry.HISM ? Entry.HISM->GetInstanceCount() : 0;
 
+        // Capture by value: HostActor ptr and index i.
+        // HostActor is also held by CachedHostActor (weak ref) but we capture
+        // the raw pointer here because button lambdas outlive the loop iteration.
+        // Guard with IsValid check inside the lambda.
+        AHISMProxyHostActor* CapturedActor = HostActor;
+        const int32 CapturedIndex = i;
+
         Category.AddCustomRow(FText::FromString(Entry.TypeName.ToString()))
         .NameContent()
         [
@@ -129,53 +132,35 @@ void FHISMProxyHostActorDetails::AddInstanceTypeRows(
             .Text(FText::FromString("Add Instance at Pivot"))
             .ToolTipText(FText::FromString(
                 "Move this actor's pivot to the desired world position, then click."))
-            .OnClicked_Raw(this,
-                &FHISMProxyHostActorDetails::OnAddInstanceClicked, HostActor, i)
+            .OnClicked(FOnClicked::CreateLambda([CapturedActor, CapturedIndex]()
+            {
+                if (IsValid(CapturedActor))
+                {
+                    const FScopedTransaction Transaction(
+                        FText::FromString("Add HISM Proxy Instance"));
+                    CapturedActor->Modify();
+                    CapturedActor->AddInstanceForType(
+                        CapturedIndex, CapturedActor->GetActorTransform());
+
+                    FPropertyEditorModule& PM =
+                        FModuleManager::GetModuleChecked<FPropertyEditorModule>(
+                            "PropertyEditor");
+                    PM.NotifyCustomizationModuleChanged();
+                }
+                return FReply::Handled();
+            }))
         ];
     }
 }
-
-FReply FHISMProxyHostActorDetails::OnAddInstanceClicked(
-    AHISMProxyHostActor* HostActor, int32 TypeIndex)
-{
-    if (!HostActor) { return FReply::Handled(); }
-
-    const FScopedTransaction Transaction(
-        FText::FromString("Add HISM Proxy Instance"));
-    HostActor->Modify();
-    HostActor->AddInstanceForType(TypeIndex, HostActor->GetActorTransform());
-
-    // Refresh the Details panel to update instance counts.
-    FPropertyEditorModule& PropertyModule =
-        FModuleManager::GetModuleChecked<FPropertyEditorModule>("PropertyEditor");
-    PropertyModule.NotifyCustomizationModuleChanged();
-
-    return FReply::Handled();
-}
-
-FReply FHISMProxyHostActorDetails::OnValidateClicked(
-    AHISMProxyHostActor* HostActor)
-{
-    if (HostActor) { HostActor->ValidateSetup(); }
-    return FReply::Handled();
-}
 ```
 
-> **Note:** `FScopedTransaction` wraps `AddInstanceForType` so the instance addition is undoable via Ctrl+Z. Always call `HostActor->Modify()` before mutating the actor in editor operations.
+> **Why lambdas instead of `_Raw` with trailing arguments:** Slate's `FOnClicked` is `TDelegate<FReply()>` — a zero-argument delegate. `OnClicked_Raw` with trailing payload arguments does not compile for zero-argument delegates. The correct pattern is `FOnClicked::CreateLambda(...)` which captures the needed values. Each lambda captures `CapturedActor` and `CapturedIndex` by value, and guards with `IsValid` before use.
 
 ---
 
 ## `UHISMFoliageConversionUtility`
 
 **Files:** `GameCoreEditor/Public/HISMProxy/HISMFoliageConversionUtility.h / .cpp`
-
-### Why the Previous Implementation Was Unsafe
-
-The earlier version accumulated `int32` instance indices during `ForEachInstance` and then called `RemoveInstances` with those indices. This is incorrect: `RemoveInstances` compacts the instance array, invalidating indices for all instances beyond the first removed index. The result is wrong instances being removed or an out-of-bounds access.
-
-**The fix:** collect all transforms first into a local array, then add them all to the host actor, then remove foliage using the foliage system's own stable `FFoliageInstanceId`-based removal API which does not suffer from index shifting.
-
-### Class Definition
 
 ```cpp
 UCLASS(Blueprintable)
@@ -186,7 +171,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Conversion")
     TObjectPtr<AHISMProxyHostActor> TargetHostActor;
 
-    // Recommended: true. Leaving foliage causes duplicate mesh rendering.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Conversion")
     bool bRemoveFoliageAfterConversion = true;
 
@@ -198,7 +182,13 @@ public:
 };
 ```
 
-### `ConvertFoliageToProxyHost` — Safe Implementation
+### `ConvertFoliageToProxyHost` — Three-Pass Safe Implementation
+
+**Why three passes:** Mutating foliage data while iterating it causes undefined behaviour. Pass 1 reads all data into a local array. Pass 2 writes to the host actor (independent). Pass 3 removes from foliage highest-index-first so compaction does not invalidate earlier indices.
+
+**Why no `FFoliageInstanceId`:** This type is internal to the Foliage module and not publicly accessible in UE 5.7 headers. Instance indices as plain `int32` are sufficient when combined with descending-order removal.
+
+**Why `FoliageActor->PostEditChange()` instead of `FoliageInfo->Refresh(...)`:** `FFoliageInfo::Refresh` changed signature between UE versions and is not reliably callable with a fixed argument list. `PostEditChange` on the foliage actor triggers a full internal refresh through the standard UObject change notification path, which is stable across UE 5.x.
 
 ```cpp
 void UHISMFoliageConversionUtility::ConvertFoliageToProxyHost()
@@ -229,6 +219,7 @@ void UHISMFoliageConversionUtility::ConvertFoliageToProxyHost()
 
     int32 TotalConverted = 0;
     int32 TotalSkipped   = 0;
+    bool  bAnyRemoved    = false;
 
     TMap<UFoliageType*, FFoliageInfo*> AllFoliageInfo = FoliageActor->GetAllFoliageInfo();
 
@@ -252,79 +243,63 @@ void UHISMFoliageConversionUtility::ConvertFoliageToProxyHost()
             continue;
         }
 
-        // --- Pass 1: collect all transforms and instance IDs into local arrays.
-        // We MUST NOT call AddInstanceForType or RemoveInstances during this pass,
-        // as either would invalidate the internal foliage data structures.
+        UHierarchicalInstancedStaticMeshComponent* FoliageHISM =
+            FoliageInfo->GetComponent();
+        if (!FoliageHISM) { continue; }
+
+        const int32 NumInstances = FoliageHISM->GetInstanceCount();
+        if (NumInstances == 0) { continue; }
+
+        // ── Pass 1: Collect all transforms into local storage. ──────────────
+        // Do NOT call AddInstanceForType or RemoveInstance here.
         struct FCollectedInstance
         {
             FTransform WorldTransform;
-            FFoliageInstanceId InstanceId;
+            int32      SourceIndex;   // plain int32 — FFoliageInstanceId is internal
         };
         TArray<FCollectedInstance> Collected;
+        Collected.Reserve(NumInstances);
 
-        const FFoliageInstanceHash* HashGrid = FoliageInfo->GetInstanceHash();
-        // GetInstanceHash may be null if the foliage info was just created.
-        // Fall back to component-level iteration.
-
-        // GetAllInstances returns a TArray<FFoliageInstance> indexed 0..N-1.
-        // Each FFoliageInstance has a Location, Rotation, DrawScale3D.
-        // We get world transforms via the component's GetInstanceTransform.
-        if (UHierarchicalInstancedStaticMeshComponent* FoliageHISM =
-            FoliageInfo->GetComponent())
+        for (int32 j = 0; j < NumInstances; ++j)
         {
-            const int32 NumInstances = FoliageHISM->GetInstanceCount();
-            Collected.Reserve(NumInstances);
-
-            for (int32 j = 0; j < NumInstances; ++j)
-            {
-                FTransform WorldT;
-                FoliageHISM->GetInstanceTransform(j, WorldT, /*bWorldSpace=*/true);
-
-                FCollectedInstance& C = Collected.AddDefaulted_GetRef();
-                C.WorldTransform = WorldT;
-                // Store the instance index as ID — used for stable batch removal below.
-                C.InstanceId.Index = j;
-            }
+            FTransform WorldT;
+            FoliageHISM->GetInstanceTransform(j, WorldT, /*bWorldSpace=*/true);
+            Collected.Add({ WorldT, j });
         }
 
-        if (Collected.IsEmpty()) { continue; }
-
-        // --- Pass 2: add all collected transforms to the host actor.
+        // ── Pass 2: Add to host actor. ─────────────────────────────────────
+        // Host actor HISM is independent of foliage — safe to mutate.
         for (const FCollectedInstance& C : Collected)
         {
             TargetHostActor->AddInstanceForType(TypeIndex, C.WorldTransform);
             ++TotalConverted;
         }
 
-        // --- Pass 3: remove from foliage — done after ALL adds are complete.
-        // Build the removal index array from highest to lowest so that
-        // compaction of earlier indices does not affect later ones.
-        // This is the correct approach when using index-based removal.
+        // ── Pass 3: Remove from foliage highest-index-first. ──────────────
+        // Removing from the end of the array keeps earlier indices stable
+        // as the internal buffer compacts after each removal.
         if (bRemoveFoliageAfterConversion)
         {
             TArray<int32> RemovalIndices;
             RemovalIndices.Reserve(Collected.Num());
             for (const FCollectedInstance& C : Collected)
-                RemovalIndices.Add(C.InstanceId.Index);
+                RemovalIndices.Add(C.SourceIndex);
 
-            // Sort descending so we remove from the end of the array first.
-            // Removing from end to front means earlier indices remain stable.
             RemovalIndices.Sort([](int32 A, int32 B) { return A > B; });
 
-            if (UHierarchicalInstancedStaticMeshComponent* FoliageHISM =
-                FoliageInfo->GetComponent())
-            {
-                // RemoveInstances on the component directly, one at a time
-                // from highest to lowest index — safe against compaction.
-                for (int32 RemoveIdx : RemovalIndices)
-                {
-                    FoliageHISM->RemoveInstance(RemoveIdx);
-                }
-            }
+            for (int32 RemoveIdx : RemovalIndices)
+                FoliageHISM->RemoveInstance(RemoveIdx);
 
-            // Notify the foliage info that its component data changed.
-            FoliageInfo->Refresh(FoliageActor, true, true);
+            bAnyRemoved = true;
         }
+    }
+
+    // Trigger a full internal refresh on the foliage actor via the standard
+    // change notification path. More stable than calling FFoliageInfo::Refresh
+    // directly, whose signature varies between UE versions.
+    if (bAnyRemoved)
+    {
+        FoliageActor->PostEditChange();
     }
 
     World->GetCurrentLevel()->MarkPackageDirty();
@@ -342,23 +317,13 @@ void UHISMFoliageConversionUtility::ConvertFoliageToProxyHost()
 }
 ```
 
-### Why Three Passes?
-
-| Pass | What | Why |
-|---|---|---|
-| 1 — Collect | Read all transforms + indices into `Collected[]` | Foliage data must not be mutated while being read |
-| 2 — Add | Call `AddInstanceForType` for each collected transform | Host actor HISM is independent — safe to mutate |
-| 3 — Remove | Remove from foliage highest-index-first | Descending order keeps earlier indices stable during compaction |
-
-This three-pass design eliminates the index-invalidation bug entirely.
-
 ---
 
 ## Notes
 
-- **`FScopedTransaction`** wraps the entire conversion — it is fully undoable via Ctrl+Z.
-- **Foliage tool vs host actor are mutually exclusive renderers.** Always set `bRemoveFoliageAfterConversion = true` to avoid double rendering.
-- **Sub-levels / World Partition:** `GetInstancedFoliageActorForCurrentLevel` returns only the persistent level's foliage actor. If foliage spans sub-levels, run the converter once per sub-level while it is active and loaded.
-- **`FoliageInfo->Refresh`** rebuilds the foliage info's internal spatial hash and LOD data after removal. Required for the editor to display the correct remaining instance count.
-- **Details panel customization** must be unregistered in `ShutdownModule` — see Module Setup above.
-- **Add Instance at Pivot** is wrapped in `FScopedTransaction` and calls `HostActor->Modify()` before mutating state — this makes it fully undoable.
+- **`FOnClicked::CreateLambda` is required for Slate buttons.** `OnClicked_Raw` with trailing payload arguments does not compile for `TDelegate<FReply()>` (zero-argument). All button click handlers use lambdas that capture needed state by value.
+- **`FFoliageInstanceId` is not used.** It is an internal Foliage module type not exposed in UE 5.7 public headers. Plain `int32` source indices with descending-order removal achieve the same result.
+- **`FoliageActor->PostEditChange()` triggers the refresh.** More stable than `FFoliageInfo::Refresh(...)` whose signature changed between UE versions.
+- **`FScopedTransaction` wraps the entire conversion.** Fully undoable via Ctrl+Z.
+- **Sub-levels / World Partition:** `GetInstancedFoliageActorForCurrentLevel` returns only the persistent level's foliage. Run the converter once per sub-level while it is active.
+- **Details panel must be unregistered on shutdown.** `ShutdownModule` calls `UnregisterCustomClassLayout` — omitting this causes a crash on editor reload.
