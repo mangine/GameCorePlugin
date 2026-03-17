@@ -2,7 +2,7 @@
 
 **Sub-page of:** [Quest System](Quest%20System%20Overview.md)
 
-All events are broadcast via `UGameCoreEventSubsystem` (the GMS wrapper). Channels follow the `GameCoreEvent.Quest.*` namespace. The quest system emits and never directly calls other systems — all downstream reactions (rewards, journal, achievements, UI, analytics) subscribe to these events.
+All events are broadcast via `UGameCoreEventSubsystem` (the GMS wrapper). Channels follow the `GameCoreEvent.Quest.*` namespace. The quest system emits events and never directly calls other systems — all downstream reactions (rewards, journal, achievements, UI, analytics) subscribe to these channels.
 
 ---
 
@@ -12,28 +12,30 @@ Add to `DefaultGameplayTags.ini` in the Quest module:
 
 ```ini
 ; ── Quest lifecycle ─────────────────────────────────────────────────────────────────
-+GameplayTagList=(Tag="GameCoreEvent.Quest.Started",          DevComment="A player accepted and started a quest")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.Completed",        DevComment="A quest was successfully completed")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.Failed",           DevComment="A quest was failed")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.Abandoned",        DevComment="A player abandoned an active quest")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.BecameAvailable",  DevComment="Unlock requirements passed; quest is now available to accept")
++GameplayTagList=(Tag="GameCoreEvent.Quest.Started",         DevComment="Player accepted and started a quest")
++GameplayTagList=(Tag="GameCoreEvent.Quest.Completed",       DevComment="Quest successfully completed")
++GameplayTagList=(Tag="GameCoreEvent.Quest.Failed",          DevComment="Quest failed")
++GameplayTagList=(Tag="GameCoreEvent.Quest.Abandoned",       DevComment="Player abandoned an active quest")
++GameplayTagList=(Tag="GameCoreEvent.Quest.BecameAvailable", DevComment="Unlock requirements passed; quest now available")
 
-; ── Stage events ────────────────────────────────────────────────────────────────────
-+GameplayTagList=(Tag="GameCoreEvent.Quest.StageStarted",     DevComment="A quest stage became active")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.StageCompleted",   DevComment="A quest stage was completed; quest advanced to next stage")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.StageFailed",      DevComment="A quest stage failed (does not necessarily fail the quest)")
+; ── Stage events ─────────────────────────────────────────────────────────────────────
++GameplayTagList=(Tag="GameCoreEvent.Quest.StageStarted",    DevComment="A quest stage became active")
++GameplayTagList=(Tag="GameCoreEvent.Quest.StageCompleted",  DevComment="Stage completed; quest advanced")
++GameplayTagList=(Tag="GameCoreEvent.Quest.StageFailed",     DevComment="Stage failed (does not necessarily fail the quest)")
 
 ; ── Tracker events ───────────────────────────────────────────────────────────────────
-+GameplayTagList=(Tag="GameCoreEvent.Quest.TrackerUpdated",   DevComment="A progress tracker counter changed")
++GameplayTagList=(Tag="GameCoreEvent.Quest.TrackerUpdated",  DevComment="A progress tracker counter changed")
 
-; ── Cadence resets (server-side, for journal and UI) ────────────────────────────────
-+GameplayTagList=(Tag="GameCoreEvent.Quest.DailyReset",       DevComment="Daily quest cadence reset occurred")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.WeeklyReset",      DevComment="Weekly quest cadence reset occurred")
+; ── Cadence resets ───────────────────────────────────────────────────────────────────
++GameplayTagList=(Tag="GameCoreEvent.Quest.DailyReset",      DevComment="Daily quest cadence reset at 00:00 UTC")
++GameplayTagList=(Tag="GameCoreEvent.Quest.WeeklyReset",     DevComment="Weekly quest cadence reset at Monday 00:00 UTC")
 
-; ── Party quest events ────────────────────────────────────────────────────────────────
-+GameplayTagList=(Tag="GameCoreEvent.Quest.PartyInvite",      DevComment="LeaderAccept: party members notified of pending quest acceptance")
-+GameplayTagList=(Tag="GameCoreEvent.Quest.MemberLeft",       DevComment="A party member left a shared quest")
+; ── Shared quest events (only relevant when USharedQuestComponent is in use) ─────────
++GameplayTagList=(Tag="GameCoreEvent.Quest.GroupInvite",     DevComment="LeaderAccept: group members notified of pending shared quest")
++GameplayTagList=(Tag="GameCoreEvent.Quest.MemberLeft",      DevComment="A member left a shared quest")
 ```
+
+> **Note on `GroupInvite` and `MemberLeft`:** these two events are only ever emitted when `USharedQuestCoordinator` is active. Games not using the shared quest extension will never see them. They are defined here for completeness but are inert if `USharedQuestComponent` is not used.
 
 ---
 
@@ -42,7 +44,7 @@ Add to `DefaultGameplayTags.ini` in the Quest module:
 **File:** `Quest/Events/QuestEventPayloads.h`
 
 ```cpp
-// ── Quest lifecycle payloads ─────────────────────────────────────────────────────
+// ── Quest lifecycle ────────────────────────────────────────────────────────────────
 
 USTRUCT(BlueprintType)
 struct FQuestStartedPayload
@@ -72,7 +74,7 @@ struct FQuestFailedPayload
     GENERATED_BODY()
     UPROPERTY() FGameplayTag QuestId;
     UPROPERTY() TWeakObjectPtr<APlayerState> PlayerState;
-    // True if this failure permanently closes the quest (SingleAttempt).
+    // True if this failure permanently closes the quest (SingleAttempt lifecycle).
     UPROPERTY() bool bPermanentlyClosed = false;
 };
 
@@ -92,7 +94,7 @@ struct FQuestBecameAvailablePayload
     UPROPERTY() TWeakObjectPtr<APlayerState> PlayerState;
 };
 
-// ── Stage payloads ──────────────────────────────────────────────────────────────────
+// ── Stage payloads ─────────────────────────────────────────────────────────────────
 
 USTRUCT(BlueprintType)
 struct FQuestStageChangedPayload
@@ -101,7 +103,7 @@ struct FQuestStageChangedPayload
     UPROPERTY() FGameplayTag QuestId;
     UPROPERTY() FGameplayTag StageTag;
     UPROPERTY() TWeakObjectPtr<APlayerState> PlayerState;
-    // Localizable objective text from UQuestStageDefinition::StageObjectiveText.
+    // From UQuestStageDefinition::StageObjectiveText — localizable.
     UPROPERTY() FText ObjectiveText;
 };
 
@@ -119,16 +121,26 @@ struct FQuestTrackerUpdatedPayload
     UPROPERTY() TWeakObjectPtr<APlayerState> PlayerState;
 };
 
-// ── Party payloads ─────────────────────────────────────────────────────────────────
+// ── Shared quest payloads ──────────────────────────────────────────────────────────
+// Only used when USharedQuestComponent / USharedQuestCoordinator are active.
 
 USTRUCT(BlueprintType)
-struct FQuestPartyInvitePayload
+struct FQuestGroupInvitePayload
 {
     GENERATED_BODY()
     UPROPERTY() FGameplayTag QuestId;
-    // All PlayerStates being notified (excludes leader who already accepted).
+    // Members pending enrollment (excludes leader who already accepted).
     UPROPERTY() TArray<TWeakObjectPtr<APlayerState>> InvitedMembers;
     UPROPERTY() float GraceWindowSeconds = 10.0f;
+};
+
+USTRUCT(BlueprintType)
+struct FQuestMemberLeftPayload
+{
+    GENERATED_BODY()
+    UPROPERTY() FGameplayTag QuestId;
+    UPROPERTY() TWeakObjectPtr<APlayerState> LeavingMember;
+    UPROPERTY() int32 RemainingMemberCount = 0;
 };
 ```
 
@@ -138,30 +150,28 @@ struct FQuestPartyInvitePayload
 
 | Event | Emitted By | When |
 |---|---|---|
-| `Quest.Started` | `UQuestComponent` | After enrollment completes |
+| `Quest.Started` | `UQuestComponent` | Enrollment complete |
 | `Quest.Completed` | `UQuestComponent::Internal_CompleteQuest` | Terminal success state entered |
 | `Quest.Failed` | `UQuestComponent::Internal_FailQuest` | Terminal failure state entered |
 | `Quest.Abandoned` | `UQuestComponent::ServerRPC_AbandonQuest` | Player abandons |
-| `Quest.BecameAvailable` | `UQuestComponent` (watcher callback) | Unlock requirements pass |
+| `Quest.BecameAvailable` | `UQuestComponent` watcher callback | Unlock requirements pass |
 | `Quest.StageStarted` | `UQuestComponent::Internal_AdvanceStage` | New stage activated |
 | `Quest.StageCompleted` | `UQuestComponent::Internal_AdvanceStage` | Previous stage completed |
-| `Quest.StageFailed` | `UQuestComponent::Internal_FailQuest` (stage-level) | Stage failure state entered |
-| `Quest.TrackerUpdated` | `UQuestComponent::Server_IncrementTracker` | Counter incremented |
+| `Quest.StageFailed` | `UQuestComponent::Internal_FailQuest` | Stage failure state entered |
+| `Quest.TrackerUpdated` | `UQuestComponent::Server_IncrementTracker` | Counter incremented (called externally) |
 | `Quest.DailyReset` | `UQuestRegistrySubsystem::OnDailyReset` | 00:00 UTC daily |
 | `Quest.WeeklyReset` | `UQuestRegistrySubsystem::OnWeeklyReset` | Monday 00:00 UTC |
-| `Quest.PartyInvite` | `UPartyQuestCoordinator::LeaderInitiateQuestAccept` | Leader accepts on behalf |
-| `Quest.MemberLeft` | `UPartyQuestCoordinator::RemoveMember` | Member leaves party quest |
+| `Quest.GroupInvite` | `USharedQuestCoordinator::LeaderInitiateAccept` | Leader accepts on behalf of group |
+| `Quest.MemberLeft` | `USharedQuestCoordinator::RemoveMember` | Member leaves shared quest |
 
 ---
 
-## RequirementEvent Tags (for Watcher System)
+## RequirementEvent Tags (Watcher System Internal)
 
-These are NOT `GameCoreEvent.*` — they are `RequirementEvent.*` tags used exclusively to invalidate cached requirement results in `URequirementWatcherComponent`.
+These are **not** `GameCoreEvent.*` tags. They live under `RequirementEvent.*` and are used exclusively to invalidate cached requirement results inside `URequirementWatcherComponent`. They are fired by `UQuestComponent` via `URequirementWatcherManager::NotifyPlayerEvent` — not via GMS.
 
-| Tag | Fired When | Invalidates |
+| Tag | Fired By | Invalidates |
 |---|---|---|
-| `RequirementEvent.Quest.TrackerUpdated` | Any tracker counter changes | `URequirement_KillCount` and other persisted trackers |
-| `RequirementEvent.Quest.StageChanged` | Stage advances | Any stage-dependent requirements |
-| `RequirementEvent.Quest.Completed` | Quest completes | `URequirement_QuestCompleted`, `URequirement_QuestCooldown` |
-
-These tags are fired by `UQuestComponent` directly via `URequirementWatcherManager::BroadcastEvent`, not via GMS. They are watcher-system internal signals.
+| `RequirementEvent.Quest.TrackerUpdated` | `UQuestComponent::Server_IncrementTracker` | Tracker-based requirements (`URequirement_Persisted` subclasses) |
+| `RequirementEvent.Quest.StageChanged` | `UQuestComponent::Internal_AdvanceStage` | Any stage-gated requirements |
+| `RequirementEvent.Quest.Completed` | `UQuestComponent::Internal_CompleteQuest` | `URequirement_QuestCompleted`, `URequirement_QuestCooldown` |
