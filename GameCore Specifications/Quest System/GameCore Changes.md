@@ -3,11 +3,105 @@
 **Sub-page of:** [Quest System](Quest%20System%20Overview.md) 
 **Module:** `GameCore` (plugin — changes apply globally to all systems)
 
-The Quest System requires two targeted additions to the GameCore Requirement System. These are generic improvements — they have no knowledge of quests.
+The Quest System requires three targeted additions to the GameCore plugin. All are generic improvements with no knowledge of quests.
 
 ---
 
-## 1. `FRequirementPayload` (new USTRUCT)
+## 1. `IGroupProvider` (new UInterface)
+
+**File:** `GameCore/Source/GameCore/Interfaces/GroupProvider.h`
+
+A generic interface for any actor or component that owns group/party membership data. Used by `USharedQuestComponent` to read group state without coupling to any concrete party system. Any grouping system — parties, ship crews, squads, guilds — implements this interface.
+
+```cpp
+UINTERFACE(MinimalAPI, BlueprintType)
+class UGroupProvider : public UInterface { GENERATED_BODY() };
+
+class GAMECORE_API IGroupProvider
+{
+    GENERATED_BODY()
+public:
+    // Number of members currently in the group, including this player.
+    // Returns 1 if the player is ungrouped.
+    virtual int32 GetGroupSize() const = 0;
+
+    // True if this PlayerState is currently the group leader.
+    virtual bool IsGroupLeader() const = 0;
+
+    // All PlayerState members of the group, including this player.
+    // Returned array is valid only for the current frame — do not cache.
+    virtual TArray<APlayerState*> GetGroupMembers() const = 0;
+};
+```
+
+### Where It Is Implemented
+
+`IGroupProvider` is implemented on `APlayerState` (or on a component that `APlayerState` delegates to). The party system, when it exists, makes `APlayerState` satisfy this interface by implementing the three methods and delegating to whatever party actor owns the authoritative data.
+
+```cpp
+// Future party system example:
+class AMyPlayerState : public APlayerState, public IGroupProvider
+{
+    virtual int32 GetGroupSize() const override
+    {
+        return PartyComponent ? PartyComponent->GetMemberCount() : 1;
+    }
+    virtual bool IsGroupLeader() const override
+    {
+        return PartyComponent && PartyComponent->IsLeader(this);
+    }
+    virtual TArray<APlayerState*> GetGroupMembers() const override
+    {
+        return PartyComponent ? PartyComponent->GetAllMembers()
+                              : TArray<APlayerState*>{const_cast<AMyPlayerState*>(this)};
+    }
+private:
+    UPROPERTY()
+    TObjectPtr<UPartyComponent> PartyComponent;
+};
+```
+
+### How `USharedQuestComponent` Accesses It
+
+`USharedQuestComponent` lives on `APlayerState`. It reads group data by casting its own owner:
+
+```cpp
+IGroupProvider* USharedQuestComponent::GetGroupProvider() const
+{
+    return Cast<IGroupProvider>(GetOwner()); // APlayerState
+}
+```
+
+If `APlayerState` does not implement `IGroupProvider`, the cast returns null. `USharedQuestComponent` treats null as "ungrouped" and falls back to solo behavior transparently — no crash, no error, no assertion.
+
+```cpp
+void USharedQuestComponent::OnMobKilledByGroupMember(
+    const FMobKilledEventPayload& Payload)
+{
+    IGroupProvider* Provider = GetGroupProvider();
+    if (!Provider) return; // Not in a group — nothing to fan out
+
+    // Fan out tracker increment to all group members who have this quest active.
+    for (APlayerState* Member : Provider->GetGroupMembers())
+    {
+        if (Member == GetOwner()) continue; // Self handled by base component
+        if (UQuestComponent* QC = Member->FindComponentByClass<UQuestComponent>())
+        {
+            // Increment tracker for any quest the member has active
+            // that matches the killed mob's tracker type.
+            // The integration layer (game module) drives which tracker key to use.
+            QC->Server_IncrementTracker(
+                Payload.QuestId, Payload.TrackerKey, 1);
+        }
+    }
+}
+```
+
+> **Design rule:** `IGroupProvider` is read-only from the quest system's perspective. The quest system never writes group state through this interface — it only reads member lists and leader status.
+
+---
+
+## 2. `FRequirementPayload` (new USTRUCT)
 
 **File:** `GameCore/Source/GameCore/Requirements/RequirementPayload.h`
 
@@ -28,11 +122,10 @@ struct GAMECORE_API FRequirementPayload
     UPROPERTY(BlueprintReadOnly)
     TMap<FGameplayTag, int32> Counters;
 
-    // Float values: time elapsed, distance travelled, percentages, etc.
+    // Float values: time elapsed, distance travelled, completion timestamps, etc.
     UPROPERTY(BlueprintReadOnly)
     TMap<FGameplayTag, float> Floats;
 
-    // Helpers
     bool GetCounter(const FGameplayTag& Key, int32& OutValue) const
     {
         if (const int32* Found = Counters.Find(Key))
@@ -57,72 +150,57 @@ struct GAMECORE_API FRequirementPayload
 
 ---
 
-## 2. `FRequirementContext` — Addition
+## 3. `FRequirementContext` — Addition
 
 **File:** `GameCore/Source/GameCore/Requirements/RequirementContext.h` (existing)
 
-Add one field to the existing struct:
+Add one field:
 
 ```cpp
-// Injected persisted data keyed by payload tag.
-// Populated by the owning system before passing context to Evaluate().
-// Each entry is a self-contained payload for one logical data domain
-// (e.g. Quest.Tracker.KillCount -> FRequirementPayload with Counters).
-//
-// Requirements that read from this map must declare GetDataAuthority() == Both,
+// Injected persisted data keyed by payload domain tag.
+// Populated by the owning system's ContextBuilder before evaluation.
+// Requirements reading this map must declare GetDataAuthority() == Both,
 // since the owning system controls what data is available on each side.
-//
-// Example injection (in UQuestComponent::BuildRequirementContext):
-//   FRequirementPayload Payload;
-//   Payload.Counters.Add(TAG_Quest_Tracker_KillCount, 2);
-//   Context.PersistedData.Add(TAG_Quest_Payload_Stage1, Payload);
 UPROPERTY()
 TMap<FGameplayTag, FRequirementPayload> PersistedData;
 ```
 
-> **Design rule:** The key is a domain tag, not a tracker tag. One payload entry per logical domain (e.g. one per quest stage). Individual counter/float tags live inside the payload. This keeps the map flat and lookup O(1) at both levels.
+> **Design rule:** The key is a domain tag (e.g. the QuestId), not an individual counter tag. One payload entry per logical domain. Individual counters/floats live inside the payload. This keeps the top-level map small and lookup O(1) at both levels.
 
 ---
 
-## 3. `URequirement_Persisted` (new abstract class)
+## 4. `URequirement_Persisted` (new abstract class)
 
 **File:** `GameCore/Source/GameCore/Requirements/RequirementPersisted.h / .cpp`
 
-An abstract intermediate class between `URequirement` and any requirement that needs to read from `FRequirementContext::PersistedData`. Handles key lookup, missing-payload failure, and seals `Evaluate()` so subclasses cannot accidentally bypass the lookup.
+An abstract intermediate class for requirements that read from `FRequirementContext::PersistedData`. Seals `Evaluate()` so subclasses cannot accidentally bypass the payload lookup.
 
 ```cpp
-// Abstract base for all requirements that read from FRequirementContext::PersistedData.
-// Subclasses implement EvaluateWithPayload() instead of Evaluate().
-// The payload lookup and missing-key failure are handled here — subclasses
-// never touch FRequirementContext::PersistedData directly.
 UCLASS(Abstract, EditInlineNew, CollapseCategories)
 class GAMECORE_API URequirement_Persisted : public URequirement
 {
     GENERATED_BODY()
 public:
-    // Tag used to look up this requirement's FRequirementPayload in
-    // FRequirementContext::PersistedData. Set by the designer on each instance.
-    // Must match the key used by the owning system when building FRequirementContext.
+    // Domain tag used to look up FRequirementPayload in FRequirementContext::PersistedData.
+    // Must match the key the owning system injects via its ContextBuilder.
+    // Set by the designer on each requirement instance.
     UPROPERTY(EditDefaultsOnly, Category="Requirement",
               meta=(Categories="Quest.Payload"))
     FGameplayTag PayloadKey;
 
-    // Data authority is Both: the owning system decides what is available on each side.
-    // The client receives replicated FQuestRuntime data, so payload can be built client-side.
+    // Data authority is Both: the payload is built from replicated data,
+    // so it is available on both server and owning client.
     virtual ERequirementDataAuthority GetDataAuthority() const override
     {
         return ERequirementDataAuthority::Both;
     }
 
-    // Subclasses implement this. Payload is guaranteed valid when called.
-    // The base Evaluate() handles lookup and fires a descriptive Fail if the key
-    // is not present in Context.PersistedData.
+    // Subclasses implement this instead of Evaluate().
+    // Payload is guaranteed non-null when called.
     virtual FRequirementResult EvaluateWithPayload(
         const FRequirementContext& Context,
         const FRequirementPayload& Payload) const
     {
-        // Pure virtual — force subclasses to implement.
-        // Declared with a body here only to satisfy PURE_VIRTUAL macro needs.
         return FRequirementResult::Fail(
             LOCTEXT("NotImplemented", "EvaluateWithPayload not implemented."));
     }
@@ -136,31 +214,24 @@ public:
 #endif
 
 protected:
-    // Sealed. Subclasses must not override Evaluate() — use EvaluateWithPayload().
+    // Sealed. Subclasses must not override Evaluate().
     virtual FRequirementResult Evaluate(
         const FRequirementContext& Context) const override final
     {
         if (!PayloadKey.IsValid())
-        {
             return FRequirementResult::Fail(
                 LOCTEXT("NoPayloadKey",
                     "Persisted requirement has no PayloadKey set."));
-        }
 
         const FRequirementPayload* Payload =
             Context.PersistedData.Find(PayloadKey);
 
         if (!Payload)
-        {
-            // Not a hard failure for client-side evaluation where data may not
-            // yet be present — treated as a soft miss. The owning system is
-            // responsible for ensuring payload is populated before evaluation.
             return FRequirementResult::Fail(
                 FText::Format(
                     LOCTEXT("MissingPayload",
-                        "Payload not found for key: {0}"),
+                        "No payload found for key: {0}"),
                     FText::FromString(PayloadKey.ToString())));
-        }
 
         return EvaluateWithPayload(Context, *Payload);
     }
@@ -171,15 +242,15 @@ protected:
 
 - Do **not** override `Evaluate()` — it is sealed.
 - Do **not** redeclare `Abstract` on the subclass.
-- Always set `DisplayName` in `UCLASS` specifier.
-- Set `PayloadKey` in the asset Details panel — it must match the key the owning system injects.
-- `GetDescription()` should include `PayloadKey` and the threshold being checked.
-- `GetWatchedEvents()` should declare the event tags that invalidate this requirement in the watcher system.
+- Always set `DisplayName` in `UCLASS`.
+- `PayloadKey` must match the domain key injected by the owning system's `ContextBuilder`.
+- Override `GetWatchedEvents_Implementation` to declare which `RequirementEvent.*` tags invalidate this requirement in the watcher.
+- Override `GetDescription()` to include `PayloadKey` and the threshold being checked.
 
-### Example Subclass
+### Example Subclass (lives in game module, not GameCore)
 
 ```cpp
-// Lives in PirateGame Quest module, not GameCore.
+// PirateGame Quest module — URequirement_KillCount.h
 UCLASS(EditInlineNew, CollapseCategories,
        meta=(DisplayName="Kill Count Tracker"))
 class PIRATEQUESTS_API URequirement_KillCount : public URequirement_Persisted
@@ -189,8 +260,6 @@ public:
     UPROPERTY(EditDefaultsOnly, Category="Requirement", meta=(ClampMin=1))
     int32 RequiredKills = 1;
 
-    // Tag identifying which counter inside the payload holds the kill count.
-    // e.g. Quest.Counter.KillCount
     UPROPERTY(EditDefaultsOnly, Category="Requirement",
               meta=(Categories="Quest.Counter"))
     FGameplayTag CounterTag;
@@ -199,37 +268,22 @@ public:
         const FRequirementContext& Context,
         const FRequirementPayload& Payload) const override
     {
-        int32 CurrentKills = 0;
-        Payload.GetCounter(CounterTag, CurrentKills);
-
-        if (CurrentKills >= RequiredKills)
-            return FRequirementResult::Pass();
-
+        int32 Current = 0;
+        Payload.GetCounter(CounterTag, Current);
+        if (Current >= RequiredKills) return FRequirementResult::Pass();
         return FRequirementResult::Fail(
             FText::Format(
-                LOCTEXT("NeedMoreKills", "Kills: {0} / {1}"),
-                FText::AsNumber(CurrentKills),
-                FText::AsNumber(RequiredKills)));
+                LOCTEXT("NeedKills", "{0} / {1} kills"),
+                FText::AsNumber(Current), FText::AsNumber(RequiredKills)));
     }
 
     virtual void GetWatchedEvents_Implementation(
         FGameplayTagContainer& OutEvents) const override
     {
-        // Invalidate when mob kill event fires.
         OutEvents.AddTag(
             FGameplayTag::RequestGameplayTag(
                 TEXT("RequirementEvent.Quest.TrackerUpdated")));
     }
-
-#if WITH_EDITOR
-    virtual FString GetDescription() const override
-    {
-        return FString::Printf(TEXT("Kill Count >= %d (payload: %s, counter: %s)"),
-            RequiredKills,
-            *PayloadKey.ToString(),
-            *CounterTag.ToString());
-    }
-#endif
 };
 ```
 
@@ -240,9 +294,10 @@ public:
 Add to `DefaultGameplayTags.ini` in the Quest module:
 
 ```ini
-+GameplayTagList=(Tag="RequirementEvent.Quest.TrackerUpdated",  DevComment="A quest progress tracker counter changed")
++GameplayTagList=(Tag="RequirementEvent.Quest.TrackerUpdated", DevComment="A quest tracker counter changed")
 +GameplayTagList=(Tag="RequirementEvent.Quest.StageChanged",   DevComment="Active quest moved to a new stage")
-+GameplayTagList=(Tag="RequirementEvent.Quest.Completed",      DevComment="A quest was completed — monotonic requirements re-check")
++GameplayTagList=(Tag="RequirementEvent.Quest.Completed",      DevComment="A quest was completed")
 +GameplayTagList=(Tag="Quest.Payload",                        DevComment="Namespace for payload domain keys")
 +GameplayTagList=(Tag="Quest.Counter",                        DevComment="Namespace for counter keys within a payload")
++GameplayTagList=(Tag="Quest.Counter.LastCompleted",          DevComment="Float: Unix timestamp of last quest completion")
 ```
