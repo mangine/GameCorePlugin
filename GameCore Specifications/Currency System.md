@@ -26,12 +26,14 @@ The Currency System manages any form of numeric currency — gold, gems, points,
 | `TMap<FGameplayTag, FCurrencySlotConfig>` in the definition | Eliminates tag duplication, O(1) config lookup, clean authoring surface |
 | No `FCurrencyConfig` intermediate struct | Direct definition lookup is sufficient; no runtime copy needed |
 | `int64` for all amounts | MMORPG economies will overflow `int32` with inflation and gold sinks |
-| Component is a dumb state owner | All policy (validation, audit, rate limiting) lives in `UCurrencySubsystem` |
+| Component is a dumb state owner | All policy (validation, audit) lives in `UCurrencySubsystem` |
 | FastArray replication (`COND_OwnerOnly`) | Delta-sends only changed currency slots; player wallet never broadcasts to others |
 | `EWalletMutationResult` return codes | Callers must handle failure explicitly — silent no-ops are unacceptable for economy |
 | Both `Source` and `Target` on every mutation | Audit trail requires both sides of every economic event |
 | Trade wallets not registered with `UPersistenceSubsystem` | Ephemeral by design; crash recovery via audit log replay, not snapshot restore |
 | Definition is a `UDataAsset` | Never replicated, never saved — read-only authoring data resolved at `BeginPlay` |
+| Anti-cheat via audit data analysis | No live rate limiting; all anomaly detection is done offline against audit records |
+| All backend calls via `FGameCoreBackend` statics | Canonical access pattern for all GameCore systems — no direct `UE_LOG`, no subsystem lookup |
 
 ---
 
@@ -72,12 +74,13 @@ GameCore/
     │
     ├── Validate: wallet valid, currency configured, server authority
     ├── Resolve FCurrencySlotConfig from Wallet->Definition->Slots[Tag]
-    ├── Clamp check: NewAmount = Clamp(Current + Delta, Config.Min, Config.Max)
-    │   └── If clamped to same value → return EWalletMutationResult::ClampViolation
+    ├── Clamp check: NewAmount = Current + Delta
+    │   ├── NewAmount < Config.Min → InsufficientFunds or ClampViolation
+    │   └── NewAmount > Config.Max → ClampViolation
     ├── Apply: FCurrencyLedgerEntry.Amount = NewAmount
     ├── FastArray MarkItemDirty → replication fires
     ├── Dispatch OnCurrencyChanged delegate on component
-    └── Audit: FGameCoreBackend::Audit(TAG_Audit_Currency_Modify, ...)
+    └── FGameCoreBackend::Audit(Entry)  ← TAG_Audit_Currency_Modify
 ```
 
 ### Atomic Transfer
@@ -93,17 +96,21 @@ GameCore/
     ├── Apply To:   Amount += Delta
     ├── MarkItemDirty on both FastArrays
     ├── Dispatch OnCurrencyChanged on both components
-    └── Audit: single transactional FAuditEntry group covering both sides
+    ├── FGameCoreBackend::Audit(Entry)  ← TAG_Audit_Currency_Transfer (debit side)
+    └── FGameCoreBackend::Audit(Entry)  ← TAG_Audit_Currency_TransferCommit (credit side)
+        Both entries share the same SessionId — used to pair them for crash recovery queries.
 ```
 
 ### Trade Crash Recovery (Conceptual)
 ```
 On server session start:
     Query IAuditService for Audit.Currency.Transfer entries with no matching Audit.Currency.TransferCommit
+    (matched by SessionId)
     For each incomplete transfer:
         Determine escrow wallet (trade session actor)
-        Return funds to source wallet via ModifyCurrency with Source = Source.Admin.Recovery
-        Audit the recovery event
+        Return funds to source wallet via ModifyCurrency
+        Source = Source.Admin.Recovery
+        FGameCoreBackend::Audit(Entry)  ← TAG_Audit_Currency_Recovery
 ```
 
 ---

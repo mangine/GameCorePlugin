@@ -4,7 +4,7 @@
 
 **File:** `Currency/CurrencySubsystem.h / .cpp`
 
-Server-only `UWorldSubsystem`. The **sole external entry point** for all currency mutations. The wallet component never mutates itself — all policy, validation, rate limiting, and audit dispatch live here.
+Server-only `UWorldSubsystem`. The **sole external entry point** for all currency mutations. The wallet component never mutates itself — all policy, validation, and audit dispatch live here.
 
 ---
 
@@ -47,13 +47,6 @@ public:
         FGuid                     SessionId = FGuid()
     );
 
-    // --- Rate Limiting (anti-exploit) ---
-
-    // Max ModifyCurrency calls allowed per actor per second.
-    // Configurable via project settings or console var.
-    // Excess calls return EWalletMutationResult::InvalidWallet and log a warning.
-    int32 MutationRateLimit = 60;
-
 private:
     EWalletMutationResult ValidateWallet(
         const UCurrencyWalletComponent* Wallet,
@@ -71,11 +64,6 @@ private:
         TScriptInterface<ISourceIDInterface> Target,
         FGuid                     SessionId
     );
-
-    // Per-actor mutation timestamp tracking for rate limiting.
-    TMap<TWeakObjectPtr<AActor>, TArray<double>> MutationTimestamps;
-
-    bool IsRateLimited(AActor* OwnerActor);
 };
 ```
 
@@ -111,15 +99,7 @@ EWalletMutationResult UCurrencySubsystem::ModifyCurrency(
     if (ValidationResult != EWalletMutationResult::Success)
         return ValidationResult;
 
-    // 2. Rate limit check
-    if (IsRateLimited(Wallet->GetOwner()))
-    {
-        UE_LOG(LogCurrency, Warning, TEXT("ModifyCurrency: rate limit exceeded for %s"),
-            *Wallet->GetOwner()->GetName());
-        return EWalletMutationResult::InvalidWallet;
-    }
-
-    // 3. Compute new amount and clamp check
+    // 2. Compute new amount and clamp check
     FCurrencyLedgerEntry* Entry = Wallet->GetOrCreateEntry(CurrencyTag);
     const int64 OldAmount = Entry->Amount;
     const int64 NewAmount = OldAmount + Delta;
@@ -132,14 +112,14 @@ EWalletMutationResult UCurrencySubsystem::ModifyCurrency(
     if (NewAmount > Config->Max)
         return EWalletMutationResult::ClampViolation;
 
-    // 4. Apply mutation
+    // 3. Apply mutation
     Entry->Amount = NewAmount;
     Wallet->Ledger.MarkItemDirty(*Entry);
 
-    // 5. Notify
+    // 4. Notify
     Wallet->OnCurrencyChanged.Broadcast(CurrencyTag, OldAmount, NewAmount);
 
-    // 6. Audit
+    // 5. Audit
     DispatchAudit(TAG_Audit_Currency_Modify, Wallet, CurrencyTag,
         Delta, NewAmount, Source, Target, SessionId);
 
@@ -199,13 +179,11 @@ EWalletMutationResult UCurrencySubsystem::TransferCurrency(
     From->OnCurrencyChanged.Broadcast(CurrencyTag, FromOld, FromEntry->Amount);
     To->OnCurrencyChanged.Broadcast(CurrencyTag, ToOld, ToEntry->Amount);
 
-    // 5. Audit — single transactional group for both sides
-    // Begin event (debit side)
-    DispatchAudit(TAG_Audit_Currency_Transfer, From, CurrencyTag,
+    // 5. Audit — two entries sharing the same SessionId link debit and credit for recovery queries
+    DispatchAudit(TAG_Audit_Currency_Transfer,       From, CurrencyTag,
         -Amount, FromEntry->Amount, Source, Target, SessionId);
-    // Commit event (credit side — same SessionId links them for recovery queries)
-    DispatchAudit(TAG_Audit_Currency_TransferCommit, To, CurrencyTag,
-        Amount, ToEntry->Amount, Source, Target, SessionId);
+    DispatchAudit(TAG_Audit_Currency_TransferCommit, To,   CurrencyTag,
+        Amount,  ToEntry->Amount,   Source, Target, SessionId);
 
     return EWalletMutationResult::Success;
 }
@@ -239,7 +217,9 @@ EWalletMutationResult UCurrencySubsystem::ValidateWallet(
 
 ## DispatchAudit
 
-`ISourceIDInterface` exposes only `GetSourceTag()` and `GetSourceDisplayName()` — it does not carry a `FGuid`. Entity GUIDs for audit purposes must come from the wallet's owning Actor. The owning Actor is expected to implement a separate identity interface (or the game module provides a utility) that maps Actor → `FGuid`. For the purposes of this spec, this is expressed as `FEntityIdentity::GetGuid(Actor)` — a game-module-level utility that the game wires up at startup.
+All audit calls use `FGameCoreBackend::Audit(Entry)` — the canonical static accessor. No direct `UE_LOG`, no `GetAudit()->RecordEvent()` chain.
+
+`ISourceIDInterface` exposes `GetSourceTag()` and `GetSourceDisplayName()` but no `FGuid`. Entity GUIDs must come from outside GameCore — the game module resolves Actor → `FGuid` via its own identity system and either subclasses `UCurrencySubsystem` or passes pre-resolved GUIDs through a higher-level API. Inside the plugin, `ActorDisplayName` and `SubjectTag` are populated from the interface; `ActorId`/`SubjectId` are left as zero GUIDs and filled by the game layer before the entry reaches the backend.
 
 ```cpp
 void UCurrencySubsystem::DispatchAudit(
@@ -257,23 +237,11 @@ void UCurrencySubsystem::DispatchAudit(
     Entry.SchemaVersion = 1;
     Entry.SessionId     = SessionId;
 
-    // ActorId and ActorDisplayName come from the Source ISourceIDInterface.
-    // ISourceIDInterface does not carry a FGuid — the game module must resolve
-    // entity GUIDs externally (e.g. via a player state identity component or
-    // a game-level FEntityIdentity utility). Here we use the wallet owner name
-    // as a fallback display string; replace with a proper GUID at game-module level.
     if (Source.GetObject())
-    {
         Entry.ActorDisplayName = Source->GetSourceDisplayName().ToString();
-        // Entry.ActorId = resolved by game module from Source object
-    }
 
-    // SubjectId/SubjectTag identify the target entity.
     if (Target.GetObject())
-    {
         Entry.SubjectTag = Target->GetSourceTag();
-        // Entry.SubjectId = resolved by game module from Target object
-    }
 
     Entry.Payload = FAuditPayloadBuilder{}
         .SetTag   (TEXT("currency"),         CurrencyTag)
@@ -286,38 +254,26 @@ void UCurrencySubsystem::DispatchAudit(
 }
 ```
 
-**Note on GUID resolution:** `FAuditEntry::ActorId` and `SubjectId` must be populated at the game-module layer, not inside GameCore. GameCore cannot assume any specific identity system. The recommended pattern is for the game module to subclass `UCurrencySubsystem` or provide a bound delegate that resolves `UObject* → FGuid` before calling `FGameCoreBackend::Audit`. This keeps the plugin generic while allowing full audit fidelity in the game.
-
 ---
 
-## Rate Limiting
+## Logging
 
-Rate limiting is a defense-in-depth measure. A legitimate game flow will never hit 60 mutations/second per actor. If this threshold fires, it is an exploit signal and must be logged and investigated.
+All internal warnings and errors use `FGameCoreBackend::Log()`. No direct `UE_LOG` calls inside the subsystem.
 
 ```cpp
-bool UCurrencySubsystem::IsRateLimited(AActor* OwnerActor)
-{
-    const double Now = FPlatformTime::Seconds();
-    TArray<double>& Timestamps = MutationTimestamps.FindOrAdd(OwnerActor);
-
-    // Evict entries older than 1 second
-    Timestamps.RemoveAll([Now](double T) { return (Now - T) > 1.0; });
-
-    if (Timestamps.Num() >= MutationRateLimit)
-        return true;
-
-    Timestamps.Add(Now);
-    return false;
-}
+// Example: invalid wallet passed to ModifyCurrency
+FGameCoreBackend::Log(
+    ELogSeverity::Warning,
+    TEXT("CurrencySubsystem"),
+    FString::Printf(TEXT("ModifyCurrency: invalid wallet or no authority on actor %s"),
+        *Wallet->GetOwner()->GetName()));
 ```
-
-**Note:** `MutationTimestamps` uses `TWeakObjectPtr` keys to avoid holding strong references to destroyed actors. Periodically flush stale weak pointers during low-activity frames if the map grows large in long-running sessions.
 
 ---
 
 ## Anti-Cheat Notes
 
-- Clients **never call** `ModifyCurrency` or `TransferCurrency` directly. Game RPCs that trigger currency mutations validate on the server before calling the subsystem.
+- Clients **never call** `ModifyCurrency` or `TransferCurrency` directly. Game RPCs validate on the server before calling the subsystem.
 - The subsystem does not accept RPCs. It is called only by trusted server-side code.
-- All mutation results that are not `Success` should be logged at `Warning` level with actor identity for CS investigation.
-- `InsufficientFunds` responses should be tracked — repeated occurrences from the same actor may indicate a client-side exploit attempt to spend funds the server knows are absent.
+- Anti-cheat is handled via **data analysis on audit records**, not live rate limiting. Every mutation — successful or failed — produces an audit entry. Anomalies (unusual velocity, negative balance attempts, repeated `InsufficientFunds`) are detected offline against the audit log.
+- All non-`Success` results should be logged via `FGameCoreBackend::Log(Warning, ...)` with actor identity so they appear in the audit-adjacent log stream.
