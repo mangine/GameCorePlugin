@@ -61,6 +61,12 @@ private:
         int32                   CurrentDepth,
         FRandomStream*          Stream);   // null when unseeded
 
+    // Quantity resolution is stream-aware to preserve determinism when seeded.
+    int32 ResolveQuantity(
+        FInt32Range          Range,
+        EQuantityDistribution Distribution,
+        FRandomStream*       Stream);      // null when unseeded
+
     static constexpr int32 MaxRecursionDepth = 3;
 
     TMap<FLootModifierHandle, FLootModifier> Modifiers;
@@ -78,6 +84,7 @@ RunLootTable(Table, Context):
 
   // Seed setup — done once before any rolls
   Stream = null
+  FinalSeed = INDEX_NONE
   If Context.Seed != INDEX_NONE:
     RandomOffset = FMath::RandRange(0, MAX_int32)
     FinalSeed    = HashCombine(Context.Seed, RandomOffset)
@@ -90,7 +97,7 @@ RunLootTable(Table, Context):
     Instigator:   Context.Instigator
     SourceTag:    Context.SourceTag
     TableAsset:   Table
-    FinalSeed:    FinalSeed (or INDEX_NONE if unseeded)
+    FinalSeed:    FinalSeed
     LuckBonus:    Context.LuckBonus
     Results:      Results)
 
@@ -102,29 +109,20 @@ RollTableInternal(Table, Context, Depth, Stream):
     ensure(false)   // non-shipping only
     return {}
 
-  RollCount = RandRange(Table.RollCount.Min, Table.RollCount.Max)
+  RollCount = Stream ? Stream->RandRange(Table.RollCount.Min, Table.RollCount.Max)
+                     : FMath::RandRange(Table.RollCount.Min, Table.RollCount.Max)
 
   For each roll:
     RolledValue = Stream ? Stream->FRandRange(0.f, 1.f + Context.LuckBonus)
                          : FMath::FRandRange(0.f, 1.f + Context.LuckBonus)
 
     // ── Entry selection with downgrade support ────────────────────────────
-    //
     // Step 1: find the highest entry whose threshold does not exceed RolledValue.
-    //         This is the candidate — requirements have not been checked yet.
-    //
-    // Step 2: evaluate EntryRequirements on the candidate.
-    //         Requirements are evaluated AFTER selection, not during the scan.
-    //
-    // Step 3: on requirement failure:
-    //   bDowngradeOnRequirementFailed == true  → walk down to next lower entry, repeat from Step 2.
-    //   bDowngradeOnRequirementFailed == false → no reward this roll. Stop.
-    //   Downgrade chain stops as soon as a candidate passes, a candidate has
-    //   bDowngradeOnRequirementFailed == false, or no lower candidates remain.
+    // Step 2: evaluate EntryRequirements on that candidate.
+    // Step 3: on failure — downgrade walk if bDowngradeOnRequirementFailed, else no reward.
 
-    // Build FRequirementContext for evaluation
     FRequirementContext ReqContext = FRequirementContext::ForActor(
-        Context.Instigator.Get() ? Context.Instigator->GetPawn() : nullptr);
+        Context.Instigator.IsValid() ? Context.Instigator->GetPawn() : nullptr);
 
     // Find initial candidate (highest threshold <= RolledValue)
     CandidateIndex = INDEX_NONE
@@ -136,17 +134,15 @@ RollTableInternal(Table, Context, Depth, Stream):
     // Downgrade loop
     while CandidateIndex >= 0:
       Candidate = Table.Entries[CandidateIndex]
-
       if URequirementLibrary::EvaluateAll(Candidate.EntryRequirements, ReqContext):
-        // Requirements passed — use this entry
-        break
+        break   // requirements passed — use this entry
+      else if Candidate.bDowngradeOnRequirementFailed:
+        CandidateIndex -= 1   // walk down
       else:
-        if Candidate.bDowngradeOnRequirementFailed:
-          CandidateIndex -= 1   // try next lower entry
-        else:
-          CandidateIndex = INDEX_NONE   // no reward this roll
-          break
+        CandidateIndex = INDEX_NONE
+        break
 
+    if CandidateIndex < 0: CandidateIndex = INDEX_NONE
     if CandidateIndex == INDEX_NONE: continue   // no reward this roll
 
     SelectedEntry = Table.Entries[CandidateIndex]
@@ -154,9 +150,12 @@ RollTableInternal(Table, Context, Depth, Stream):
     if SelectedEntry.NestedTable is set:
       NestedTable = SelectedEntry.NestedTable.LoadSynchronous()
       if NestedTable:
+        // Recurse — stream is passed through so nested rolls advance the same sequence.
+        // If the nested table produces no rewards, no further downgrade occurs —
+        // downgrade applies only to direct entry selection, not nested table output.
         Results += RollTableInternal(NestedTable, Context, Depth + 1, Stream)
     else:
-      Quantity = ResolveQuantity(SelectedEntry.Quantity, SelectedEntry.QuantityDistribution)
+      Quantity = ResolveQuantity(SelectedEntry.Quantity, SelectedEntry.QuantityDistribution, Stream)
       Results += FLootReward
       {
         RewardType:       SelectedEntry.Reward.RewardType
@@ -178,30 +177,38 @@ FRequirementContext ReqContext = FRequirementContext::ForActor(
     Context.Instigator.IsValid() ? Context.Instigator->GetPawn() : nullptr);
 ```
 
-If `Instigator` is null or stale the context is built with a null actor — requirements that need a valid actor will fail, which is the correct safe fallback. Requirements that are actor-independent (e.g. world-state checks) still evaluate normally.
+If `Instigator` is null or stale the context is built with a null actor — requirements that need a valid actor will fail, which is the correct safe fallback. Requirements that are actor-independent still evaluate normally.
 
 ---
 
 ## Quantity Resolution
 
+`ResolveQuantity` receives the active `FRandomStream*` so that quantity rolls are part of the same deterministic sequence when seeded. When unseeded, `Stream` is null and `FMath::RandRange` is used.
+
 ```cpp
-int32 ResolveQuantity(FInt32Range Range, EQuantityDistribution Distribution)
+int32 ULootRollerSubsystem::ResolveQuantity(
+    FInt32Range           Range,
+    EQuantityDistribution Distribution,
+    FRandomStream*        Stream)
 {
     const int32 Min = Range.GetLowerBoundValue();
     const int32 Max = Range.GetUpperBoundValue();
     if (Min == Max) return Min;
 
+    auto Roll = [&]() -> int32
+    {
+        return Stream ? Stream->RandRange(Min, Max) : FMath::RandRange(Min, Max);
+    };
+
     switch (Distribution)
     {
     case EQuantityDistribution::Uniform:
-        return FMath::RandRange(Min, Max);
+        return Roll();
 
     case EQuantityDistribution::Normal:
         // Triangular approximation: average of two uniform rolls.
-        // No external dependency, bias toward midpoint.
-        const int32 A = FMath::RandRange(Min, Max);
-        const int32 B = FMath::RandRange(Min, Max);
-        return FMath::RoundToInt((A + B) * 0.5f);
+        // Bias toward midpoint, no external dependency.
+        return FMath::RoundToInt((Roll() + Roll()) * 0.5f);
     }
     return Min;
 }
@@ -218,12 +225,18 @@ struct FLootModifier
     float        Bonus;        // additive roll ceiling extension, >= 0
 };
 
-// Opaque handle returned by RegisterModifier. Store to unregister.
+// Opaque handle returned by RegisterModifier. Store and pass to UnregisterModifier.
+// GetTypeHash is defined so FLootModifierHandle can be used as a TMap key.
 struct FLootModifierHandle
 {
     uint32 Id = 0;
     bool IsValid() const { return Id != 0; }
 };
+
+INLINE uint32 GetTypeHash(const FLootModifierHandle& Handle)
+{
+    return GetTypeHash(Handle.Id);
+}
 ```
 
 `ResolveLuckBonus` sums all `FLootModifier` entries where `SourceTag.MatchesTag(Modifier.ContextTag)`, then adds the GAS `Attribute.Luck` value from the instigator's ASC (if present). **No cap is applied by the loot system** — the GAS attribute and buff design are the authoritative ceiling. Negative totals are clamped to 0.0.

@@ -12,7 +12,8 @@ struct GAMECORE_API FLootRollContext
 
     // The player receiving the rewards. Used for requirement evaluation and audit.
     // Must be valid on the server at roll time.
-    UPROPERTY(BlueprintReadWrite)
+    // Not reflected — TWeakObjectPtr is not safe as a UPROPERTY in a transient struct.
+    // Assigned in C++ before passing to RunLootTable.
     TWeakObjectPtr<APlayerState> Instigator;
 
     // Why this roll is happening. Used for modifier lookup and audit.
@@ -23,8 +24,8 @@ struct GAMECORE_API FLootRollContext
     FGameplayTag SourceTag;
 
     // Extends the roll ceiling from 1.0 to (1.0 + LuckBonus).
-    // Resolved by the caller from player buffs, event multipliers, and registered
-    // subsystem modifiers before calling RunLootTable.
+    // Resolved by the caller via ResolveLuckBonus() before calling RunLootTable,
+    // or set directly for scripted scenarios.
     // Must be >= 0.0. Negative values are clamped to 0.0.
     UPROPERTY(BlueprintReadWrite, meta = (ClampMin = "0.0"))
     float LuckBonus = 0.0f;
@@ -32,14 +33,14 @@ struct GAMECORE_API FLootRollContext
     // Optional group actor for group loot scenarios.
     // Null for solo rolls. The fulfillment layer uses this to route to group
     // distribution logic (round-robin, need/greed, etc.) — not used by the roller.
-    UPROPERTY(BlueprintReadWrite)
+    // Not reflected — TWeakObjectPtr is not safe as a UPROPERTY in a transient struct.
     TWeakObjectPtr<AActor> GroupActor;
 
     // Optional deterministic seed.
-    // INDEX_NONE (default) means unseeded — FMath::FRand() is used.
-    // Any other value activates seeded rolling via a single FRandomStream
-    // derived from this value. The FinalSeed is recorded in the audit payload
-    // for CS reproduction of historical rolls.
+    // INDEX_NONE (default, -1) means unseeded — FMath::FRand() is used.
+    // Any other value activates seeded rolling. Note: there is no way to explicitly
+    // request seed value -1; INDEX_NONE is always treated as unseeded.
+    // The derived FinalSeed is recorded in the audit payload for CS reproduction.
     UPROPERTY(BlueprintReadWrite)
     int32 Seed = INDEX_NONE;
 };
@@ -56,12 +57,12 @@ If Context.Seed != INDEX_NONE:
     RandomOffset = FMath::RandRange(0, MAX_int32)   // rolled once, unconditionally
     FinalSeed    = HashCombine(Context.Seed, RandomOffset)
     RollStream   = FRandomStream(FinalSeed)          // single stream, advanced sequentially
-    All rolls (across all RollCount iterations and nested tables) use RollStream.FRandRange()
+    All rolls and quantity resolutions use RollStream — including nested table recursion
 Else:
     All rolls use FMath::FRandRange() — no stream
 ```
 
-Using a **single advancing stream** rather than per-roll seeding ensures that the full sequence of rolls across a table invocation is reproducible from one `FinalSeed`. The `FinalSeed` is recorded in the audit payload, enabling exact reproduction by CS tooling.
+Using a **single advancing stream** ensures that the full sequence of rolls across a table invocation — including nested tables and quantity resolution — is reproducible from one `FinalSeed`. The `FinalSeed` is recorded in the audit payload.
 
 ---
 
@@ -77,4 +78,4 @@ LuckBonus = ULootRollerSubsystem::ResolveLuckBonus(Instigator, SourceTag)
 - Registered subsystem modifiers matching `SourceTag`
 - GAS Luck attribute on `Instigator->GetPawn()`'s ASC (if present)
 
-Callers may override or bypass this and set `LuckBonus` directly for scripted scenarios.
+Callers may set `LuckBonus` directly to bypass this for scripted scenarios.

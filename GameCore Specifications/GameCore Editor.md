@@ -26,11 +26,11 @@ void FGameCoreEditorModule::StartupModule()
         FOnGetDetailCustomizationInstance::CreateStatic(
             &FULootTableCustomization::MakeInstance));
 
-    // FLootTableEntry — ILootRewardable-filtered asset picker
+    // FLootEntryReward — ILootRewardable-filtered asset picker on RewardDefinition
     PropertyModule.RegisterCustomPropertyTypeLayout(
-        FLootTableEntry::StaticStruct()->GetFName(),
+        FLootEntryReward::StaticStruct()->GetFName(),
         FOnGetPropertyTypeCustomizationInstance::CreateStatic(
-            &FFLootTableEntryCustomization::MakeInstance));
+            &FFLootEntryRewardCustomization::MakeInstance));
 }
 
 void FGameCoreEditorModule::ShutdownModule()
@@ -38,8 +38,10 @@ void FGameCoreEditorModule::ShutdownModule()
     if (FPropertyEditorModule* PropertyModule =
         FModuleManager::GetModulePtr<FPropertyEditorModule>("PropertyEditor"))
     {
-        PropertyModule->UnregisterCustomClassLayout(ULootTable::StaticClass()->GetFName());
-        PropertyModule->UnregisterCustomPropertyTypeLayout(FLootTableEntry::StaticStruct()->GetFName());
+        PropertyModule->UnregisterCustomClassLayout(
+            ULootTable::StaticClass()->GetFName());
+        PropertyModule->UnregisterCustomPropertyTypeLayout(
+            FLootEntryReward::StaticStruct()->GetFName());
     }
 }
 ```
