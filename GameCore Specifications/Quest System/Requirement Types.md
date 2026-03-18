@@ -1,34 +1,34 @@
 # Requirement Types
 
 **Sub-page of:** [Quest System](Quest%20System%20Overview.md) 
-**Module:** `PirateGame.Quest` (all types here are quest-module specific)
+**Module:** `GameCore` (quest module within the plugin)
 
-Only requirements whose data is **owned by the quest system** are defined here. Requirements that depend on data from other systems (combat, inventory, group/party) are defined in those systems or in game-module integration layers.
+Only requirements whose data is **owned by the quest system** are defined here.
 
 ---
 
 ## Ownership Rule
 
 > A requirement type belongs to the module that owns its data source.
-> - Kill counts → combat/integration layer (reads `FRequirementPayload` via `URequirement_Persisted`)
-> - Group size → party/group system (reads `IGroupProvider`)
-> - Quest completion state → quest system (`CompletedQuestTags` on `UQuestComponent`)
-> - Quest cooldown → quest system (`LastCompletedTimestamp` on `FQuestRuntime`)
-> - Active quest count → quest system (`ActiveQuests` on `UQuestComponent`)
+> - Kill counts → game module integration layer
+> - Group size → party/group system module
+> - Quest completion state → quest system (`CompletedQuestTags`)
+> - Quest cooldown → quest system (`LastCompletedTimestamp`)
+> - Active quest count → quest system (`ActiveQuests`)
 
 ---
 
 ## `URequirement_QuestCompleted`
 
 **File:** `Quest/Requirements/Requirement_QuestCompleted.h / .cpp` 
-**Inherits:** `URequirement` (GameCore) 
-**Authority:** `Both` — `CompletedQuestTags` is replicated, client can evaluate 
-**`bIsMonotonic`:** `true` by default — completion never un-completes (cadence resets are handled by the quest system removing the tag, not by this requirement)
+**Inherits:** `URequirement` 
+**Authority:** `Both` — `CompletedQuestTags` is replicated 
+**`bIsMonotonic`:** `true` — completion never un-completes
 
 ```cpp
 UCLASS(EditInlineNew, CollapseCategories,
        meta=(DisplayName="Quest Completed"))
-class PIRATEQUESTS_API URequirement_QuestCompleted : public URequirement
+class GAMECORE_API URequirement_QuestCompleted : public URequirement
 {
     GENERATED_BODY()
 public:
@@ -42,15 +42,17 @@ public:
     virtual FRequirementResult Evaluate(
         const FRequirementContext& Context) const override
     {
-        if (!Context.PlayerState)
-            return FRequirementResult::Fail(
-                LOCTEXT("NoPS", "No player state."));
-
-        const UQuestComponent* QC =
-            Context.PlayerState->FindComponentByClass<UQuestComponent>();
+        // Use cached QuestComponent pointer — avoids FindComponentByClass.
+        const UQuestComponent* QC = Context.QuestComponent;
         if (!QC)
-            return FRequirementResult::Fail(
-                LOCTEXT("NoQC", "No quest component on player state."));
+        {
+            // Fallback for contexts not built by UQuestComponent (e.g. editor preview).
+            if (!Context.PlayerState) return FRequirementResult::Fail(
+                LOCTEXT("NoPS", "No player state."));
+            QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
+        }
+        if (!QC) return FRequirementResult::Fail(
+            LOCTEXT("NoQC", "No quest component on player state."));
 
         if (QC->CompletedQuestTags.HasTag(RequiredQuestCompletedTag))
             return FRequirementResult::Pass();
@@ -82,48 +84,58 @@ public:
 ## `URequirement_QuestCooldown`
 
 **File:** `Quest/Requirements/Requirement_QuestCooldown.h / .cpp` 
-**Inherits:** `URequirement_Persisted` (GameCore) 
-**Authority:** `Both` — `LastCompletedTimestamp` is in replicated `FQuestRuntime` 
-**PayloadKey:** Must match `QuestId` (the domain key used by `UQuestComponent::BuildRequirementContext`)
+**Inherits:** `URequirement` (not `URequirement_Persisted` — reads directly from `Context.QuestComponent`) 
+**Authority:** `Both` — `LastCompletedTimestamp` is in replicated `FQuestRuntime`
+
+> **Why not `URequirement_Persisted`?** `LastCompletedTimestamp` is an `int64` but `FRequirementPayload` stores floats which lose precision. Reading directly from `Context.QuestComponent` avoids the precision issue and simplifies the data path. The `PayloadKey` identifies which quest to look up.
 
 ```cpp
 UCLASS(EditInlineNew, CollapseCategories,
        meta=(DisplayName="Quest Cooldown"))
-class PIRATEQUESTS_API URequirement_QuestCooldown : public URequirement_Persisted
+class GAMECORE_API URequirement_QuestCooldown : public URequirement
 {
     GENERATED_BODY()
 public:
+    // Must match the QuestId tag of the quest this cooldown gates.
+    // Used to look up FQuestRuntime::LastCompletedTimestamp.
+    UPROPERTY(EditDefaultsOnly, Category="Requirement",
+              meta=(Categories="Quest.Id"))
+    FGameplayTag QuestIdKey;
+
     UPROPERTY(EditDefaultsOnly, Category="Requirement")
     EQuestResetCadence Cadence = EQuestResetCadence::None;
 
-    // Used only when Cadence == None. Seconds elapsed since last completion.
     UPROPERTY(EditDefaultsOnly, Category="Requirement",
               meta=(EditCondition="Cadence == EQuestResetCadence::None",
                     ClampMin=0.0f))
     float CooldownSeconds = 86400.0f;
 
-    virtual FRequirementResult EvaluateWithPayload(
-        const FRequirementContext& Context,
-        const FRequirementPayload& Payload) const override
+    virtual ERequirementDataAuthority GetDataAuthority() const override
+    { return ERequirementDataAuthority::Both; }
+
+    virtual FRequirementResult Evaluate(
+        const FRequirementContext& Context) const override
     {
-        float LastCompleted = 0.0f;
-        const bool bHasTs = Payload.GetFloat(
-            FGameplayTag::RequestGameplayTag(
-                TEXT("Quest.Counter.LastCompleted")),
-            LastCompleted);
+        const UQuestComponent* QC = Context.QuestComponent;
+        if (!QC)
+        {
+            if (Context.PlayerState)
+                QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
+        }
+        if (!QC) return FRequirementResult::Pass(); // Fail-safe
 
-        if (!bHasTs || LastCompleted <= 0.0f)
-            return FRequirementResult::Pass(); // Never completed, no cooldown
+        const FQuestRuntime* Runtime = QC->FindActiveQuest(QuestIdKey);
+        const int64 LastCompleted = Runtime ? Runtime->LastCompletedTimestamp : 0;
 
-        const int64 LastTs = static_cast<int64>(LastCompleted);
-        const int64 NowTs  = FDateTime::UtcNow().ToUnixTimestamp();
+        if (LastCompleted <= 0) return FRequirementResult::Pass();
+
+        const int64 NowTs = FDateTime::UtcNow().ToUnixTimestamp();
 
         if (Cadence == EQuestResetCadence::None)
         {
-            const int64 Elapsed   = NowTs - LastTs;
-            const int64 Required  = static_cast<int64>(CooldownSeconds);
+            const int64 Required = static_cast<int64>(CooldownSeconds);
+            const int64 Elapsed  = NowTs - LastCompleted;
             if (Elapsed >= Required) return FRequirementResult::Pass();
-
             return FRequirementResult::Fail(
                 FText::Format(
                     LOCTEXT("Cooldown", "Available in {0}s"),
@@ -142,10 +154,15 @@ public:
         else if (Cadence == EQuestResetCadence::Weekly)
             LastReset = Registry->GetLastWeeklyResetTimestamp();
 
-        if (LastTs < LastReset) return FRequirementResult::Pass();
+        if (LastCompleted < LastReset) return FRequirementResult::Pass();
 
+        // Compute next availability without storing it.
+        // Client reads LastCompletedTimestamp from replicated FQuestRuntime
+        // and can compute: NextAvailable = LastCompleted + CooldownSeconds (None)
+        //                  NextAvailable = LastReset + ResetPeriodSeconds (Daily/Weekly)
+        // UI formula: RemainingSeconds = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
         return FRequirementResult::Fail(
-            LOCTEXT("NotReset", "Quest resets daily at 00:00 UTC."));
+            LOCTEXT("NotReset", "Quest not yet reset."));
     }
 
     virtual void GetWatchedEvents_Implementation(
@@ -168,21 +185,40 @@ public:
 };
 ```
 
+### UI Cooldown Countdown Pattern
+
+The client computes availability without any extra replication:
+
+```
+For Cadence == None:
+  NextAvailable = FQuestRuntime::LastCompletedTimestamp + CooldownSeconds
+  Remaining     = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
+  Display:        "Available in Xh Ym"
+
+For Cadence == Daily:
+  NextAvailable = UQuestRegistrySubsystem::GetLastDailyResetTimestamp() + 86400
+  Remaining     = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
+  Display:        "Resets in Xh Ym" (or "Resets tomorrow at 00:00 UTC")
+
+For Cadence == Weekly:
+  NextAvailable = UQuestRegistrySubsystem::GetLastWeeklyResetTimestamp() + 604800
+  Remaining     = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
+```
+
+The UI widget subscribes to `GameCoreEvent.Quest.DailyReset` / `WeeklyReset` to refresh the display when a reset occurs. No additional field needed on `FQuestRuntime`.
+
 ---
 
 ## `URequirement_ActiveQuestCount`
 
 **File:** `Quest/Requirements/Requirement_ActiveQuestCount.h` 
-**Inherits:** `URequirement` (GameCore) 
+**Inherits:** `URequirement` 
 **Authority:** `Both`
 
 ```cpp
-// Passes when the player has fewer than MaxAllowed active quests.
-// Can be placed in UnlockRequirements to prevent a quest appearing
-// as Available when the player is already at capacity.
 UCLASS(EditInlineNew, CollapseCategories,
        meta=(DisplayName="Active Quest Capacity"))
-class PIRATEQUESTS_API URequirement_ActiveQuestCount : public URequirement
+class GAMECORE_API URequirement_ActiveQuestCount : public URequirement
 {
     GENERATED_BODY()
 public:
@@ -192,12 +228,13 @@ public:
     virtual FRequirementResult Evaluate(
         const FRequirementContext& Context) const override
     {
-        if (!Context.PlayerState)
-            return FRequirementResult::Fail(
-                LOCTEXT("NoPS", "No player state."));
-
-        const UQuestComponent* QC =
-            Context.PlayerState->FindComponentByClass<UQuestComponent>();
+        // Use cached QuestComponent pointer — avoids FindComponentByClass.
+        const UQuestComponent* QC = Context.QuestComponent;
+        if (!QC)
+        {
+            if (Context.PlayerState)
+                QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
+        }
         if (!QC) return FRequirementResult::Pass();
 
         if (QC->ActiveQuests.Items.Num() < MaxAllowed)
@@ -222,25 +259,8 @@ public:
 
 ### Tracker-Based Requirements (e.g. Kill Count)
 
-Requirements that count game events (kills, resource gathers, interactions) are defined in the **game module integration layer**, not in the quest system. They inherit `URequirement_Persisted` (GameCore) and read `FRequirementPayload::Counters` injected by `UQuestComponent`'s watcher `ContextBuilder`.
-
-```
-Game module: URequirement_KillCount : public URequirement_Persisted
-  PayloadKey  = QuestId tag
-  CounterTag  = Quest.Counter.Kill.<MobType> (or Quest.Counter.Kill.Any)
-  Reads       = Payload.Counters[CounterTag]
-  WatchedEvents = RequirementEvent.Quest.TrackerUpdated
-```
-
-The tracker value itself is incremented by an external bridge component that subscribes to `GameCoreEvent.Combat.MobKilled` and calls `UQuestComponent::Server_IncrementTracker`. The requirement only reads the result.
+Live in the game module. Inherit `URequirement_Persisted` (GameCore). Read `FRequirementPayload::Counters` via `Context.PersistedData[QuestId]`.
 
 ### Group Size Requirements
 
-Requirements that gate on group membership size belong to the **party/group system module**. They will be specced when a concrete group system is implemented. They read data via `IGroupProvider` (GameCore) and carry `GetDataAuthority() == ServerOnly`.
-
-```
-Group system module: URequirement_GroupSize : public URequirement
-  Reads      = IGroupProvider::GetGroupSize() from Context.PlayerState
-  Authority  = ServerOnly
-  Lives in   = Party/Group system module, NOT quest module
-```
+Live in the party/group system module. Read via `IGroupProvider::GetGroupSize()` from `Context.PlayerState`. `GetDataAuthority() == ServerOnly`.

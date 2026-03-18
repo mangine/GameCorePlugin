@@ -11,10 +11,8 @@ These structs carry per-player mutable quest state. They are replicated, seriali
 **File:** `Quest/Runtime/QuestRuntime.h`
 
 ```cpp
-// One progress counter for a single tracker within an active quest stage.
-// Incremented server-side only via GMS event handlers in UQuestComponent.
 USTRUCT(BlueprintType)
-struct PIRATEQUESTS_API FQuestTrackerEntry
+struct GAMECORE_API FQuestTrackerEntry
 {
     GENERATED_BODY()
 
@@ -22,14 +20,13 @@ struct PIRATEQUESTS_API FQuestTrackerEntry
     UPROPERTY(BlueprintReadOnly)
     FGameplayTag TrackerKey;
 
-    // Current accumulated value. Always >= 0.
-    // Clamped to EffectiveTarget on de-scaling snapshot (party leave).
+    // Current accumulated value. Always >= 0. Clamped to EffectiveTarget.
     UPROPERTY(BlueprintReadOnly)
     int32 CurrentValue = 0;
 
-    // Cached effective target for this player/party configuration.
-    // Recomputed when party size changes. Stored here so the client
-    // can display progress without loading the definition asset.
+    // Effective target for this player/group configuration.
+    // Recomputed when group size changes. Stored so the client can display
+    // progress without loading the definition asset.
     UPROPERTY(BlueprintReadOnly)
     int32 EffectiveTarget = 1;
 };
@@ -45,60 +42,55 @@ struct PIRATEQUESTS_API FQuestTrackerEntry
 
 ```cpp
 USTRUCT(BlueprintType)
-struct PIRATEQUESTS_API FQuestRuntime : public FFastArraySerializerItem
+struct GAMECORE_API FQuestRuntime : public FFastArraySerializerItem
 {
     GENERATED_BODY()
 
-    // Matches UQuestDefinition::QuestId.
     UPROPERTY(BlueprintReadOnly)
     FGameplayTag QuestId;
 
-    // Current stage. Matches a FGameplayTag state in the UStateMachineAsset.
-    // Replicated. Client uses this for UI stage display.
+    // Current stage. Matches a state tag in UQuestDefinition::StageGraph.
     UPROPERTY(BlueprintReadOnly)
     FGameplayTag CurrentStageTag;
 
     // Progress counters for the current stage.
     // Only entries with bReEvaluateOnly=false are present here.
-    // Replicated. Client reads these for progress bar display.
     UPROPERTY(BlueprintReadOnly)
     TArray<FQuestTrackerEntry> Trackers;
 
-    // Role this player has in this quest run.
-    UPROPERTY(BlueprintReadOnly)
-    EQuestMemberRole MemberRole = EQuestMemberRole::Primary;
-
     // Unix timestamp (seconds) of last completion.
-    // Used by URequirement_QuestCooldown and cadence reset checks.
+    // Used by URequirement_QuestCooldown for elapsed-time and cadence checks.
     // 0 = never completed.
     UPROPERTY(BlueprintReadOnly)
     int64 LastCompletedTimestamp = 0;
 
-    // ── FFastArraySerializer callbacks ────────────────────────────────────────
-    // Called on the client when this entry is added, updated, or removed.
-    // UQuestComponent uses these to trigger UI events.
+    // ── FFastArraySerializer callbacks ──────────────────────────────────────
     void PostReplicatedAdd(const struct FQuestRuntimeArray& Array);
     void PostReplicatedChange(const struct FQuestRuntimeArray& Array);
     void PreReplicatedRemove(const struct FQuestRuntimeArray& Array);
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    FQuestTrackerEntry* FindTracker(const FGameplayTag& TrackerKey)
+    FQuestTrackerEntry* FindTracker(const FGameplayTag& Key)
     {
         return Trackers.FindByPredicate(
-            [&](const FQuestTrackerEntry& E){ return E.TrackerKey == TrackerKey; });
+            [&](const FQuestTrackerEntry& E){ return E.TrackerKey == Key; });
     }
-
-    const FQuestTrackerEntry* FindTracker(const FGameplayTag& TrackerKey) const
+    const FQuestTrackerEntry* FindTracker(const FGameplayTag& Key) const
     {
         return Trackers.FindByPredicate(
-            [&](const FQuestTrackerEntry& E){ return E.TrackerKey == TrackerKey; });
+            [&](const FQuestTrackerEntry& E){ return E.TrackerKey == Key; });
     }
 };
+```
 
-// FastArray container. Lives as a UPROPERTY in UQuestComponent.
+> **Note on `EQuestMemberRole`:** Member role (Primary/Helper) is specific to the shared quest extension and lives only on the shared quest runtime, not in the base `FQuestRuntime`. See `USharedQuestCoordinator` for the shared extension's runtime data.
+
+---
+
+## `FQuestRuntimeArray`
+
+```cpp
 USTRUCT()
-struct PIRATEQUESTS_API FQuestRuntimeArray : public FFastArraySerializer
+struct GAMECORE_API FQuestRuntimeArray : public FFastArraySerializer
 {
     GENERATED_BODY()
 
@@ -127,18 +119,16 @@ struct TStructOpsTypeTraits<FQuestRuntimeArray>
 | Field | Replicated | Notes |
 |---|---|---|
 | `ActiveQuests` | Yes — FFastArraySerializer | Delta replicated per-item to owning client only |
-| `CompletedQuestTags` | Yes — `ReplicatedUsing` | Full tag container, changes infrequent |
-| `FQuestTrackerEntry::CurrentValue` | Yes (part of FQuestRuntime) | Client uses for progress bars |
-| `FQuestTrackerEntry::EffectiveTarget` | Yes (part of FQuestRuntime) | Needed client-side for progress display |
-| `LastCompletedTimestamp` | Yes (part of FQuestRuntime) | Client shows cooldown countdown |
+| `CompletedQuestTags` | Yes — `ReplicatedUsing` | Full tag container, infrequent changes |
+| `FQuestTrackerEntry::CurrentValue` | Yes | Client uses for progress bars |
+| `FQuestTrackerEntry::EffectiveTarget` | Yes | Needed client-side for progress display |
+| `LastCompletedTimestamp` | Yes | Client computes cooldown countdown from this |
 
-> **Owning client only.** Quest runtime data is replicated only to the player who owns it. No other client sees another player's quest state. Party progress is shown via a separate party HUD channel, not by replicating FQuestRuntime to all party members.
+> **Owning client only.** Quest runtime data is replicated only to the player who owns it.
 
 ---
 
 ## Building `FRequirementContext` from `FQuestRuntime`
-
-This is how `UQuestComponent` injects tracker data into the requirement context before evaluation:
 
 ```cpp
 FRequirementContext UQuestComponent::BuildRequirementContext(
@@ -146,70 +136,151 @@ FRequirementContext UQuestComponent::BuildRequirementContext(
     const UQuestDefinition* Definition) const
 {
     FRequirementContext Ctx;
-    Ctx.PlayerState = GetOwner<APlayerState>();
-    Ctx.World       = GetWorld();
-    Ctx.Instigator  = Ctx.PlayerState
-        ? Ctx.PlayerState->GetPawn() : nullptr;
+    Ctx.PlayerState   = GetOwner<APlayerState>();
+    Ctx.World         = GetWorld();
+    Ctx.Instigator    = Ctx.PlayerState ? Ctx.PlayerState->GetPawn() : nullptr;
+    Ctx.QuestComponent = const_cast<UQuestComponent*>(this); // cached for requirements
 
-    // Build one payload per stage, keyed by a domain tag.
-    // Convention: Quest.Payload.<QuestName>.<StageName>
-    // For simplicity, one payload per active quest keyed by QuestId.
     FRequirementPayload Payload;
     for (const FQuestTrackerEntry& Tracker : QuestRuntime.Trackers)
-    {
         Payload.Counters.Add(Tracker.TrackerKey, Tracker.CurrentValue);
-    }
 
-    // Also expose LastCompletedTimestamp as a float for cooldown requirements.
-    if (QuestRuntime.LastCompletedTimestamp > 0)
-    {
-        Payload.Floats.Add(
-            FGameplayTag::RequestGameplayTag(TEXT("Quest.Counter.LastCompleted")),
-            static_cast<float>(QuestRuntime.LastCompletedTimestamp));
-    }
-
-    Ctx.PersistedData.Add(QuestRuntime.QuestId, Payload);
+    Ctx.PersistedData.Add(QuestRuntime.QuestId, MoveTemp(Payload));
     return Ctx;
 }
 ```
 
-> **Note:** The payload key is `QuestId`. `URequirement_Persisted` instances on this quest's requirement lists must have `PayloadKey` set to the same `QuestId` tag. This is validated in `UQuestDefinition::IsDataValid`.
+> `QuestComponent` is set directly so requirements like `URequirement_QuestCompleted` and `URequirement_ActiveQuestCount` can access quest state without `FindComponentByClass`. `LastCompletedTimestamp` is no longer injected into the payload — `URequirement_QuestCooldown` reads it directly from `Ctx.QuestComponent->FindActiveQuest(PayloadKey)`.
 
 ---
 
-## Persistence Serialization
+## Persistence: `Serialize_Save` and `Serialize_Load`
 
-`UQuestComponent` implements `IPersistableComponent`. Serialization format:
+**Schema version: 1**
+
+Both methods live on `UQuestComponent`. Tags are serialized as `FName` strings for forward compatibility across tag list changes.
 
 ```cpp
 void UQuestComponent::Serialize_Save(FArchive& Ar)
 {
-    // CompletedQuestTags — serialized as array of tag names
+    // CompletedQuestTags
     TArray<FName> TagNames;
-    CompletedQuestTags.GetGameplayTagArray().ForEach(
-        [&](const FGameplayTag& T){ TagNames.Add(T.GetTagName()); });
+    for (const FGameplayTag& T : CompletedQuestTags)
+        TagNames.Add(T.GetTagName());
     Ar << TagNames;
 
     // ActiveQuests
     int32 Count = ActiveQuests.Items.Num();
     Ar << Count;
-    for (FQuestRuntime& Q : ActiveQuests.Items)
+    for (const FQuestRuntime& Q : ActiveQuests.Items)
     {
-        FName QuestIdName = Q.QuestId.GetTagName();
-        FName StageTagName = Q.CurrentStageTag.GetTagName();
+        FName QuestIdName   = Q.QuestId.GetTagName();
+        FName StageTagName  = Q.CurrentStageTag.GetTagName();
         Ar << QuestIdName << StageTagName;
-        Ar << Q.MemberRole;
         Ar << Q.LastCompletedTimestamp;
 
         int32 TrackerCount = Q.Trackers.Num();
         Ar << TrackerCount;
-        for (FQuestTrackerEntry& T : Q.Trackers)
+        for (const FQuestTrackerEntry& T : Q.Trackers)
         {
             FName TrackerKeyName = T.TrackerKey.GetTagName();
             Ar << TrackerKeyName << T.CurrentValue << T.EffectiveTarget;
         }
     }
 }
+
+void UQuestComponent::Serialize_Load(FArchive& Ar, uint32 SavedVersion)
+{
+    // CompletedQuestTags
+    TArray<FName> TagNames;
+    Ar << TagNames;
+    CompletedQuestTags.Reset();
+    for (const FName& Name : TagNames)
+    {
+        FGameplayTag Tag = FGameplayTag::RequestGameplayTag(Name, false);
+        if (Tag.IsValid())
+            CompletedQuestTags.AddTag(Tag);
+        else
+            UE_LOG(LogQuest, Warning,
+                TEXT("Serialize_Load: Unknown CompletedQuestTag '%s' — skipped."),
+                *Name.ToString());
+    }
+
+    // ActiveQuests
+    int32 Count = 0;
+    Ar << Count;
+    ActiveQuests.Items.Reset();
+    for (int32 i = 0; i < Count; ++i)
+    {
+        FName QuestIdName, StageTagName;
+        Ar << QuestIdName << StageTagName;
+
+        FGameplayTag QuestId  = FGameplayTag::RequestGameplayTag(QuestIdName,  false);
+        FGameplayTag StageTag = FGameplayTag::RequestGameplayTag(StageTagName, false);
+
+        int64 LastCompleted = 0;
+        Ar << LastCompleted;
+
+        int32 TrackerCount = 0;
+        Ar << TrackerCount;
+
+        TArray<FQuestTrackerEntry> Trackers;
+        for (int32 j = 0; j < TrackerCount; ++j)
+        {
+            FName TrackerKeyName;
+            int32 CurrentValue = 0, EffectiveTarget = 1;
+            Ar << TrackerKeyName << CurrentValue << EffectiveTarget;
+
+            FGameplayTag TrackerKey =
+                FGameplayTag::RequestGameplayTag(TrackerKeyName, false);
+            if (TrackerKey.IsValid())
+            {
+                FQuestTrackerEntry Entry;
+                Entry.TrackerKey     = TrackerKey;
+                Entry.CurrentValue   = CurrentValue;
+                Entry.EffectiveTarget = EffectiveTarget;
+                Trackers.Add(Entry);
+            }
+            else
+            {
+                UE_LOG(LogQuest, Warning,
+                    TEXT("Serialize_Load: Unknown TrackerKey '%s' in quest '%s' — skipped."),
+                    *TrackerKeyName.ToString(), *QuestIdName.ToString());
+            }
+        }
+
+        // Skip entire quest runtime if either core tag is unknown.
+        // This prevents a broken FQuestRuntime from entering ActiveQuests.
+        if (!QuestId.IsValid() || !StageTag.IsValid())
+        {
+            UE_LOG(LogQuest, Warning,
+                TEXT("Serialize_Load: Quest '%s' or stage '%s' tag unknown — skipped."),
+                *QuestIdName.ToString(), *StageTagName.ToString());
+            continue;
+        }
+
+        FQuestRuntime Runtime;
+        Runtime.QuestId               = QuestId;
+        Runtime.CurrentStageTag       = StageTag;
+        Runtime.LastCompletedTimestamp = LastCompleted;
+        Runtime.Trackers              = MoveTemp(Trackers);
+        ActiveQuests.Items.Add(MoveTemp(Runtime));
+    }
+
+    ActiveQuests.MarkArrayDirty();
+}
+
+void UQuestComponent::Migrate(FArchive& Ar, uint32 FromVersion, uint32 ToVersion)
+{
+    // v1 → future: add migration steps here as the serialization layout evolves.
+    // Additive-only changes (new fields with defaults) do not require migration.
+    // Structural changes (removed fields, renamed trackers) must be handled here.
+    // Log all migrations with UE_LOG(LogQuest, ...) for live-ops diagnostics.
+}
 ```
 
-> Tags are serialized as `FName` (tag name string) rather than raw indices for forward compatibility across tag list changes.
+---
+
+## Post-Load: Validate and Register
+
+After `Serialize_Load` completes, `UQuestComponent::BeginPlay` (server path) calls `ValidateActiveQuestsOnLogin` followed by watcher registration. See `UQuestComponent.md` for the full ordered flow.

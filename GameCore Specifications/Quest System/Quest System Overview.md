@@ -1,6 +1,6 @@
 # Quest System
 
-**Module:** `PirateGame.Quest` (game module, not GameCore plugin) 
+**Module:** `GameCore` (plugin) 
 **Status:** Specification — Pending Implementation 
 **UE Version:** 5.7 
 **Depends On:** GameCore (Requirement System, State Machine System, Serialization System, Event Bus)
@@ -26,15 +26,17 @@
 ## Design Principles
 
 - **Quest definitions are shared, immutable, server-loaded assets.** No per-player state lives in `UQuestDefinition`. The definition is the schema; `FQuestRuntime` is the instance.
-- **The State Machine asset is the stage graph.** `UStateMachineAsset` drives stage transition logic. `UQuestComponent` reads the asset directly — `UStateMachineComponent` is NOT added to `APlayerState`. Stage progression is tracked via `FQuestRuntime::CurrentStageTag`.
-- **Requirements evaluate against injected data.** Progress counters live in `FQuestTrackerEntry` and are injected into `FRequirementContext::PersistedData` via the watcher's `ContextBuilder` at evaluation time. Requirements are stateless.
-- **`UQuestComponent` exposes a tracker increment API. It has zero GMS subscriptions.** External integration layers (game module) call `Server_IncrementTracker` when relevant events occur. The quest system never subscribes to combat, inventory, or any other system's events directly.
-- **The watcher handles unlock detection. Completion is evaluated on tracker increment.** `URequirementWatcherComponent` watches `UnlockRequirements` reactively for all candidate quests. Stage `CompletionRequirements` are evaluated imperatively when `Server_IncrementTracker` is called and a tracker reaches its target — not through the watcher's flush cycle.
-- **Authority is quest-level, not call-site.** `EQuestCheckAuthority` on `UQuestDefinition` determines whether unlock/completion validation runs server-first or client-first.
+- **The State Machine asset is the stage graph.** `UStateMachineAsset` drives stage transition logic. `UQuestComponent` reads the asset directly via `UStateMachineAsset::FindFirstPassingTransition` — `UStateMachineComponent` is NOT added to `APlayerState`. Stage progression is tracked via `FQuestRuntime::CurrentStageTag`.
+- **Stage transitions use `UQuestTransitionRule`.** A `UTransitionRule` subclass that evaluates a `URequirementList` against the quest’s `FRequirementContext`. Designers author branching stage graphs using the same requirement system as everywhere else.
+- **Requirements evaluate against injected data.** Progress counters live in `FQuestTrackerEntry` and are injected into `FRequirementContext::PersistedData` via the watcher’s `ContextBuilder` at evaluation time. Requirements are stateless.
+- **`UQuestComponent` exposes a tracker increment API. It has zero GMS subscriptions.** External integration layers call `Server_IncrementTracker` when relevant events occur. The quest system never subscribes to combat, inventory, or any other system’s events.
+- **Completion is evaluated imperatively on tracker increment.** When a tracker reaches its `EffectiveTarget`, `UQuestComponent` immediately evaluates `CompletionRequirements` and resolves the stage. The watcher flush is not involved in completion evaluation.
+- **Unlock requirements use the watcher reactively.** `URequirementWatcherComponent` watches `UnlockRequirements` for all candidate quests. Authority is per-quest (`EQuestCheckAuthority`): `ServerAuthoritative` runs watcher server-only; `ClientValidated` runs watcher on both sides with server re-validation.
+- **Authority is quest-level, not call-site.** `EQuestCheckAuthority` on `UQuestDefinition` governs both unlock and completion validation paths.
 - **Available quests are not persisted.** Only `ActiveQuests` and `CompletedQuestTags` are saved. Available quests are recalculated on login by re-running watcher evaluation.
-- **`bEnabled` is a live-ops kill switch.** Disabled quests are filtered from candidate lists. Active quests whose definition has `bEnabled = false` are removed from `ActiveQuests` on login without polluting `CompletedQuestTags`.
+- **`bEnabled` is a live-ops kill switch.** Disabled quests are filtered from candidate lists. Active disabled quests are removed on login without polluting `CompletedQuestTags`.
 - **The quest system emits events; it never calls other systems.** Rewards, journal, achievements, and UI are downstream consumers of GMS events.
-- **Shared quest support is a fully optional extension.** `USharedQuestComponent` inherits `UQuestComponent`. `USharedQuestDefinition` inherits `UQuestDefinition`. Dropping in the base types gives a complete solo quest system. The shared extension is opt-in per game.
+- **Shared quest support is a fully optional extension.** Dropping in the base types gives a complete solo quest system. The shared extension is opt-in.
 
 ---
 
@@ -42,21 +44,23 @@
 
 ```
 EQuestCheckAuthority::ServerAuthoritative
-  Server evaluates UnlockRequirements / CompletionRequirements.
-  On pass: server fires ClientRPC_NotifyQuestEvent to owning client.
+  Unlock watcher: runs SERVER only.
+    On pass → server fires ClientRPC_NotifyQuestEvent(BecameAvailable).
+  Completion: server evaluates, notifies client via ClientRPC.
   Use for: SingleAttempt quests, story gates, high-value rewards.
 
 EQuestCheckAuthority::ClientValidated
-  Client evaluates requirements using replicated FQuestRuntime data + injected payload.
-  On pass: client fires ServerRPC_RequestValidation(QuestId, StageTag).
-  Server re-evaluates from authoritative context (ContextBuilder called server-side).
-  On server pass: server fires ClientRPC_NotifyQuestEvent.
+  Unlock watcher: runs on SERVER and OWNING CLIENT.
+    Client watcher fires ServerRPC_RequestAccept on pass (UI responsiveness).
+    Server re-evaluates from authoritative context — never trusts client result.
+  Completion: client watcher fires ServerRPC_RequestValidation on pass.
+    Server re-evaluates authoritatively. Never trusts client result.
   Use for: common side quests, daily quests, high-volume quests.
 ```
 
 The `URequirementWatcherComponent` runs on:
-- **Server always** — for `ServerAuthoritative` quests, drives unlock RPCs to client
-- **Owning client** — for `ClientValidated` quests, drives local UI feedback and triggers server validation RPCs
+- **Server always** — evaluates all registered unlock sets authoritatively
+- **Owning client** — for `ClientValidated` quests only, drives UI feedback and triggers server RPCs
 
 ---
 
@@ -65,9 +69,9 @@ The `URequirementWatcherComponent` runs on:
 `UQuestComponent::Server_IncrementTracker` is a public server-side API. It is called by whatever system in the game module owns the relevant event. The quest system has no knowledge of what triggered the increment.
 
 ```
-Game module (e.g. UQuestTrackerBridge component on PlayerState):
+Game module (e.g. UQuestTrackerBridge on APlayerState):
   Subscribes to GameCoreEvent.Combat.MobKilled
-  On event: resolves QuestId and TrackerKey from the killed mob's data
+  Resolves QuestId and TrackerKey from the killed mob’s data
   Calls UQuestComponent::Server_IncrementTracker(QuestId, TrackerKey, 1)
 
 UQuestComponent:
@@ -78,7 +82,7 @@ UQuestComponent:
   Fires GameCoreEvent.Quest.TrackerUpdated
 ```
 
-This wiring bridge lives entirely in the game module — not in the quest system and not in the combat system.
+This wiring bridge lives entirely in the game module.
 
 ---
 
@@ -92,11 +96,9 @@ This wiring bridge lives entirely in the game module — not in the quest system
 [Failed / Completed] ──(Lifecycle rules)──> [Locked | Available | Active]
 ```
 
-Lifecycle rules per `EQuestLifecycle`:
-
 | Lifecycle | On Fail | On Complete |
 |---|---|---|
-| `SingleAttempt` | Permanently closed, `CompletedQuestTags` receives fail tag | Permanently closed |
+| `SingleAttempt` | Permanently closed, `QuestCompletedTag` added | Permanently closed |
 | `RetryUntilComplete` | Reset to Available (cooldown if set) | Permanently closed |
 | `RetryAndAssist` | Reset to Available (cooldown if set) | Player can re-enter as Helper |
 | `Evergreen` | Reset to Available (cooldown if set) | Reset to Available (cooldown if set) |
