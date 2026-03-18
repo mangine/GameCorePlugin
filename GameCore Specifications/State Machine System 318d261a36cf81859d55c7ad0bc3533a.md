@@ -42,6 +42,8 @@ The State Machine System is a data-driven, event-driven, graph-based finite stat
 - `RequestTransition(TargetStateTag)` — forced move, owning system has already validated.
 - `EvaluateTransitions(ContextObject)` — machine checks its rules; first passing rule wins.
 
+**Asset-only evaluation (no component).** Systems that manage their own runtime (e.g. `UQuestComponent` tracking `FQuestRuntime::CurrentStageTag` directly) call `UStateMachineAsset::FindFirstPassingTransition` to evaluate transitions without needing a `UStateMachineComponent`.
+
 **State change.** On transition: `OnExit` → runtime update → `OnEnter` → `OnStateChanged` delegate fires → GMS broadcast fires → `NotifyDirty` called (if `bPersistState`).
 
 **Client reception.** Clients with `AuthorityMode == Both` receive the replicated `FGameplayTag`. `OnStateChanged` fires locally for cosmetics and UI sync.
@@ -90,8 +92,42 @@ public:
 #endif
 
     UStateNodeBase* FindNode(const FGameplayTag& StateTag) const;
+
+    // Pure utility for systems that evaluate transitions without a UStateMachineComponent.
+    // Returns the ToState tag of the first transition from FromStateTag whose rule passes
+    // against ContextObject, or an invalid tag if none pass.
+    // AnyState transitions are evaluated first (highest priority), then
+    // FromState-specific transitions in definition order.
+    // ContextObject is passed through verbatim to UTransitionRule::Evaluate.
+    // Pass nullptr for ContextObject when rules do not require context.
+    FGameplayTag FindFirstPassingTransition(
+        const FGameplayTag& FromStateTag,
+        UObject* ContextObject = nullptr) const;
 };
 ```
+
+```cpp
+FGameplayTag UStateMachineAsset::FindFirstPassingTransition(
+    const FGameplayTag& FromStateTag,
+    UObject* ContextObject) const
+{
+    // AnyState transitions evaluated first — highest priority.
+    for (const FStateTransition& T : AnyStateTransitions)
+    {
+        if (!T.Rule || T.Rule->Evaluate(nullptr, ContextObject))
+            return T.ToState;
+    }
+    for (const FStateTransition& T : Transitions)
+    {
+        if (T.FromState == FromStateTag
+            && (!T.Rule || T.Rule->Evaluate(nullptr, ContextObject)))
+            return T.ToState;
+    }
+    return FGameplayTag(); // No passing transition found
+}
+```
+
+> **`UStateMachineComponent*` is passed as `nullptr`.** `FindFirstPassingTransition` is used by systems (like `UQuestComponent`) that do not host a `UStateMachineComponent`. Rules that require the component pointer (e.g. time-in-state checks) are not suitable for context-only evaluation and must not be used in quest stage graphs.
 
 ---
 
@@ -461,16 +497,34 @@ void UStateMachineComponent::RestoreState(const FGameplayTag& SavedStateTag)
 
 ```
 GameCore/
-  UStateMachineAsset
+  UStateMachineAsset        — FindFirstPassingTransition for asset-only evaluation
   UStateNodeBase
   UTransitionRule
   UStateMachineComponent
 
-Game / QuestPlugin/
-  UQuestStateMachineAsset  : UStateMachineAsset
-  UQuestStateNode          : UStateNodeBase
-  UQuestTransitionRule     : UTransitionRule
+GameCore Quest module/
+  UQuestStateNode           : UStateNodeBase
+    + bIsCompletionState      — UQuestComponent triggers complete flow on enter
+    + bIsFailureState         — UQuestComponent triggers fail flow on enter
+    + OnEnter / OnExit        — no-op (quest side effects driven by UQuestComponent)
+
+  UQuestTransitionRule      : UTransitionRule
+    + Requirements: URequirementList
+    + Evaluate(Component, ContextObject):
+        Cast ContextObject to FRequirementContext*
+        Return Requirements->Evaluate(*Ctx).bPassed
 ```
+
+## `UQuestStateNode` and `UQuestTransitionRule`
+
+These are defined in the GameCore Quest module (`GameCore/Source/GameCore/Quest/`). See `GameCore Changes.md` in the Quest System specification for full class declarations.
+
+**Authoring a branching quest stage graph:**
+1. Create a `UStateMachineAsset` for the quest.
+2. Add `UQuestStateNode` instances for each stage — mark terminal nodes with `bIsCompletionState` or `bIsFailureState`.
+3. Draw transitions between nodes. Set `Rule` to a `UQuestTransitionRule` instance and author `Requirements` in the Details panel.
+4. Multiple outgoing transitions from the same stage express branching — `FindFirstPassingTransition` picks the first passing rule.
+5. Assign the asset to `UQuestDefinition::StageGraph`.
 
 ---
 
@@ -481,6 +535,7 @@ Game / QuestPlugin/
 - **History is not replicated.** Clients reconstruct from `OnStateChanged` / GMS events.
 - **Hierarchical FSMs deferred.** Multiple machines communicate via GMS state-changed events and Gameplay Tags.
 - **Post-load `GrantedTags` reconciliation is caller responsibility.** `RestoreState` does not replay `OnEnter`. Any state that grants tags or activates abilities must be re-applied by the owning system after loading. See Persistence section above.
+- **`FindFirstPassingTransition` passes `nullptr` as `UStateMachineComponent*`.** Rules that require the component pointer are not compatible with asset-only evaluation contexts such as quest stage graphs.
 
 ---
 
@@ -519,3 +574,4 @@ GameCore/
 - **`GetPersistenceKey()` must never be renamed after shipping** — it is the blob identifier in saved payloads. If an actor hosts multiple `UStateMachineComponent` instances, each must have a unique `PersistenceKeyOverride` set.
 - **`Serialize_Save` must be strictly read-only** — no state mutation during serialization.
 - **`NotifyDirty` is called only on the server** (`HasAuthority()`) inside `EnterState`, gated by `bPersistState`.
+- **`FindFirstPassingTransition` is pure** — no state mutation, safe to call from const contexts.

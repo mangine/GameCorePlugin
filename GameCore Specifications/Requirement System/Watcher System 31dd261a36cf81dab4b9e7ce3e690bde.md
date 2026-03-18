@@ -83,10 +83,17 @@ public:
     // Collects watched events from all requirements in the list.
     // Allocates a FRequirementSetRuntime with a parallel cache array.
     // Authority is read from List->Authority — no override parameter exists by design.
+    //
+    // ContextBuilder (optional): called immediately before every evaluation flush
+    // to inject additional data into FRequirementContext — e.g. FRequirementPayload
+    // entries from UQuestComponent tracker state, or any other per-evaluation data
+    // the owning system needs to supply. If null, context is built from PlayerState only.
+    //
     // Returns a handle the owning system must store to unregister later.
     FRequirementSetHandle RegisterSet(
         URequirementList* List,
-        FOnRequirementSetDirty OnDirty);
+        FOnRequirementSetDirty OnDirty,
+        TFunction<void(FRequirementContext&)> ContextBuilder = nullptr);
 
     // Removes all subscriptions and cache for this set.
     // Call when the quest completes, the ability is unlocked, or the system no longer
@@ -102,6 +109,7 @@ public:
     // ── Manual Evaluation ────────────────────────────────────────────────────
 
     // Forces immediate evaluation of a specific set, bypassing the flush timer.
+    // Calls the set's ContextBuilder (if bound) before evaluating.
     // Use for one-shot checks that cannot wait for the next flush window.
     FRequirementResult EvaluateSetNow(FRequirementSetHandle Handle,
                                       const FRequirementContext& Context);
@@ -126,6 +134,38 @@ private:
     void StartFlushTimerIfNeeded();
     void FlushPendingEvaluations();
     void EvaluateSetInternal(FRequirementSetRuntime& Runtime);
+    FRequirementContext BuildContext() const;
+};
+```
+
+---
+
+# `FRequirementSetRuntime` — Updated
+
+`ContextBuilder` is stored per registered set so it is called every flush for that set only:
+
+```cpp
+USTRUCT()
+struct FRequirementSetRuntime
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    TObjectPtr<URequirementList> Asset;
+
+    TArray<ERequirementCacheState> CachedResults;
+
+    ERequirementEvalAuthority Authority = ERequirementEvalAuthority::ServerOnly;
+
+    FRequirementSetHandle Handle;
+
+    FOnRequirementSetDirty OnDirty;
+
+    // Optional. Called immediately before evaluation to inject payload data,
+    // quest tracker state, or any other context the owning system needs to supply.
+    // Stored as TFunction — owning system captures whatever it needs via lambda.
+    // Null if the owning system has no additional context to inject.
+    TFunction<void(FRequirementContext&)> ContextBuilder;
 };
 ```
 
@@ -167,8 +207,6 @@ void URequirementWatcherComponent::FlushPendingEvaluations()
     // Move to local copy so dirty marks fired during evaluation queue for next flush.
     TSet<FRequirementSetHandle> ToEvaluate = MoveTemp(PendingDirtySet);
 
-    FRequirementContext Ctx = BuildContext(); // constructs from owning PlayerState
-
     for (const FRequirementSetHandle& Handle : ToEvaluate)
     {
         FRequirementSetRuntime* Runtime = RegisteredSets.Find(Handle.Id);
@@ -182,18 +220,27 @@ void URequirementWatcherComponent::FlushPendingEvaluations()
 - `TSet` deduplicates: 20 `ItemAdded` events for the same quest set = 1 evaluation.
 - Timer starts only on the **first** dirty mark. Subsequent marks in the same window do not reset the timer, bounding worst-case latency to `FlushDelaySeconds`.
 - `MoveTemp` atomically clears the pending set before evaluation, so events fired *during* evaluation correctly queue for the next flush rather than being lost.
+- Note: `BuildContext()` is no longer called at the flush level — each set calls its own `ContextBuilder` individually inside `EvaluateSetInternal`, so different sets can inject different data in the same flush.
 
 ---
 
 # Per-Requirement Cache During Evaluation
 
-During `EvaluateSetInternal`, each requirement's result is checked against its cache entry before calling `Evaluate`:
+During `EvaluateSetInternal`, the set's `ContextBuilder` is invoked first to inject payload data, then each requirement is evaluated against the enriched context:
 
 ```cpp
 void URequirementWatcherComponent::EvaluateSetInternal(FRequirementSetRuntime& Runtime)
 {
     TArray<URequirement*> AllRequirements = Runtime.Asset->GetAllRequirements();
+
+    // Build base context from owning PlayerState.
     FRequirementContext Ctx = BuildContext();
+
+    // Allow owning system to inject additional data (tracker payloads, etc.).
+    // This is how UQuestComponent injects FRequirementPayload for persisted requirements.
+    if (Runtime.ContextBuilder)
+        Runtime.ContextBuilder(Ctx);
+
     bool bAllPassed = true;
 
     for (int32 i = 0; i < AllRequirements.Num(); ++i)
@@ -212,8 +259,6 @@ void URequirementWatcherComponent::EvaluateSetInternal(FRequirementSetRuntime& R
         if (!Result.bPassed)
         {
             bAllPassed = false;
-            // For a list (AND-all) we can short-circuit here.
-            // For an expression set, the set's Evaluate() handles short-circuiting internally.
             break;
         }
     }
@@ -223,7 +268,36 @@ void URequirementWatcherComponent::EvaluateSetInternal(FRequirementSetRuntime& R
 }
 ```
 
-**Cache entries are parallel to `GetAllRequirements()`.** No `TMap` involved — lookup is array index O(1). Cache array is sized at `RegisterSet` time.
+**`ContextBuilder` contract:**
+- Called on every flush for this set — must be cheap. No async work, no allocations beyond map inserts.
+- Captures owning system state via lambda. The lambda is stored in `FRequirementSetRuntime` — ensure captured objects are guarded with `TWeakObjectPtr` to avoid dangling references.
+- Must not call `RegisterSet` or `UnregisterSet` — re-entrant watcher mutation is not supported.
+
+**Example — UQuestComponent injecting tracker payload:**
+```cpp
+// At RegisterSet time in UQuestComponent:
+FGameplayTag QuestId = Runtime.QuestId;
+TWeakObjectPtr<UQuestComponent> WeakThis = this;
+
+FRequirementSetHandle Handle = Watcher->RegisterSet(
+    StageDef->CompletionRequirements,
+    FOnRequirementSetDirty::CreateUObject(this, &UQuestComponent::OnCompletionWatcherChanged),
+    [WeakThis, QuestId](FRequirementContext& Ctx)
+    {
+        if (UQuestComponent* QC = WeakThis.Get())
+        {
+            // Find the active runtime and inject tracker data as payload.
+            if (const FQuestRuntime* QR = QC->FindActiveQuest(QuestId))
+            {
+                FRequirementPayload Payload;
+                for (const FQuestTrackerEntry& T : QR->Trackers)
+                    Payload.Counters.Add(T.TrackerKey, T.CurrentValue);
+                Ctx.PersistedData.Add(QuestId, Payload);
+            }
+        }
+    }
+);
+```
 
 ---
 
@@ -233,7 +307,7 @@ void URequirementWatcherComponent::EvaluateSetInternal(FRequirementSetRuntime& R
 
 **Registration timing.** `RegisterSet` should be called after `APlayerState::BeginPlay` completes and all data components are initialized. For replicated systems, guard registration behind an `OnRep` or an explicit server-driven initialization RPC — not blindly in `BeginPlay`.
 
-**Startup evaluation pass.** On the first `RegisterSet` call, the component performs a full synchronous evaluation of all requirements in the set to populate the cache. This is the only time a full pass runs; subsequent evaluations are dirty-only.
+**Startup evaluation pass.** On the first `RegisterSet` call, the component performs a full synchronous evaluation of all requirements in the set to populate the cache. The `ContextBuilder` is invoked during this pass exactly as it is during flush evaluations.
 
 **Logout / PlayerState destruction.** `EndPlay` on the component calls `URequirementWatcherManager::UnregisterWatcher` and clears all registered sets. Owning systems do not need to manually unregister all handles on logout — the component cleanup handles it.
 
@@ -251,8 +325,9 @@ RequirementEvent
   │     ├── ItemAdded
   │     └── ItemRemoved
   ├── Quest
-  │     ├── QuestCompleted
-  │     └── QuestActivated
+  │     ├── TrackerUpdated
+  │     ├── StageChanged
+  │     └── Completed
   ├── Reputation
   │     └── ReputationChanged
   └── Tag
@@ -282,7 +357,7 @@ The watcher component respects the `ERequirementEvalAuthority` set on each `FReq
 
 ```
 Client flush → all requirements pass → Client fires Server_ValidateRequirementSet(Handle)
-  → Server re-evaluates from server context
+  → Server re-evaluates from server context (ContextBuilder called server-side too)
   → If pass: server takes the gated action (unlock quest, grant reward, etc.)
   → If fail: server discards and optionally sends ClientRPC with failure reason
 ```
@@ -309,6 +384,7 @@ The owning system decides what to do with the result — update UI, unlock a que
 
 - **Flush delay adds latency.** Quest unlock or UI refresh may lag up to `FlushDelaySeconds` after the triggering event. This is intentional — tune per system. Reduce to 0.1s for UI-facing sets if needed.
 - **`NotifyWorldEvent` is O(players watching tag).** Avoid for high-frequency events. World-scoped events like zone entry should be routed per-player where possible.
-- **No cross-player aggregate requirements.** A set requiring "20 players in this zone" does not map to per-player watcher logic. Such aggregate conditions require a separate world-event component on a non-player actor. See main page for discussion.
+- **No cross-player aggregate requirements.** A set requiring "20 players in this zone" does not map to per-player watcher logic. Such aggregate conditions require a separate world-event component on a non-player actor.
 - **Registration leaks if handle is not stored.** If the owning system discards the `FRequirementSetHandle`, it cannot unregister the set. The watcher component cleans up on `EndPlay`, but mid-session leaks waste subscription slots until logout.
-- **Async requirements in watched sets.** Async requirements are not re-evaluated by the watcher flush — the flush calls `Evaluate()` (sync) only. If a set contains async requirements, the owning system must call `EvaluateSetNow` with the async path separately, or restructure so async requirements are one-shot checks outside the watcher.
+- **Async requirements in watched sets.** Async requirements are not re-evaluated by the watcher flush — the flush calls `Evaluate()` (sync) only. If a set contains async requirements, the owning system must call `EvaluateSetNow` with the async path separately.
+- **`ContextBuilder` must be non-reentrant.** Calling `RegisterSet` or `UnregisterSet` from inside a `ContextBuilder` lambda is undefined behaviour — the watcher is mid-flush.
