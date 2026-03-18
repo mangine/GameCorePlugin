@@ -2,7 +2,7 @@
 
 **Sub-page of:** [Quest System](Quest%20System%20Overview.md)
 
-This document explains how to integrate the Quest System into a game, what setup is required, which modules are responsible for which concerns, and how each external system interface works. It is written for a developer setting up the system for the first time.
+This document explains how to integrate the Quest System into a game, what setup is required, which modules are responsible for which concerns, and how each external system interface works.
 
 ---
 
@@ -18,9 +18,9 @@ This document explains how to integrate the Quest System into a game, what setup
 - Provide a public `Server_IncrementTracker` API for external systems to drive progress
 
 **Does not:**
-- Subscribe to any GMS events itself (combat, inventory, etc.)
+- Subscribe to any GMS events itself
 - Know what triggers a tracker increment
-- Grant rewards (emits a completed event with a soft loot table reference)
+- Grant rewards
 - Write journal entries
 - Render any UI
 - Know about party/group systems (the shared quest extension handles that via `IGroupProvider`)
@@ -31,38 +31,25 @@ This document explains how to integrate the Quest System into a game, what setup
 
 ### 1. GameCore Plugin
 
-The quest system depends on GameCore. Ensure the plugin is enabled and the following modules are in your `Build.cs`:
-
 ```csharp
 PublicDependencyModuleNames.AddRange(new string[]
 {
-    "GameCore",   // URequirement, URequirementList, UStateMachineAsset,
-                  // URequirementWatcherComponent, UGameCoreEventSubsystem,
-                  // IPersistableComponent, IGroupProvider
-    "NetCore",    // FFastArraySerializer
+    "GameCore",
+    "NetCore",
     "GameplayTags",
 });
 ```
 
 ### 2. APlayerState Setup
 
-Every player must have these two components on `APlayerState`:
-
 ```cpp
-// In AMyPlayerState constructor:
-QuestComponent = CreateDefaultSubobject<UQuestComponent>(TEXT("QuestComponent"));
-// OR, if using shared quests:
-QuestComponent = CreateDefaultSubobject<USharedQuestComponent>(TEXT("QuestComponent"));
-
-// Required by GameCore — likely already present:
-WatcherComponent = CreateDefaultSubobject<URequirementWatcherComponent>(TEXT("WatcherComponent"));
+QuestComponent    = CreateDefaultSubobject<UQuestComponent>(TEXT("QuestComponent"));
+// OR for shared quests:
+QuestComponent    = CreateDefaultSubobject<USharedQuestComponent>(TEXT("QuestComponent"));
+WatcherComponent  = CreateDefaultSubobject<URequirementWatcherComponent>(TEXT("WatcherComponent"));
 ```
 
-`URequirementWatcherComponent` must be present before `UQuestComponent::BeginPlay` runs. Order of `CreateDefaultSubobject` calls does not matter — both exist by the time `BeginPlay` fires.
-
 ### 3. Persistence Wiring
-
-`UQuestComponent` implements `IPersistableComponent`. For persistence to activate, the owning actor must also have `UPersistenceRegistrationComponent`:
 
 ```cpp
 PersistenceComp = CreateDefaultSubobject<UPersistenceRegistrationComponent>(
@@ -71,108 +58,84 @@ PersistenceComp->PersistenceTag =
     FGameplayTag::RequestGameplayTag(TEXT("Persistence.Entity.Player"));
 ```
 
-When `UPersistenceRegistrationComponent` is present, `UQuestComponent` automatically participates in save/load cycles via `Serialize_Save` / `Serialize_Load`. No additional wiring needed.
+**Persisted:** `ActiveQuests` (full `FQuestRuntime` array), `CompletedQuestTags`. 
+**Not persisted:** Available quests (recalculated on login), watcher handles (re-registered in `BeginPlay`).
 
-**What is persisted:**
-- `ActiveQuests` — full `FQuestRuntime` array including tracker values and stage
-- `CompletedQuestTags` — tag container of permanently closed quests
+### 4. Quest Config Asset
 
-**What is NOT persisted (recalculated on login):**
-- Available quests — re-evaluated by re-running unlock watcher registration
-- Watcher handles — re-registered in `BeginPlay` after load
+Create a `UQuestConfigDataAsset` in your content folder and assign it to `UQuestComponent::QuestConfig`. Set `MaxActiveQuests` and any other tunables. This avoids hardcoded defaults in the component.
 
-### 4. Asset Manager Configuration
-
-Quest definitions are `UPrimaryDataAsset` subclasses loaded on demand. Register the asset type in `DefaultGame.ini`:
+### 5. Asset Manager Configuration
 
 ```ini
 [/Script/Engine.AssetManagerSettings]
 +PrimaryAssetTypesToScan=(
     PrimaryAssetType="QuestDefinition",
-    AssetBaseClass=/Script/PirateGame.QuestDefinition,
+    AssetBaseClass=/Script/GameCore.QuestDefinition,
     bHasBlueprintClasses=False,
     bIsEditorOnly=False,
     Directories=((Path="/Game/Quests"))
 )
 ```
 
-This covers both `UQuestDefinition` and `USharedQuestDefinition` since both use `"QuestDefinition"` as their primary asset type.
+**Asset naming convention:** The asset file name must match the leaf node of `QuestDefinition::QuestId`. e.g. `QuestId = Quest.Id.TreasureHunt` → asset named `TreasureHunt`. This is validated by `UQuestDefinition::IsDataValid`.
 
-### 5. Gameplay Tags
+### 6. Gameplay Tags
 
-Copy the tag entries from [File Structure — DefaultGameplayTags.ini](File%20Structure.md) into your project's `DefaultGameplayTags.ini`. Tags must be present before any quest definition assets are loaded.
+Copy tag entries from [File Structure](File%20Structure.md) into your `DefaultGameplayTags.ini`.
 
 ---
 
 ## Requirement Evaluation — Who Checks What
 
-This is the most important thing to understand about the quest system's architecture.
-
 ```
 Unlock Requirements (quest becoming Available)
   ───────────────────────────────────────────────
-  Evaluated by:  URequirementWatcherComponent (reactive, coalesced flush)
-  Authority:     Driven by UQuestDefinition::CheckAuthority
-    ServerAuthoritative → watcher runs on SERVER only
-                          server fires ClientRPC on pass
-    ClientValidated     → watcher runs on SERVER + OWNING CLIENT
-                          client fires ServerRPC on pass
-                          server re-evaluates; never trusts client result
-  Context:       BuildRequirementContext() with empty payload
-                 (unlock requirements do not read tracker data)
-  Pre-filter:    CompletedQuestTags checked first (O(1) tag lookup)
-                 bEnabled checked second (skips disabled quests entirely)
+  Evaluated by:  URequirementWatcherComponent (reactive, coalesced)
+  Authority: ServerAuthoritative
+    Server watcher evaluates → ClientRPC on pass (server is sole evaluator)
+  Authority: ClientValidated
+    Client watcher evaluates for UI feedback → ServerRPC_AcceptQuest on pass
+    Server always re-evaluates before accepting
+  Pre-filter:    CompletedQuestTags O(1) check, then bEnabled
 
 Completion Requirements (stage advancing)
   ───────────────────────────────────────────────
-  Evaluated by:  UQuestComponent directly (imperative, on tracker increment)
-  Trigger:       Server_IncrementTracker → tracker reaches EffectiveTarget
-                 → EvaluateCompletionRequirementsNow(QuestId)
-  Authority:     ServerAuthoritative → server evaluates, notifies client
-                 ClientValidated     → client fires ServerRPC_RequestValidation
-                                       server re-evaluates authoritatively
-  Context:       BuildRequirementContext() WITH tracker payload injected
-                 FRequirementPayload keyed by QuestId, counters from FQuestRuntime
-```
+  Trigger:  Server_IncrementTracker → tracker hits EffectiveTarget
+            → EvaluateCompletionRequirementsNow (immediate, no watcher flush)
+  Authority: ServerAuthoritative → server evaluates, notifies client
+  Authority: ClientValidated → client fires ServerRPC_RequestValidation
+             server re-evaluates authoritatively
 
-### The ContextBuilder Pattern
-
-When `UQuestComponent` registers completion requirements with the watcher, it supplies a `ContextBuilder` lambda that injects the current tracker values into `FRequirementContext::PersistedData` before every evaluation. This is how `URequirement_Persisted` subclasses (like `URequirement_KillCount`) can read live progress without polling:
-
-```
-Watcher flush triggered by RequirementEvent.Quest.TrackerUpdated
-  → For each dirty set: call ContextBuilder(Ctx)
-      ContextBuilder reads FQuestRuntime::Trackers
-      Injects FRequirementPayload{Counters: {Quest.Counter.Kill: 2}} into Ctx
-  → URequirement_KillCount::EvaluateWithPayload(Ctx, Payload)
-      Reads Payload.Counters[CounterTag] = 2
-      Compares to RequiredKills = 3 → Fail
+Stage Transitions (branching)
+  ───────────────────────────────────────────────
+  Evaluated by:  UStateMachineAsset::FindFirstPassingTransition
+  Rule type:     UQuestTransitionRule (evaluates URequirementList)
+  Context:       FRequirementContext built by UQuestComponent
+  Branching:     Multiple outgoing transitions from the same stage;
+                 first passing rule wins.
 ```
 
 ---
 
 ## Serialization — What Saves What
 
-| Data | Owner | Mechanism | Notes |
-|---|---|---|---|
-| `ActiveQuests` | `UQuestComponent` | `IPersistableComponent::Serialize_Save` | Full `FQuestRuntime` array, tags serialized as `FName` |
-| `CompletedQuestTags` | `UQuestComponent` | `IPersistableComponent::Serialize_Save` | Tag name array |
-| Quest definitions | `UQuestRegistrySubsystem` | Asset Manager async load | Not saved — loaded on demand, unloaded when no active players |
-| Watcher handles | `URequirementWatcherComponent` | Not persisted | Re-registered in `BeginPlay` after load |
-| Available quests | None | Not persisted | Recalculated by unlock watcher on login |
+| Data | Owner | Mechanism |
+|---|---|---|
+| `ActiveQuests` | `UQuestComponent` | `Serialize_Save` / `Serialize_Load` |
+| `CompletedQuestTags` | `UQuestComponent` | `Serialize_Save` / `Serialize_Load` |
+| Quest definitions | `UQuestRegistrySubsystem` | Asset Manager async load, not saved |
+| Watcher handles | `URequirementWatcherComponent` | Not saved, re-registered on login |
 
-The persistence system calls `Serialize_Save` / `Serialize_Load` automatically via `UPersistenceRegistrationComponent`. The game module does not need to call these manually.
-
-**Schema versioning:** `UQuestComponent::GetSchemaVersion()` returns `1`. Increment this and implement `Migrate()` if the serialization layout changes after shipping.
+Schema migration: increment `GetSchemaVersion()` and implement `Migrate()`. Unknown tags in saved data are skipped with a warning — no crash on content updates.
 
 ---
 
 ## Tracker Increments — Integration Layer Pattern
 
-The quest system has zero GMS subscriptions. Progress is driven entirely by external calls to `UQuestComponent::Server_IncrementTracker`. The recommended integration pattern is a thin bridge component on `APlayerState`:
+The quest system has zero GMS subscriptions. Use a bridge component:
 
 ```cpp
-// Game module: QuestTrackerBridge.h
 UCLASS(ClassGroup=(Game), meta=(BlueprintSpawnableComponent))
 class UQuestTrackerBridge : public UActorComponent
 {
@@ -181,137 +144,78 @@ public:
     virtual void BeginPlay() override
     {
         if (!HasAuthority()) return;
-
-        // Subscribe to combat events
         auto& GMS = UGameCoreEventSubsystem::Get(this);
         GMS.RegisterListener(
             TAG_GameCoreEvent_Combat_MobKilled,
             this, &UQuestTrackerBridge::OnMobKilled);
     }
-
 private:
     void OnMobKilled(const FMobKilledEventPayload& Payload)
     {
-        // Only handle kills by this player
         if (Payload.KillerPlayerState != GetOwner()) return;
-
         UQuestComponent* QC =
             GetOwner<APlayerState>()->FindComponentByClass<UQuestComponent>();
         if (!QC) return;
-
-        // Iterate active quests and increment any matching kill trackers.
-        // TrackerKey matching is game-specific — depends on your mob tag scheme.
         for (const FQuestRuntime& Runtime : QC->ActiveQuests.Items)
-        {
             for (const FQuestTrackerEntry& Tracker : Runtime.Trackers)
-            {
                 if (IsKillTrackerForMob(Tracker.TrackerKey, Payload.MobTag))
-                {
                     QC->Server_IncrementTracker(
                         Runtime.QuestId, Tracker.TrackerKey, 1);
-                }
-            }
-        }
     }
-
     bool IsKillTrackerForMob(
         const FGameplayTag& TrackerKey, const FGameplayTag& MobTag) const
-    {
-        // Game-specific: e.g. Quest.Counter.Kill.Skeleton matches MobTag.Skeleton
-        // Implementation depends on your tracker key naming convention.
-        return TrackerKey.MatchesTag(MobTag);
-    }
+    { return TrackerKey.MatchesTag(MobTag); }
 };
 ```
-
-Add `UQuestTrackerBridge` to `APlayerState` alongside `UQuestComponent`. This pattern keeps the quest system and combat system fully decoupled — neither imports the other.
 
 ---
 
 ## Icons and Markers — UI Integration
 
-### Quest Marker Icons
+`UQuestDefinition::QuestMarkerTag` → `UQuestMarkerDataAsset::GetIcon(Tag)` → soft texture loaded by UI. The quest system never loads textures.
 
-`UQuestDefinition::QuestMarkerTag` is a `FGameplayTag` (e.g. `Quest.Marker.MainStory`). Map it to a texture in `UQuestMarkerDataAsset`:
+`UQuestDefinition::Display` (`FQuestDisplayData`) holds localizable `FText` title, short/long description, difficulty enum, and a soft `UTexture2D`. Accessed by UI directly from the loaded definition.
 
+`UQuestStageDefinition::StageObjectiveText` is broadcast in `FQuestStageChangedPayload` on `GameCoreEvent.Quest.StageStarted`. HUD subscribes and updates.
+
+### Cooldown Countdown (UI)
+
+The UI computes countdown without extra replication:
 ```
-Content/UI/Quest/DA_QuestMarkers (UQuestMarkerDataAsset)
-  MarkerIcons:
-    Quest.Marker.MainStory  → T_Icon_MainStory
-    Quest.Marker.SideQuest  → T_Icon_SideQuest
-    Quest.Marker.Daily      → T_Icon_Daily
-    Quest.Marker.Dungeon    → T_Icon_Skull
+Cadence::None:   NextAvailable = LastCompletedTimestamp + CooldownSeconds
+Cadence::Daily:  NextAvailable = GetLastDailyResetTimestamp() + 86400
+Cadence::Weekly: NextAvailable = GetLastWeeklyResetTimestamp() + 604800
+Remaining = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
 ```
 
-The UI widget reads `QuestDefinition->QuestMarkerTag`, calls `MarkerDataAsset->GetIcon(Tag)`, and loads the soft texture reference on demand. The quest system never loads textures.
-
-### Display Data
-
-`UQuestDefinition::Display` (`FQuestDisplayData`) contains:
-- `Title` — `FText`, localizable, shown in quest log header
-- `ShortDescription` — `FText`, one-line summary for tracker HUD
-- `LongDescription` — `FText`, full description for quest log detail view
-- `Difficulty` — `EQuestDifficulty`, shown as star/skull rating
-- `QuestImage` — soft `UTexture2D`, loaded by UI on demand
-
-None of these are loaded by the quest system at runtime. The UI accesses them directly from the loaded `UQuestDefinition`.
-
-### Stage Objective Text
-
-`UQuestStageDefinition::StageObjectiveText` (`FText`) is broadcast in `FQuestStageChangedPayload` when a stage becomes active. The HUD subscribes to `GameCoreEvent.Quest.StageStarted` and updates the objective tracker display from the payload.
+Subscribe to `GameCoreEvent.Quest.DailyReset` / `WeeklyReset` to refresh the display on reset.
 
 ---
 
 ## Interfaces to Other Systems
 
-### Reward System
+**Reward System:** Subscribes to `GameCoreEvent.Quest.Completed`. Payload carries soft `ULootTable` reference and `bIsHelperRun`. Reward system loads and grants. Quest system never loads the loot table.
 
-The quest system does NOT grant rewards. On completion it emits `GameCoreEvent.Quest.Completed` with `FQuestCompletedPayload` containing:
-- `RewardTable` — soft reference to `ULootTable` (first-time or repeating based on role)
-- `bIsHelperRun` — whether this was a helper run
-- `MemberRole` — `Primary` or `Helper`
+**Journal System:** Subscribes to `Quest.Completed`, `Quest.Failed`, `Quest.Abandoned`. Quest system stores only `CompletedQuestTags`, no history.
 
-The reward system subscribes to this event, loads the loot table, and grants rewards.
+**Party / Group System:** Communicates via `IGroupProvider` (GameCore). Implements `GetGroupSize`, `IsGroupLeader`, `GetGroupMembers`, `GetGroupActor` on `APlayerState`. Quest system never calls party RPCs or reads party state directly.
 
-### Journal System
+**Map / Compass System:** Reads `QuestMarkerTag` and `UQuestMarkerDataAsset` independently. Quest system provides no map API.
 
-The quest system emits `Quest.Completed`, `Quest.Failed`, `Quest.Abandoned` with full payload. The journal system subscribes and writes its own log entries. The quest system only stores `CompletedQuestTags` (a tag container) — not quest history or completion details.
-
-### Party / Group System
-
-The shared quest extension communicates with the group system exclusively via `IGroupProvider` (GameCore). The party system implements this interface on `APlayerState`:
-
-```
-IGroupProvider (GameCore interface)
-  GetGroupSize()    → used for tracker ScalingMultiplier calculation
-  IsGroupLeader()   → used for LeaderAccept validation
-  GetGroupMembers() → used for passive tracker contribution fan-out
-```
-
-The quest system never calls party RPCs, never reads party actor state directly, and has no import dependency on the party module.
-
-### Map / Compass System
-
-The map system reads `UQuestDefinition::QuestMarkerTag` and `UQuestMarkerDataAsset` independently. The quest system provides no map integration itself — it exposes the tag and the player's `ActiveQuests` via the replicated component, and the map system reads those.
-
-### Interaction System
-
-QuestNPC interactions are handled by `UInteractionComponent` on the NPC actor. The interaction's `EntryRequirements` can include `URequirement_QuestCompleted` or `URequirement_ActiveQuestCount` to gate interactions based on quest state. The quest system does not know about interaction entries.
-
-Cooldown display (e.g. “Quest resets in 4h”) is surfaced via `URequirement_QuestCooldown::FailReason` text, which is passed through the requirement system's `FRequirementResult` and displayed by the interaction UI. No special quest system integration required.
+**Interaction System:** NPC `UInteractionComponent::EntryRequirements` can include `URequirement_QuestCompleted` or `URequirement_ActiveQuestCount`. Quest cooldown display text comes from `URequirement_QuestCooldown::FailReason` via `FRequirementResult`.
 
 ---
 
 ## Shared Quest Extension — Additional Setup
 
-To enable shared quests:
-
 1. Replace `UQuestComponent` with `USharedQuestComponent` on `APlayerState`.
-2. Implement `IGroupProvider` on `APlayerState` (delegating to your party component).
+2. Implement `IGroupProvider` on `APlayerState` (or use `UGroupProviderDelegates`).
 3. Add `USharedQuestCoordinator` to your group/party actor.
-4. Create `USharedQuestDefinition` assets instead of `UQuestDefinition` for group quests (both types can coexist in the registry).
+4. Group actor implements `IGroupProvider::GetGroupActor()` returning itself.
+5. Bind `USharedQuestCoordinator::OnRequestGroupEnrollment` to your group invite flow.
+6. Create `USharedQuestDefinition` assets for group quests.
 
-If `APlayerState` does not implement `IGroupProvider`, `USharedQuestComponent` falls back to solo behavior — it does not crash or assert. This means you can drop in `USharedQuestComponent` before the party system is ready and everything still works.
+If `APlayerState` does not implement `IGroupProvider`, `USharedQuestComponent` falls back to solo behavior silently.
 
 ---
 
@@ -321,21 +225,23 @@ If `APlayerState` does not implement `IGroupProvider`, `USharedQuestComponent` f
 ☐ GameCore plugin enabled
 ☐ UQuestComponent added to APlayerState
 ☐ URequirementWatcherComponent added to APlayerState
-☐ UPersistenceRegistrationComponent added to APlayerState (for save/load)
+☐ UPersistenceRegistrationComponent added to APlayerState
+☐ UQuestConfigDataAsset created and assigned to UQuestComponent::QuestConfig
 ☐ "QuestDefinition" primary asset type registered in DefaultGame.ini
 ☐ Gameplay tags from File Structure copied to DefaultGameplayTags.ini
-☐ At least one UQuestDefinition asset created in /Game/Quests/
-☐ UQuestTrackerBridge (or equivalent) added to APlayerState for tracker events
-☐ UQuestMarkerDataAsset created and referenced by UI for marker icons
-☐ GMS listeners added in reward/journal systems for Quest.Completed event
+☐ UQuestDefinition assets created in /Game/Quests/ (name = QuestId leaf)
+☐ UQuestTrackerBridge (or equivalent) added to APlayerState
+☐ UQuestMarkerDataAsset created and referenced by UI
+☐ GMS listeners added in reward/journal systems for Quest.Completed
 ```
 
 ## Checklist: Shared Quest Extension
 
 ```
 ☐ USharedQuestComponent replaces UQuestComponent on APlayerState
-☐ APlayerState implements IGroupProvider
+☐ APlayerState implements IGroupProvider (or uses UGroupProviderDelegates)
 ☐ USharedQuestCoordinator added to group/party actor
-☐ Group actor implements IGroupProvider
+☐ Group actor implements IGroupProvider::GetGroupActor() returning itself
+☐ OnRequestGroupEnrollment delegate bound on USharedQuestCoordinator
 ☐ USharedQuestDefinition assets created for group quests
 ```
