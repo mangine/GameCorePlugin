@@ -38,37 +38,31 @@ public:
      * Callers pass the result into FLootRollContext::LuckBonus.
      */
     float ResolveLuckBonus(
-        APlayerState*    Instigator,
-        FGameplayTag     SourceTag) const;
+        APlayerState* Instigator,
+        FGameplayTag  SourceTag) const;
 
     /**
      * Register a luck modifier for a specific loot source context.
      * Called by buff systems, event managers, or seasonal modifiers.
      *
-     * @param ContextTag  The source tag this modifier applies to.
+     * @param ContextTag  Source tag this modifier applies to.
      *                    Use a parent tag (e.g. GameCore.LootSource) to match all children.
      * @param Bonus       Additive bonus to roll ceiling. Must be >= 0.
      * @return            Handle — store and pass to UnregisterModifier to remove.
      */
-    FLootModifierHandle RegisterModifier(
-        FGameplayTag ContextTag,
-        float        Bonus);
-
+    FLootModifierHandle RegisterModifier(FGameplayTag ContextTag, float Bonus);
     void UnregisterModifier(FLootModifierHandle Handle);
 
 private:
 
-    // Internal recursive roller. Depth is incremented per nested table call.
-    // Returns empty array without assert in shipping when depth > MaxRecursionDepth.
     TArray<FLootReward> RollTableInternal(
         const ULootTable*       Table,
         const FLootRollContext& Context,
         int32                   CurrentDepth,
-        FRandomStream*          Stream);   // null when no seed
+        FRandomStream*          Stream);   // null when unseeded
 
     static constexpr int32 MaxRecursionDepth = 3;
 
-    // Registered luck modifiers. Keyed by handle for O(1) removal.
     TMap<FLootModifierHandle, FLootModifier> Modifiers;
 };
 ```
@@ -82,45 +76,80 @@ RunLootTable(Table, Context):
   Guard: HasAuthority() — return {} on client
   Guard: Table != nullptr — ensure() + return {}
 
+  // Seed setup — done once before any rolls
   Stream = null
-  If Context.Seed is set:
-    RandomOffset = FMath::RandRange(0, MAX_int32)   // rolled unconditionally before any table entry
-    FinalSeed    = HashCombine(Context.Seed.GetValue(), RandomOffset)
-    Stream       = FRandomStream(FinalSeed)
+  If Context.Seed != INDEX_NONE:
+    RandomOffset = FMath::RandRange(0, MAX_int32)
+    FinalSeed    = HashCombine(Context.Seed, RandomOffset)
+    Stream       = FRandomStream(FinalSeed)   // single stream, advanced throughout
 
   Results = RollTableInternal(Table, Context, 0, Stream)
 
   // Audit — always fires, even when Results is empty
-  FGameCoreBackend::GetAudit(TAG_Audit_Loot_Roll).RecordEvent(
+  FGameCoreBackend::GetAudit(TAG_GameCore_Audit_Loot_Roll).RecordEvent(
     Instigator:   Context.Instigator
     SourceTag:    Context.SourceTag
     TableAsset:   Table
-    FinalSeed:    FinalSeed (or INDEX_NONE if no seed)
+    FinalSeed:    FinalSeed (or INDEX_NONE if unseeded)
     LuckBonus:    Context.LuckBonus
     Results:      Results)
 
   return Results
+
 
 RollTableInternal(Table, Context, Depth, Stream):
   if Depth > MaxRecursionDepth:
     ensure(false)   // non-shipping only
     return {}
 
-  RollCount = RandRange(Table.RollCount.Min, Table.RollCount.Max)   // uniform
+  RollCount = RandRange(Table.RollCount.Min, Table.RollCount.Max)
 
-  For i in [0, RollCount):
-    RolledValue = (Stream != null)
-        ? Stream->FRandRange(0.0f, 1.0f + Context.LuckBonus)
-        : FMath::FRandRange(0.0f, 1.0f + Context.LuckBonus)
+  For each roll:
+    RolledValue = Stream ? Stream->FRandRange(0.f, 1.f + Context.LuckBonus)
+                         : FMath::FRandRange(0.f, 1.f + Context.LuckBonus)
 
-    // Evaluate entries in ascending threshold order
-    SelectedEntry = null
-    For each Entry in Table.Entries (sorted ascending by RollThreshold):
-      if Entry.RollThreshold > RolledValue: break
-      if not EvaluateRequirements(Entry.EntryRequirements, Context.Instigator): continue
-      SelectedEntry = Entry
+    // ── Entry selection with downgrade support ────────────────────────────
+    //
+    // Step 1: find the highest entry whose threshold does not exceed RolledValue.
+    //         This is the candidate — requirements have not been checked yet.
+    //
+    // Step 2: evaluate EntryRequirements on the candidate.
+    //         Requirements are evaluated AFTER selection, not during the scan.
+    //
+    // Step 3: on requirement failure:
+    //   bDowngradeOnRequirementFailed == true  → walk down to next lower entry, repeat from Step 2.
+    //   bDowngradeOnRequirementFailed == false → no reward this roll. Stop.
+    //   Downgrade chain stops as soon as a candidate passes, a candidate has
+    //   bDowngradeOnRequirementFailed == false, or no lower candidates remain.
 
-    if SelectedEntry == null: continue   // no reward this roll
+    // Build FRequirementContext for evaluation
+    FRequirementContext ReqContext = FRequirementContext::ForActor(
+        Context.Instigator.Get() ? Context.Instigator->GetPawn() : nullptr);
+
+    // Find initial candidate (highest threshold <= RolledValue)
+    CandidateIndex = INDEX_NONE
+    For i = Table.Entries.Num()-1 downto 0:
+      if Table.Entries[i].RollThreshold <= RolledValue:
+        CandidateIndex = i
+        break
+
+    // Downgrade loop
+    while CandidateIndex >= 0:
+      Candidate = Table.Entries[CandidateIndex]
+
+      if URequirementLibrary::EvaluateAll(Candidate.EntryRequirements, ReqContext):
+        // Requirements passed — use this entry
+        break
+      else:
+        if Candidate.bDowngradeOnRequirementFailed:
+          CandidateIndex -= 1   // try next lower entry
+        else:
+          CandidateIndex = INDEX_NONE   // no reward this roll
+          break
+
+    if CandidateIndex == INDEX_NONE: continue   // no reward this roll
+
+    SelectedEntry = Table.Entries[CandidateIndex]
 
     if SelectedEntry.NestedTable is set:
       NestedTable = SelectedEntry.NestedTable.LoadSynchronous()
@@ -137,6 +166,19 @@ RollTableInternal(Table, Context, Depth, Stream):
 
   return Results
 ```
+
+---
+
+## Requirement Context Construction
+
+`FRequirementContext::ForActor` is the standard builder used across the plugin. In the loot roller it is constructed from the instigator's pawn:
+
+```cpp
+FRequirementContext ReqContext = FRequirementContext::ForActor(
+    Context.Instigator.IsValid() ? Context.Instigator->GetPawn() : nullptr);
+```
+
+If `Instigator` is null or stale the context is built with a null actor — requirements that need a valid actor will fail, which is the correct safe fallback. Requirements that are actor-independent (e.g. world-state checks) still evaluate normally.
 
 ---
 
@@ -197,13 +239,34 @@ struct FLootModifierHandle
 ## Gameplay Tags
 
 ```
+// Loot source tags — used in FLootRollContext::SourceTag and modifier registration
 GameCore.LootSource.BossKill
 GameCore.LootSource.ChestOpen
 GameCore.LootSource.QuestReward
 GameCore.LootSource.Fishing
 GameCore.LootSource.Crafting
 
+// Audit tag — passed to FGameCoreBackend::GetAudit()
 GameCore.Audit.Loot.Roll
+
+// Reward routing tags — used in FLootEntryReward::RewardType and FLootReward::RewardType
+GameCore.Reward.Item
+GameCore.Reward.Currency
+GameCore.Reward.XP
+GameCore.Reward.Ability
 ```
 
-Game-specific source tags extend `GameCore.LootSource` in the game module's tag file.
+Game-specific tags extend these hierarchies in the game module's tag file.
+
+---
+
+## Asset Manager Registration
+
+Add to `DefaultGame.ini` to enable `ULootTable` async loading and Asset Manager discovery:
+
+```ini
+[/Script/Engine.AssetManagerSettings]
++PrimaryAssetTypesToScan=(PrimaryAssetType="LootTable",AssetBaseClass=/Script/GameCore.LootTable,bHasBlueprintClasses=False,bIsEditorOnly=False,Directories=((Path="/Game/LootTables")),Rules=(Priority=0,bApplyRecursively=True))
+```
+
+Adjust `Directories` to match the project's content layout. The type name `"LootTable"` must match `ULootTable`'s `GetPrimaryAssetId()` implementation.

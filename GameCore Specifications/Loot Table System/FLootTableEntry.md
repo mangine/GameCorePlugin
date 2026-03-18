@@ -19,23 +19,28 @@ struct GAMECORE_API FLootTableEntry
 
     // ── Conditions ───────────────────────────────────────────────────────────
 
-    // Optional per-entry gate evaluated against Context.Instigator before selection.
-    // All requirements must pass (AND). Failed entries are skipped this roll.
+    // Optional per-entry gate evaluated against the roll instigator.
+    // All requirements must pass (AND). See selection algorithm for failure behaviour.
     // Must contain only synchronous requirements — validated at cook time.
     // For OR/NOT logic, use URequirement_Composite as a single array element.
     UPROPERTY(EditAnywhere, Instanced, BlueprintReadOnly, Category = "Entry")
     TArray<TObjectPtr<URequirement>> EntryRequirements;
 
+    // Controls what happens when this entry is selected but EntryRequirements fail.
+    // true  — downgrade to the next lower qualifying entry that passes requirements.
+    // false — no reward is granted for this roll (default).
+    // Applies only to this entry; each entry has its own flag.
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Entry")
+    bool bDowngradeOnRequirementFailed = false;
+
     // ── Reward Payload ───────────────────────────────────────────────────────
 
-    // Authored reward: RewardType tag + RewardDefinition asset.
-    // Quantity is NOT set here — it is resolved from the Quantity range below
-    // and written into the output FLootReward by the roller.
+    // Authored reward data. Contains RewardType tag and RewardDefinition asset.
     // Mutually exclusive with NestedTable. If both are set, NestedTable takes priority
     // and Reward is ignored. An ensure() fires in non-shipping builds.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Reward",
         meta = (EditCondition = "!NestedTable"))
-    FLootReward Reward;
+    FLootEntryReward Reward;
 
     // If set, rolling this entry recurses into the nested table instead of
     // producing a direct reward. Counts as one recursion depth increment.
@@ -55,6 +60,36 @@ struct GAMECORE_API FLootTableEntry
     EQuantityDistribution QuantityDistribution = EQuantityDistribution::Uniform;
 };
 ```
+
+---
+
+## `FLootEntryReward`
+
+Authoring-only struct embedded in `FLootTableEntry::Reward`. Holds the data designers configure per entry. Separate from `FLootReward` (the output struct) to keep authoring and output roles cleanly distinct.
+
+**File:** `LootTable/FLootEntryReward.h`
+
+```cpp
+USTRUCT(BlueprintType)
+struct GAMECORE_API FLootEntryReward
+{
+    GENERATED_BODY()
+
+    // Drives fulfillment routing. See FLootReward for tag examples.
+    UPROPERTY(EditAnywhere, BlueprintReadOnly)
+    FGameplayTag RewardType;
+
+    // The concrete reward definition asset. Must implement ILootRewardable.
+    // Enforced at authoring time by FFLootEntryRewardCustomization's filtered picker.
+    // Not enforced at runtime — fulfillment layer is responsible for safe casting.
+    // Null for tag-only rewards where RewardType alone is sufficient.
+    UPROPERTY(EditAnywhere, BlueprintReadOnly,
+        meta = (GameCoreInterfaceFilter = "LootRewardable"))
+    TSoftObjectPtr<UObject> RewardDefinition;
+};
+```
+
+At roll time, `FLootEntryReward` fields are copied into the output `FLootReward` alongside the resolved `Quantity`.
 
 ---
 
@@ -78,8 +113,8 @@ enum class EQuantityDistribution : uint8
 
 ## Notes
 
-- `Reward.Quantity` is always 0 in the authored struct — it is not read by the roller. The roller resolves quantity from `FLootTableEntry::Quantity` and writes it into the output `FLootReward::Quantity`.
-- `EntryRequirements` uses the same `URequirement` pattern as the Interaction System and Quest System. Synchronous-only — the roller never suspends.
-- `NestedTable` is a soft reference. The roller loads it synchronously via `LoadSynchronous()` — tables must be small enough that sync load is acceptable on the server. Large tables should be pre-loaded by the caller.
-- A single entry **cannot** be both a leaf reward and a nested table. `ensure(!Reward.IsValid() || NestedTable.IsNull())` fires in non-shipping builds if both are configured.
-- See [FLootReward](FLootReward.md) for `RewardDefinition` field details and the `ILootRewardable` editor picker filtering.
+- `EntryRequirements` uses the same `URequirement` pattern as the Interaction and Quest systems. Synchronous-only — the roller never suspends.
+- `bDowngradeOnRequirementFailed` triggers a linear downgrade walk: after the highest qualifying entry fails requirements, the roller walks down to the next lower entry and retries. Each candidate entry's own `bDowngradeOnRequirementFailed` is checked — downgrade chains only continue while consecutive entries have the flag set.
+- `NestedTable` is a soft reference loaded synchronously via `LoadSynchronous()`. Tables referenced from loaded actors (chests, mobs) are already in memory — sync load is a cache hit. Pre-load explicitly only for tables referenced via soft pointers on actors that load independently.
+- A single entry **cannot** be both a leaf reward and a nested table. `ensure(!Reward.RewardType.IsValid() || NestedTable.IsNull())` fires in non-shipping builds if both are configured.
+- See [FLootReward](FLootReward.md) for the output struct and [ILootRewardable](ILootRewardable.md) for `RewardDefinition` editor picker filtering.

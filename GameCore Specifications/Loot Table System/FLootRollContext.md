@@ -36,13 +36,12 @@ struct GAMECORE_API FLootRollContext
     TWeakObjectPtr<AActor> GroupActor;
 
     // Optional deterministic seed.
-    // When set, the roller generates a final seed by hashing this value with
-    // a random offset (rolled first, before any table entries), then uses
-    // FRandomStream(FinalSeed + RollIndex) per entry roll.
-    // Used for CS reproduction of historical loot rolls.
-    // When unset, FMath::FRand() is used.
+    // INDEX_NONE (default) means unseeded — FMath::FRand() is used.
+    // Any other value activates seeded rolling via a single FRandomStream
+    // derived from this value. The FinalSeed is recorded in the audit payload
+    // for CS reproduction of historical rolls.
     UPROPERTY(BlueprintReadWrite)
-    TOptional<int32> Seed;
+    int32 Seed = INDEX_NONE;
 };
 ```
 
@@ -50,19 +49,19 @@ struct GAMECORE_API FLootRollContext
 
 ## Seed Flow
 
-The seed in context is a **designer/CS-provided base value**, not the raw stream seed. The roller derives the actual stream seed:
+The seed in context is a **designer/CS-provided base value**, not the raw stream seed. The roller derives the actual stream seed once at the start of `RunLootTable`, before any table entries are processed:
 
 ```
-If Context.Seed is set:
-    RandomOffset = FMath::RandRange(0, MAX_int32)   // rolled first, unconditionally
-    FinalSeed    = HashCombine(Context.Seed.GetValue(), RandomOffset)
-    RollStream   = FRandomStream(FinalSeed)
-    Per-entry roll i: RollStream.FRandRange(0.0, 1.0 + LuckBonus)
+If Context.Seed != INDEX_NONE:
+    RandomOffset = FMath::RandRange(0, MAX_int32)   // rolled once, unconditionally
+    FinalSeed    = HashCombine(Context.Seed, RandomOffset)
+    RollStream   = FRandomStream(FinalSeed)          // single stream, advanced sequentially
+    All rolls (across all RollCount iterations and nested tables) use RollStream.FRandRange()
 Else:
-    Per-entry roll: FMath::FRandRange(0.0, 1.0 + LuckBonus)
+    All rolls use FMath::FRandRange() — no stream
 ```
 
-The `FinalSeed` is recorded in the audit payload, enabling exact reproduction by CS tooling.
+Using a **single advancing stream** rather than per-roll seeding ensures that the full sequence of rolls across a table invocation is reproducible from one `FinalSeed`. The `FinalSeed` is recorded in the audit payload, enabling exact reproduction by CS tooling.
 
 ---
 
@@ -76,6 +75,6 @@ LuckBonus = ULootRollerSubsystem::ResolveLuckBonus(Instigator, SourceTag)
 
 `ResolveLuckBonus` sums:
 - Registered subsystem modifiers matching `SourceTag`
-- GAS attribute modifier on `Instigator->GetPawn()` (if ASC present)
+- GAS Luck attribute on `Instigator->GetPawn()`'s ASC (if present)
 
 Callers may override or bypass this and set `LuckBonus` directly for scripted scenarios.
