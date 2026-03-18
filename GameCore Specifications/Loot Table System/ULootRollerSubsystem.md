@@ -32,7 +32,9 @@ public:
 
     /**
      * Resolves the combined LuckBonus for a player and source tag.
-     * Sums all registered modifiers matching SourceTag plus any GAS attribute on the pawn.
+     * Sums all registered subsystem modifiers matching SourceTag, then adds the
+     * GAS Luck attribute value from Instigator->GetPawn()'s ASC (if present).
+     * The GAS attribute is the authoritative ceiling — no additional cap is applied.
      * Callers pass the result into FLootRollContext::LuckBonus.
      */
     float ResolveLuckBonus(
@@ -43,10 +45,10 @@ public:
      * Register a luck modifier for a specific loot source context.
      * Called by buff systems, event managers, or seasonal modifiers.
      *
-     * @param ModifierTag  The source tag this modifier applies to.
-     *                     Use a parent tag (e.g. GameCore.LootSource) to match all children.
-     * @param Bonus        Additive bonus to roll ceiling. Must be >= 0.
-     * @param Handle       Returned handle — store and pass to UnregisterModifier to remove.
+     * @param ContextTag  The source tag this modifier applies to.
+     *                    Use a parent tag (e.g. GameCore.LootSource) to match all children.
+     * @param Bonus       Additive bonus to roll ceiling. Must be >= 0.
+     * @return            Handle — store and pass to UnregisterModifier to remove.
      */
     FLootModifierHandle RegisterModifier(
         FGameplayTag ContextTag,
@@ -82,13 +84,13 @@ RunLootTable(Table, Context):
 
   Stream = null
   If Context.Seed is set:
-    RandomOffset = FMath::RandRange(0, MAX_int32)
+    RandomOffset = FMath::RandRange(0, MAX_int32)   // rolled unconditionally before any table entry
     FinalSeed    = HashCombine(Context.Seed.GetValue(), RandomOffset)
     Stream       = FRandomStream(FinalSeed)
 
   Results = RollTableInternal(Table, Context, 0, Stream)
 
-  // Audit
+  // Audit — always fires, even when Results is empty
   FGameCoreBackend::GetAudit(TAG_Audit_Loot_Roll).RecordEvent(
     Instigator:   Context.Instigator
     SourceTag:    Context.SourceTag
@@ -182,7 +184,7 @@ struct FLootModifierHandle
 };
 ```
 
-`ResolveLuckBonus` sums all `FLootModifier` entries where `SourceTag.MatchesTag(Modifier.ContextTag)`, plus the GAS `Attribute.Luck` value from the instigator's ASC (if present). Result is clamped to `[0.0, MaxLuckBonus]` where `MaxLuckBonus = 10.0f` (configurable via `ULootRollerSubsystem::SetMaxLuckBonus`).
+`ResolveLuckBonus` sums all `FLootModifier` entries where `SourceTag.MatchesTag(Modifier.ContextTag)`, then adds the GAS `Attribute.Luck` value from the instigator's ASC (if present). **No cap is applied by the loot system** — the GAS attribute and buff design are the authoritative ceiling. Negative totals are clamped to 0.0.
 
 ---
 

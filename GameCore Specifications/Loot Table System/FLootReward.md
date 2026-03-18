@@ -21,10 +21,12 @@ struct GAMECORE_API FLootReward
     FGameplayTag RewardType;
 
     // The concrete reward definition asset (item def, currency def, XP config, etc.).
+    // Must implement ILootRewardable — enforced at authoring time by the editor asset
+    // picker filter in FFLootTableEntryCustomization. Not enforced at runtime.
     // Null for tag-only rewards where RewardType alone is sufficient for routing.
     // Loaded async by the fulfillment layer — never loaded by the loot system.
     UPROPERTY(BlueprintReadOnly)
-    TSoftObjectPtr<UPrimaryDataAsset> RewardDefinition;
+    TSoftObjectPtr<UObject> RewardDefinition;
 
     // Final resolved quantity after applying EQuantityDistribution to the entry range.
     // Always >= 1 for valid rewards.
@@ -33,6 +35,19 @@ struct GAMECORE_API FLootReward
 
     bool IsValid() const { return RewardType.IsValid(); }
 };
+```
+
+---
+
+## Asset Contract
+
+`RewardDefinition` holds any `UObject`-derived asset that implements `ILootRewardable`. The type is `TSoftObjectPtr<UObject>` at the C++ level to avoid forcing a base class on external systems. The editor picker filters to `ILootRewardable` implementors only — see [ILootRewardable](ILootRewardable.md).
+
+The fulfillment layer casts to the concrete type after async loading:
+
+```cpp
+if (UItemDefinition* ItemDef = Cast<UItemDefinition>(Reward.RewardDefinition.Get()))
+    InventorySystem->AddItem(Recipient, ItemDef, Reward.Quantity);
 ```
 
 ---
@@ -50,11 +65,20 @@ void UMyRewardHandler::FulfillRewards(
     for (const FLootReward& Reward : Rewards)
     {
         if (Reward.RewardType.MatchesTag(TAG_Reward_Item))
-            InventorySystem->AddItem(Recipient, Reward.RewardDefinition, Reward.Quantity);
+        {
+            UItemDefinition* Def = Cast<UItemDefinition>(Reward.RewardDefinition.Get());
+            if (Def) InventorySystem->AddItem(Recipient, Def, Reward.Quantity);
+        }
         else if (Reward.RewardType.MatchesTag(TAG_Reward_XP))
-            ProgressionSubsystem->GrantXP(Recipient, /* resolve tag from RewardDefinition */, Reward.Quantity, ...);
+        {
+            UXPRewardDefinition* Def = Cast<UXPRewardDefinition>(Reward.RewardDefinition.Get());
+            if (Def) ProgressionSubsystem->GrantXP(Recipient, Def->ProgressionTag, Reward.Quantity, ...);
+        }
         else if (Reward.RewardType.MatchesTag(TAG_Reward_Currency))
-            CurrencySystem->Credit(Recipient, Reward.RewardDefinition, Reward.Quantity);
+        {
+            UCurrencyDefinition* Def = Cast<UCurrencyDefinition>(Reward.RewardDefinition.Get());
+            if (Def) CurrencySystem->Credit(Recipient, Def, Reward.Quantity);
+        }
         // ... extend per game without touching GameCore
     }
 }

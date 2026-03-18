@@ -16,7 +16,8 @@ public:
     ELootTableType TableType = ELootTableType::Threshold;
 
     // Entries must be sorted ascending by RollThreshold before use.
-    // Sorting is enforced at asset save time.
+    // Use the "Sort Entries" button in the Details panel to sort manually.
+    // IsDataValid() auto-sorts on save and errors on duplicate thresholds.
     // Entries above RollThreshold 1.0 are luck-gated and unreachable at base luck.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Loot Table", meta = (TitleProperty = "RollThreshold"))
     TArray<FLootTableEntry> Entries;
@@ -26,7 +27,76 @@ public:
     // FInt32Range(1, 3) = roll between 1 and 3 times, each roll independent.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Loot Table")
     FInt32Range RollCount = FInt32Range(1);
+
+#if WITH_EDITOR
+    virtual EDataValidationResult IsDataValid(FDataValidationContext& Context) const override;
+#endif
 };
+```
+
+---
+
+## Editor Tooling
+
+### Sort Button
+
+Implemented via `IDetailCustomization` on `ULootTable` in the `GameCoreEditor` module.
+
+**File:** `GameCoreEditor/LootTable/ULootTableCustomization.h`
+
+```cpp
+class FULootTableCustomization : public IDetailCustomization
+{
+public:
+    static TSharedRef<IDetailCustomization> MakeInstance();
+    virtual void CustomizeDetails(IDetailLayoutBuilder& DetailBuilder) override;
+
+private:
+    void SortEntries(IDetailLayoutBuilder* DetailBuilder);
+};
+```
+
+Adds a "Sort Entries" button at the top of the Entries category. On click:
+1. Sorts `Entries` ascending by `RollThreshold` in-place.
+2. Marks the asset dirty so the change is saved.
+3. Forces a Details panel refresh.
+
+Registered in `FGameCoreEditorModule::StartupModule`:
+
+```cpp
+PropertyModule.RegisterCustomClassLayout(
+    ULootTable::StaticClass()->GetFName(),
+    FOnGetDetailCustomizationInstance::CreateStatic(
+        &FULootTableCustomization::MakeInstance));
+```
+
+### Validation — `IsDataValid`
+
+```cpp
+EDataValidationResult ULootTable::IsDataValid(FDataValidationContext& Context) const
+{
+    // Auto-sort: self-healing, no error emitted for sort order violations.
+    // Cast away const — sort is a non-semantic authoring fix, not a state mutation.
+    const_cast<ULootTable*>(this)->Entries.Sort(
+        [](const FLootTableEntry& A, const FLootTableEntry& B)
+        { return A.RollThreshold < B.RollThreshold; });
+
+    // Duplicate threshold check — errors only, no auto-fix.
+    // Duplicate thresholds make entry selection non-deterministic.
+    EDataValidationResult Result = EDataValidationResult::Valid;
+    for (int32 i = 1; i < Entries.Num(); ++i)
+    {
+        if (FMath::IsNearlyEqual(Entries[i].RollThreshold, Entries[i - 1].RollThreshold, KINDA_SMALL_NUMBER))
+        {
+            Context.AddError(FText::Format(
+                LOCTEXT("DuplicateThreshold",
+                    "Entries {0} and {1} share RollThreshold {2}. Duplicate thresholds cause non-deterministic reward selection."),
+                i - 1, i, Entries[i].RollThreshold));
+            Result = EDataValidationResult::Invalid;
+        }
+    }
+    return Result;
+}
 ```
 
 ---
