@@ -3,7 +3,7 @@
 **Sub-page of:** [Quest System](Quest%20System%20Overview.md) 
 **Module:** `GameCore` (quest module within the plugin)
 
-Only requirements whose data is **owned by the quest system** are defined here.
+Only requirements whose data is **owned by the quest system** are defined here. Requirements that depend on data from other systems (combat, inventory, group/party) are defined in those systems or in game-module integration layers.
 
 ---
 
@@ -46,7 +46,6 @@ public:
         const UQuestComponent* QC = Context.QuestComponent;
         if (!QC)
         {
-            // Fallback for contexts not built by UQuestComponent (e.g. editor preview).
             if (!Context.PlayerState) return FRequirementResult::Fail(
                 LOCTEXT("NoPS", "No player state."));
             QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
@@ -87,7 +86,7 @@ public:
 **Inherits:** `URequirement` (not `URequirement_Persisted` — reads directly from `Context.QuestComponent`) 
 **Authority:** `Both` — `LastCompletedTimestamp` is in replicated `FQuestRuntime`
 
-> **Why not `URequirement_Persisted`?** `LastCompletedTimestamp` is an `int64` but `FRequirementPayload` stores floats which lose precision. Reading directly from `Context.QuestComponent` avoids the precision issue and simplifies the data path. The `PayloadKey` identifies which quest to look up.
+> **Why not `URequirement_Persisted`?** `LastCompletedTimestamp` is `int64`. `FRequirementPayload` stores only `float` values. Reading directly from `Context.QuestComponent->FindActiveQuest(QuestIdKey)` avoids precision loss and simplifies the data path.
 
 ```cpp
 UCLASS(EditInlineNew, CollapseCategories,
@@ -96,8 +95,7 @@ class GAMECORE_API URequirement_QuestCooldown : public URequirement
 {
     GENERATED_BODY()
 public:
-    // Must match the QuestId tag of the quest this cooldown gates.
-    // Used to look up FQuestRuntime::LastCompletedTimestamp.
+    // Must match the QuestId of the quest this cooldown gates.
     UPROPERTY(EditDefaultsOnly, Category="Requirement",
               meta=(Categories="Quest.Id"))
     FGameplayTag QuestIdKey;
@@ -117,12 +115,9 @@ public:
         const FRequirementContext& Context) const override
     {
         const UQuestComponent* QC = Context.QuestComponent;
-        if (!QC)
-        {
-            if (Context.PlayerState)
-                QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
-        }
-        if (!QC) return FRequirementResult::Pass(); // Fail-safe
+        if (!QC && Context.PlayerState)
+            QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
+        if (!QC) return FRequirementResult::Pass();
 
         const FQuestRuntime* Runtime = QC->FindActiveQuest(QuestIdKey);
         const int64 LastCompleted = Runtime ? Runtime->LastCompletedTimestamp : 0;
@@ -144,7 +139,8 @@ public:
 
         const UQuestRegistrySubsystem* Registry =
             Context.World
-                ? Context.World->GetSubsystem<UQuestRegistrySubsystem>()
+                ? Context.World->GetGameInstance()
+                      ->GetSubsystem<UQuestRegistrySubsystem>()
                 : nullptr;
         if (!Registry) return FRequirementResult::Pass();
 
@@ -156,11 +152,6 @@ public:
 
         if (LastCompleted < LastReset) return FRequirementResult::Pass();
 
-        // Compute next availability without storing it.
-        // Client reads LastCompletedTimestamp from replicated FQuestRuntime
-        // and can compute: NextAvailable = LastCompleted + CooldownSeconds (None)
-        //                  NextAvailable = LastReset + ResetPeriodSeconds (Daily/Weekly)
-        // UI formula: RemainingSeconds = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
         return FRequirementResult::Fail(
             LOCTEXT("NotReset", "Quest not yet reset."));
     }
@@ -187,25 +178,14 @@ public:
 
 ### UI Cooldown Countdown Pattern
 
-The client computes availability without any extra replication:
-
 ```
-For Cadence == None:
-  NextAvailable = FQuestRuntime::LastCompletedTimestamp + CooldownSeconds
-  Remaining     = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
-  Display:        "Available in Xh Ym"
-
-For Cadence == Daily:
-  NextAvailable = UQuestRegistrySubsystem::GetLastDailyResetTimestamp() + 86400
-  Remaining     = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
-  Display:        "Resets in Xh Ym" (or "Resets tomorrow at 00:00 UTC")
-
-For Cadence == Weekly:
-  NextAvailable = UQuestRegistrySubsystem::GetLastWeeklyResetTimestamp() + 604800
-  Remaining     = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
+Cadence::None:   NextAvailable = LastCompletedTimestamp + CooldownSeconds
+Cadence::Daily:  NextAvailable = GetLastDailyResetTimestamp() + 86400
+Cadence::Weekly: NextAvailable = GetLastWeeklyResetTimestamp() + 604800
+Remaining = NextAvailable - FDateTime::UtcNow().ToUnixTimestamp()
 ```
 
-The UI widget subscribes to `GameCoreEvent.Quest.DailyReset` / `WeeklyReset` to refresh the display when a reset occurs. No additional field needed on `FQuestRuntime`.
+Subscribe to `GameCoreEvent.Quest.DailyReset` / `WeeklyReset` to refresh the display on reset.
 
 ---
 
@@ -228,13 +208,9 @@ public:
     virtual FRequirementResult Evaluate(
         const FRequirementContext& Context) const override
     {
-        // Use cached QuestComponent pointer — avoids FindComponentByClass.
         const UQuestComponent* QC = Context.QuestComponent;
-        if (!QC)
-        {
-            if (Context.PlayerState)
-                QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
-        }
+        if (!QC && Context.PlayerState)
+            QC = Context.PlayerState->FindComponentByClass<UQuestComponent>();
         if (!QC) return FRequirementResult::Pass();
 
         if (QC->ActiveQuests.Items.Num() < MaxAllowed)
@@ -261,6 +237,14 @@ public:
 
 Live in the game module. Inherit `URequirement_Persisted` (GameCore). Read `FRequirementPayload::Counters` via `Context.PersistedData[QuestId]`.
 
+```
+Game module: URequirement_KillCount : public URequirement_Persisted
+  PayloadKey  = QuestId tag
+  CounterTag  = Quest.Counter.Kill.<MobType>
+  Reads       = Payload.Counters[CounterTag]
+  WatchedEvents = RequirementEvent.Quest.TrackerUpdated
+```
+
 ### Group Size Requirements
 
-Live in the party/group system module. Read via `IGroupProvider::GetGroupSize()` from `Context.PlayerState`. `GetDataAuthority() == ServerOnly`.
+Live in the party/group system module. Read via `IGroupProvider::GetGroupSize()` cast from `Context.PlayerState`. `GetDataAuthority() == ServerOnly`.

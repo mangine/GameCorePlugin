@@ -13,13 +13,11 @@ The Requirement System is a data-driven, polymorphic condition evaluation layer.
 | **Core Evaluation** | `URequirement`, `URequirement_Composite`, `URequirementLibrary` | Abstract base, boolean logic tree, evaluation entry point |
 | **Requirement Sets** | `URequirementSet`, `URequirementList` | Grouping layer: list (AND-all). OR/NOT logic expressed inline via `URequirement_Composite` children. |
 | **Watcher System** | `URequirementWatcherComponent`, `URequirementWatcherManager` | Event-driven per-player dirty tracking. Eliminates polling. |
-| **Supporting Types** | `FRequirementContext`, `FRequirementResult`, `FRequirementSetRuntime` | Evaluation inputs, outputs, and per-player runtime cache |
+| **Supporting Types** | `FRequirementContext`, `FRequirementPayload`, `FRequirementResult`, `FRequirementSetRuntime` | Evaluation inputs, outputs, payload injection, and per-player runtime cache |
 
 ---
 
 # Core Design Principles
-
-These principles are the constraints everything else is built around. When in doubt about any design decision in this system or in systems consuming it, refer back here.
 
 - **Requirements are definitions, not instances.** `URequirement` objects are authored inside Data Assets and loaded once. They carry no per-player state. The same object is evaluated against many players using only data passed in via `FRequirementContext`.
 - **Synchronous by default, async by exception.** `Evaluate` must return immediately for the vast majority of requirements. `EvaluateAsync` exists only for conditions whose data is genuinely not resident in memory at evaluation time.
@@ -28,6 +26,7 @@ These principles are the constraints everything else is built around. When in do
 - **Events are GameplayTags, not enums.** Each module registers its own invalidation event tags under `RequirementEvent.*`. The watcher system uses these tags as keys — zero coupling between modules.
 - **Composites replace hardcoded logic.** Complex AND/OR/NOT conditions are expressed as `URequirement_Composite` trees — not as custom C++ evaluators with baked-in boolean logic.
 - **Watcher evaluation is push-invalidated, pull-evaluated.** Requirements never poll. When a relevant event fires, the affected requirement set is marked dirty. Evaluation runs on the next throttled flush, not on every event.
+- **Context payload injection for persisted data.** When a requirement needs to read runtime counter or float data not derivable from world state alone (e.g. quest kill counts), the owning system injects it into `FRequirementContext::PersistedData` before calling `Evaluate`. Requirements that consume this data inherit from `URequirement_Persisted`.
 
 ---
 
@@ -37,19 +36,68 @@ These principles are the constraints everything else is built around. When in do
 
 **Evaluation (on-demand).** The consuming system constructs an `FRequirementContext` and calls `Set->Evaluate(Context)` or `Set->EvaluateAsync(Context, OnComplete)`. `URequirementLibrary` is an internal helper used by `URequirementSet` subclasses — consuming systems never call it directly.
 
+**Evaluation with payload.** When evaluation needs runtime counter data (e.g. quest tracker progress), the owning system builds an `FRequirementPayload` and inserts it into `FRequirementContext::PersistedData` keyed by a domain tag before calling `Evaluate`. `URequirement_Persisted` subclasses read from this map rather than from world state.
+
 **Evaluation (watched).** For systems that need to reactively track availability (quest unlock, ability visibility), the owning system registers a `FRequirementSetRuntime` handle with `URequirementWatcherComponent`. Each `URequirement` in the set declares which `FGameplayTag` events invalidate it via `GetWatchedEvents`. When a `RequirementEvent.*` tag fires through `URequirementWatcherManager`, only sets watching that tag are dirtied. A coalescing timer flushes dirty sets in batches. The owning system receives `OnSetDirty` and re-evaluates.
 
 **Network.** Server is authoritative. Each `URequirementSet` asset carries an `Authority` property (`ERequirementEvalAuthority`, defined in `RequirementSet.h`) set by the designer. `ClientOnly` sets are evaluated on the owning client only (UI, cosmetics). `ClientValidated` sets are evaluated on the client for responsiveness and re-evaluated authoritatively on the server via RPC. `ServerOnly` sets never leave the server. Call sites do not pass or override authority — if two systems need different authority for the same conditions, they reference two separate assets.
 
 ---
 
-# `FRequirementContext`
+# `FRequirementPayload`
 
-A plain USTRUCT passed by const reference to every `Evaluate` call. Kept deliberately narrow.
+**File:** `Requirements/RequirementPayload.h`
+
+A keyed data bag injected into `FRequirementContext::PersistedData` at evaluation time. Carries runtime state (counters, floats) that stateless `URequirement` subclasses need to read without coupling to any storage or game system.
+
+The payload is constructed by the owning system and placed into the context before calling `Evaluate`. Requirements never write to this struct — it is read-only at evaluation time.
 
 ```cpp
 USTRUCT(BlueprintType)
-struct FRequirementContext
+struct GAMECORE_API FRequirementPayload
+{
+    GENERATED_BODY()
+
+    // Integer counters: kill counts, collection counts, interaction counts, etc.
+    UPROPERTY(BlueprintReadOnly)
+    TMap<FGameplayTag, int32> Counters;
+
+    // Float values: time elapsed, distance travelled, etc.
+    UPROPERTY(BlueprintReadOnly)
+    TMap<FGameplayTag, float> Floats;
+
+    bool GetCounter(const FGameplayTag& Key, int32& OutValue) const
+    {
+        if (const int32* Found = Counters.Find(Key))
+            { OutValue = *Found; return true; }
+        return false;
+    }
+
+    bool GetFloat(const FGameplayTag& Key, float& OutValue) const
+    {
+        if (const float* Found = Floats.Find(Key))
+            { OutValue = *Found; return true; }
+        return false;
+    }
+};
+```
+
+**Design rules:**
+- The key is a **domain tag** (e.g. a `QuestId`), not an individual counter tag. One payload entry per logical domain. Individual counters/floats live inside the payload. This keeps the top-level map small and lookup O(1) at both levels.
+- Payload data is available on both server and owning client when built from replicated runtime data (e.g. replicated `FQuestRuntime`). Requirements that read payload must declare `GetDataAuthority() == Both`.
+- Payloads are injected via the watcher `ContextBuilder` delegate for reactive evaluation, and via `BuildRequirementContext` for imperative evaluation.
+
+---
+
+# `FRequirementContext`
+
+**File:** `Requirements/RequirementContext.h`
+
+A plain USTRUCT passed by const reference to every `Evaluate` call.
+
+```cpp
+USTRUCT(BlueprintType)
+struct GAMECORE_API FRequirementContext
 {
     GENERATED_BODY()
 
@@ -61,30 +109,48 @@ struct FRequirementContext
 
     // Optional: instigating actor (pawn, NPC, trigger volume, etc.).
     UPROPERTY() TObjectPtr<AActor> Instigator = nullptr;
+
+    // Injected persisted data keyed by payload domain tag (e.g. QuestId).
+    // Populated by the owning system's ContextBuilder or BuildRequirementContext
+    // before evaluation. Requirements reading this map must declare
+    // GetDataAuthority() == Both.
+    // Empty for contexts not built by a system that uses payload injection.
+    UPROPERTY()
+    TMap<FGameplayTag, FRequirementPayload> PersistedData;
+
+    // Cached pointer to the owning player's UQuestComponent.
+    // Set by UQuestComponent::BuildRequirementContext.
+    // Allows quest requirements (URequirement_QuestCompleted,
+    // URequirement_ActiveQuestCount, URequirement_QuestCooldown) to access
+    // quest state directly without calling FindComponentByClass on every evaluation.
+    // Null when the context is not built by UQuestComponent — requirements
+    // must null-check and fall back to FindComponentByClass when null.
+    UPROPERTY()
+    TObjectPtr<UQuestComponent> QuestComponent = nullptr;
 };
 ```
 
-**Rules for adding fields:** Only add a field when at least two shipped requirement types require it. A field needed by only one subclass belongs in that subclass via subsystem or component lookup. Never add game-specific types here.
+**Rules for adding fields:**
+- Only add a field when at least two shipped requirement types require it.
+- A field needed by only one subclass belongs in that subclass via subsystem or component lookup.
+- Never add game-specific types here that would create a dependency from `Requirements/` on a game module.
+- The `QuestComponent` field is acceptable because `UQuestComponent` is part of GameCore. Game-module-specific component types must not be added here.
 
 ---
 
 # `FRequirementResult`
 
-Returned by every synchronous `Evaluate` call and by `EvaluateAll`.
-
 ```cpp
 USTRUCT(BlueprintType)
-struct FRequirementResult
+struct GAMECORE_API FRequirementResult
 {
     GENERATED_BODY()
 
     UPROPERTY() bool bPassed = false;
-
-    // Optional. First failure reason in the evaluated set.
     UPROPERTY() FText FailureReason;
 
-    static FRequirementResult Pass()                        { return { true,  FText::GetEmpty() }; }
-    static FRequirementResult Fail(FText Reason = {})       { return { false, Reason }; }
+    static FRequirementResult Pass()                  { return { true,  FText::GetEmpty() }; }
+    static FRequirementResult Fail(FText Reason = {}) { return { false, Reason }; }
 };
 ```
 
@@ -92,7 +158,7 @@ struct FRequirementResult
 
 # `URequirement` — Base Class (Summary)
 
-Abstract base for all evaluatable conditions. Carries two new fields introduced by the Watcher System; the evaluation contract is unchanged.
+Abstract base for all evaluatable conditions.
 
 ```cpp
 UCLASS(Abstract, EditInlineNew, CollapseCategories, BlueprintType, Blueprintable)
@@ -100,23 +166,12 @@ class GAMECORE_API URequirement : public UObject
 {
     GENERATED_BODY()
 public:
-    // ── Watcher System ────────────────────────────────────────────────────────
-
-    // If true, once this requirement passes it can never revert.
-    // (e.g. level reached, quest completed, achievement unlocked.)
-    // The watcher caches a permanent Pass and skips re-evaluation after that point.
-    // Set this in the Details panel for Blueprint subclasses, or override in C++.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Requirement")
     bool bIsMonotonic = false;
 
-    // Populates OutEvents with the GameplayTags that, when fired through
-    // URequirementWatcherManager, should dirty any set containing this requirement.
-    // Default: empty (requirement is never automatically dirtied — manual re-evaluation only).
-    // Override in every requirement that participates in watched evaluation.
     UFUNCTION(BlueprintNativeEvent, Category = "Requirement")
     void GetWatchedEvents(FGameplayTagContainer& OutEvents) const;
 
-    // ── Evaluation (unchanged) ─────────────────────────────────────────────────
     virtual FRequirementResult Evaluate(const FRequirementContext& Context) const;
     virtual bool IsAsync() const { return false; }
     virtual void EvaluateAsync(const FRequirementContext& Context,
@@ -132,9 +187,26 @@ Full class definition, statelessness contract, and subclassing checklist: see su
 
 ---
 
+# `URequirement_Persisted` — Payload-Reading Base Class
+
+**File:** `Requirements/RequirementPersisted.h / .cpp`
+
+> **Status: Specified in code within the Quest System implementation but not yet promoted to a standalone sub-page in this specification.** The class definition is available in `GameCore Specifications/Quest System/GameCore Changes.md` as an interim reference. A dedicated sub-page should be created here when the Requirement System sub-pages are next updated.
+
+An abstract intermediate class between `URequirement` and any requirement that reads from `FRequirementContext::PersistedData`. Seals `Evaluate()` so subclasses cannot accidentally bypass the payload lookup. Subclasses implement `EvaluateWithPayload(Context, Payload)` instead.
+
+**Key properties:**
+- `PayloadKey` (`FGameplayTag`): domain key used to look up `FRequirementPayload` in `FRequirementContext::PersistedData`. Must match the key the owning system injects.
+- `GetDataAuthority()` returns `Both`: payload is built from replicated data, available on both server and owning client.
+- `Evaluate()` is `final`: subclasses must not override it. Sealed to ensure payload lookup always runs.
+
+See `GameCore Specifications/Quest System/GameCore Changes.md` for the current class definition.
+
+---
+
 # Requirement Sets (Summary)
 
-`URequirementList` is a `UPrimaryDataAsset` with a configurable `Operator` (AND or OR) and an array of `URequirement` children. `URequirementSet` has been removed — `URequirementList` is the sole class. Any boolean expression is achievable by nesting `URequirement_Composite` elements in the array.
+`URequirementList` is a `UPrimaryDataAsset` with a configurable `Operator` (AND or OR) and an array of `URequirement` children. Any boolean expression is achievable by nesting `URequirement_Composite` elements in the array.
 
 Full specification: see sub-page **Requirement List**.
 
@@ -149,7 +221,7 @@ Event-driven reactive evaluation for watched requirement sets. Eliminates pollin
 | `URequirementWatcherManager` | WorldSubsystem | Server + owning Client | Routes `RequirementEvent.*` tag events to the correct player's component |
 | `URequirementWatcherComponent` | ActorComponent on `APlayerState` | Server + owning Client | Owns registered sets, dirty flags, coalescing timer, cache |
 
-At startup the component does a full evaluation pass. After that, only dirty sets are re-evaluated. Flush delay is configurable per owning system (default 0.5s; UI systems may use 0.1s).
+`RegisterSet` accepts an optional `TFunction<void(FRequirementContext&)> ContextBuilder` delegate. The builder is called immediately before every evaluation flush to inject payload data or other per-evaluation state into the context. This is how `UQuestComponent` injects tracker counters into `FRequirementContext::PersistedData` for completion requirement evaluation.
 
 Full specification: see sub-page **Watcher System**.
 
@@ -157,26 +229,26 @@ Full specification: see sub-page **Watcher System**.
 
 # Provided Requirement Types
 
-`URequirement` and `URequirement_Composite` are the only types in `Requirements/`. All other types live inside the module they query.
+`URequirement`, `URequirement_Composite`, and `URequirement_Persisted` are the only types in `Requirements/`. All other types live inside the module they query.
 
-| Class | Display Name | Owned By | Configurable Properties |
+| Class | Display Name | Owned By | Notes |
 | --- | --- | --- | --- |
-| `URequirement_Composite` | Composite (AND / OR / NOT) | `Requirements/` | `Operator`, `Children[]` |
-| `URequirement_HasTag` | Has Gameplay Tag | `Tags/` | `RequiredTag` |
-| `URequirement_MinLevel` | Minimum Player Level | `Leveling/` | `MinLevel` (int32) |
-| `URequirement_QuestCompleted` | Quest Completed | `Quests/` | `QuestId` (FName) |
-| `URequirement_QuestActive` | Quest Active | `Quests/` | `QuestId` (FName) |
-| `URequirement_TimeOfDay` | Time Of Day Window | `TimeOfDay/` | `StartHour`, `EndHour` (float) |
+| `URequirement_Composite` | Composite (AND / OR / NOT) | `Requirements/` | Boolean logic tree |
+| `URequirement_Persisted` | *(abstract)* | `Requirements/` | Base for payload-reading requirements |
+| `URequirement_HasTag` | Has Gameplay Tag | `Tags/` | Reads replicated tag state |
+| `URequirement_QuestCompleted` | Quest Completed | `Quest/Requirements/` | Reads `CompletedQuestTags` |
+| `URequirement_QuestCooldown` | Quest Cooldown | `Quest/Requirements/` | Reads `LastCompletedTimestamp` via context |
+| `URequirement_ActiveQuestCount` | Active Quest Capacity | `Quest/Requirements/` | Reads `ActiveQuests` count |
 
 ---
 
 # Adding a New Requirement Type
 
-1. Subclass `URequirement` inside the module that owns the data being queried.
+1. Subclass `URequirement` (or `URequirement_Persisted` if reading payload data) inside the module that owns the data being queried.
 2. Add `DisplayName = "..."` and `Blueprintable` to the `UCLASS` macro.
 3. Add `"Requirements"` to `PublicDependencyModuleNames` in `Build.cs`.
 4. Declare config properties as `EditDefaultsOnly BlueprintReadOnly UPROPERTY`.
-5. Override `Evaluate` (sync) or `IsAsync` + `EvaluateAsync` (async).
+5. Override `Evaluate` (sync) or `IsAsync` + `EvaluateAsync` (async). For `URequirement_Persisted` subclasses: override `EvaluateWithPayload` instead.
 6. Override `GetWatchedEvents` to declare which `RequirementEvent.*` tags invalidate this requirement.
 7. Set `bIsMonotonic = true` in the CDO or Details panel if the condition can never revert once passed.
 8. Override `GetDescription()` inside `#if WITH_EDITOR`.
@@ -187,40 +259,41 @@ Full specification: see sub-page **Watcher System**.
 
 # Network Considerations
 
-The core Requirement System has no replication code — it is a pure evaluation layer. The Watcher System adds network-aware authority handling.
-
 | Concern | Approach |
 | --- | --- |
-| Authority | Server evaluates before any gated action. Both sync and async paths. |
-| Client display | Client may call `EvaluateAll` locally for UI using replicated PlayerState data. Non-authoritative. |
+| Authority | Server evaluates before any gated action. |
+| Client display | Client may call `Evaluate` locally for UI using replicated `PlayerState` data and replicated context payload. Non-authoritative. |
 | `ClientValidated` sets | Client evaluates for responsiveness; on all-pass, fires Server RPC. Server re-evaluates fully — never trusts client result. |
 | `ClientOnly` sets | Server never evaluates. Pure UI/cosmetic gating. |
 | Context construction | Server derives `FRequirementContext` from RPC connection — never trusts client-provided subject references. |
+| Payload authority | `FRequirementContext::PersistedData` is built client-side from replicated runtime data. Requirements reading it must declare `GetDataAuthority() == Both`. |
 | Failure feedback | Consuming system sends a targeted ClientRPC with the `FText` failure reason. |
 
 ---
 
 # File and Folder Structure
 
-```jsx
+```
 GameCore/
 └── Source/GameCore/
     ├── Requirements/                               ← Core. Zero outgoing dependencies.
     │   ├── Requirement.h / .cpp                    ← URequirement base
+    │   ├── RequirementContext.h                    ← FRequirementContext, FRequirementResult
+    │   ├── RequirementPayload.h                    ← FRequirementPayload (NEW)
+    │   ├── RequirementPersisted.h / .cpp           ← URequirement_Persisted (NEW)
     │   ├── RequirementComposite.h / .cpp           ← URequirement_Composite
     │   ├── RequirementLibrary.h / .cpp             ← URequirementLibrary
     │   ├── RequirementSet.h / .cpp                 ← URequirementSet, URequirementList
     │   └── RequirementWatcher.h / .cpp             ← URequirementWatcherComponent, URequirementWatcherManager
     │
+    ├── Quest/Requirements/
+    │   ├── Requirement_QuestCompleted.h / .cpp
+    │   ├── Requirement_QuestCooldown.h / .cpp
+    │   └── Requirement_ActiveQuestCount.h
     ├── Tags/Requirements/
     │   └── RequirementHasTag.h / .cpp
-    ├── Leveling/Requirements/
-    │   └── RequirementMinLevel.h / .cpp
-    ├── Quests/Requirements/
-    │   ├── RequirementQuestCompleted.h / .cpp
-    │   └── RequirementQuestActive.h / .cpp
-    └── TimeOfDay/Requirements/
-        └── RequirementTimeOfDay.h / .cpp
+    └── Leveling/Requirements/
+        └── RequirementMinLevel.h / .cpp
 ```
 
 ---
@@ -232,6 +305,7 @@ GameCore/
 - **`EvaluateAllAsync` has no cancellation token.** Guard with `TWeakObjectPtr` capture in the lambda.
 - **Blueprint subclassing is unvalidated at edit time.** Blueprint requirements on hot evaluation paths should be moved to C++ before shipping.
 - **Watcher flush delay adds latency.** Quest unlock or ability availability may lag up to the flush delay after the triggering event. This is intentional — tune delay per system.
+- **`URequirement_Persisted` has no standalone sub-page yet.** See the `GameCore Changes.md` cross-reference in the Quest System spec for the interim class definition.
 
 ---
 
@@ -243,7 +317,7 @@ GameCore/
 | `URequirement_Composite` | `ERequirementOperator`, AND/OR/NOT evaluation logic, async propagation, authoring patterns |
 | `URequirementLibrary` | `EvaluateAll`, `MeetsAll`, `EvaluateAllAsync`, `ValidateRequirements`, `EEvaluateAsyncMode` |
 | Requirement Sets | `URequirementSet`, `URequirementList`, `FRequirementSetRuntime`, authority flags |
-| Watcher System | `URequirementWatcherComponent`, `URequirementWatcherManager`, event tags, dirty coalescing, cache |
+| Watcher System | `URequirementWatcherComponent`, `URequirementWatcherManager`, event tags, dirty coalescing, cache, `ContextBuilder` |
 
 [`URequirement_Composite`](Requirement%20System/URequirement_Composite%20319d261a36cf81bf84aadce23da6e5a0.md)
 
