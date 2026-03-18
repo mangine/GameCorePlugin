@@ -20,14 +20,6 @@ struct GAMECORE_API FLootReward
     UPROPERTY(BlueprintReadOnly)
     FGameplayTag RewardType;
 
-    // The concrete reward definition asset (item def, currency def, XP config, etc.).
-    // Must implement ILootRewardable — enforced at authoring time by the editor asset
-    // picker filter in FFLootTableEntryCustomization. Not enforced at runtime.
-    // Null for tag-only rewards where RewardType alone is sufficient for routing.
-    // Loaded async by the fulfillment layer — never loaded by the loot system.
-    UPROPERTY(BlueprintReadOnly)
-    TSoftObjectPtr<UObject> RewardDefinition;
-
     // Final resolved quantity after applying EQuantityDistribution to the entry range.
     // Always >= 1 for valid rewards.
     UPROPERTY(BlueprintReadOnly)
@@ -39,52 +31,65 @@ struct GAMECORE_API FLootReward
 
 ---
 
-## Asset Contract
+## Asset Reference — FLootTableEntry
 
-`RewardDefinition` holds any `UObject`-derived asset that implements `ILootRewardable`. The type is `TSoftObjectPtr<UObject>` at the C++ level to avoid forcing a base class on external systems. The editor picker filters to `ILootRewardable` implementors only — see [ILootRewardable](ILootRewardable.md).
-
-The fulfillment layer casts to the concrete type after async loading:
+`FLootReward` itself carries no asset reference — it is the **output** of a roll and holds only resolved data. The asset reference lives on `FLootTableEntry::RewardDefinition`, which is where the editor picker filtering is applied:
 
 ```cpp
-if (UItemDefinition* ItemDef = Cast<UItemDefinition>(Reward.RewardDefinition.Get()))
-    InventorySystem->AddItem(Recipient, ItemDef, Reward.Quantity);
+// In FLootTableEntry — this is where ILootRewardable filtering is enforced.
+// The meta tag signals FFLootTableEntryCustomization to replace the default
+// picker with an ILootRewardable-filtered SObjectPropertyEntryBox.
+UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Reward",
+    meta = (GameCoreInterfaceFilter = "LootRewardable"))
+TSoftObjectPtr<UObject> RewardDefinition;
 ```
+
+At roll time, `RewardDefinition` is copied from the selected `FLootTableEntry` into `FLootReward` as a resolved soft reference. The loot system never loads it — that is the fulfillment layer's responsibility.
+
+See [ILootRewardable](ILootRewardable.md) for the full filtering mechanism and [FLootTableEntry](FLootTableEntry.md) for the full entry definition.
 
 ---
 
 ## Fulfillment Routing Pattern
 
-The game layer switches on `RewardType` to dispatch:
+The game layer switches on `RewardType` to dispatch. Assets are loaded async before casting:
 
 ```cpp
 void UMyRewardHandler::FulfillRewards(
-    APlayerState* Recipient,
+    APlayerState*              Recipient,
     const TArray<FLootReward>& Rewards,
-    const FLootRollContext& Context)
+    const FLootRollContext&    Context)
 {
     for (const FLootReward& Reward : Rewards)
     {
         if (Reward.RewardType.MatchesTag(TAG_Reward_Item))
         {
-            UItemDefinition* Def = Cast<UItemDefinition>(Reward.RewardDefinition.Get());
+            // RewardDefinition is a soft ref — load async before use in production.
+            // Shown here as synchronous for brevity.
+            UItemDefinition* Def =
+                Cast<UItemDefinition>(Reward.RewardDefinition.LoadSynchronous());
             if (Def) InventorySystem->AddItem(Recipient, Def, Reward.Quantity);
         }
         else if (Reward.RewardType.MatchesTag(TAG_Reward_XP))
         {
-            UXPRewardDefinition* Def = Cast<UXPRewardDefinition>(Reward.RewardDefinition.Get());
-            if (Def) ProgressionSubsystem->GrantXP(Recipient, Def->ProgressionTag, Reward.Quantity, ...);
+            UXPRewardDefinition* Def =
+                Cast<UXPRewardDefinition>(Reward.RewardDefinition.LoadSynchronous());
+            if (Def)
+                ProgressionSubsystem->GrantXP(
+                    Recipient, Def->ProgressionTag, Reward.Quantity, ...);
         }
         else if (Reward.RewardType.MatchesTag(TAG_Reward_Currency))
         {
-            UCurrencyDefinition* Def = Cast<UCurrencyDefinition>(Reward.RewardDefinition.Get());
+            UCurrencyDefinition* Def =
+                Cast<UCurrencyDefinition>(Reward.RewardDefinition.LoadSynchronous());
             if (Def) CurrencySystem->Credit(Recipient, Def, Reward.Quantity);
         }
-        // ... extend per game without touching GameCore
+        // Extend per game without touching GameCore.
     }
 }
 ```
 
-`FLootReward` is intentionally dumb — it carries data, not behavior. All routing lives in the game layer.
+`FLootReward` is intentionally dumb — it carries data, not behavior. All routing and loading lives in the game layer.
 
 ---
 

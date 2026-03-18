@@ -47,9 +47,25 @@ One line. No restructuring of the existing hierarchy.
 
 ## Editor Asset Picker Filtering
 
-`FLootTableEntry::RewardDefinition` uses a `TSoftObjectPtr<UObject>` in the struct declaration. Without additional tooling, the editor would show all assets — unusable for designers.
+`FLootTableEntry::RewardDefinition` is a `TSoftObjectPtr<UObject>` at the C++ level. Without additional tooling the editor would show all assets — unusable for designers.
 
-Filtering is provided by a **`IPropertyTypeCustomization`** registered in `GameCoreEditor` for `FLootTableEntry`. It replaces the default `RewardDefinition` picker with a filtered picker that only shows assets whose class implements `ILootRewardable`.
+Filtering is enforced at authoring time by `FFLootTableEntryCustomization`, an `IPropertyTypeCustomization` registered in `GameCoreEditor`. It replaces the default `RewardDefinition` picker with an `SObjectPropertyEntryBox` filtered via `GameCoreEditorUtils::AssetImplementsInterface` — see [GameCoreEditorUtils](../GameCore%20Editor/GameCoreEditorUtils.md).
+
+### `FLootTableEntry` — Property Hook
+
+For `FFLootTableEntryCustomization` to intercept the right field, `FLootTableEntry::RewardDefinition` carries a `meta` tag that marks it as the target for custom picker rendering:
+
+```cpp
+// In FLootTableEntry — the meta tag signals FFLootTableEntryCustomization
+// to replace this field's widget with the ILootRewardable-filtered picker.
+UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Reward",
+    meta = (GameCoreInterfaceFilter = "LootRewardable"))
+TSoftObjectPtr<UObject> RewardDefinition;
+```
+
+`FFLootTableEntryCustomization::CustomizeChildren` checks for this meta tag to identify which child property gets the filtered picker. All other children are rendered normally. This makes the mechanism explicit and reusable — any future struct property that needs interface filtering adds the same meta tag and the customization handles it automatically.
+
+### `FFLootTableEntryCustomization`
 
 **File:** `GameCoreEditor/LootTable/FLootTableEntryCustomization.h`
 
@@ -59,57 +75,108 @@ class FFLootTableEntryCustomization : public IPropertyTypeCustomization
 public:
     static TSharedRef<IPropertyTypeCustomization> MakeInstance();
 
-    virtual void CustomizeHeader(TSharedRef<IPropertyHandle> PropertyHandle,
-        FDetailWidgetRow& HeaderRow,
+    // Renders the struct row header — default behavior, no override needed.
+    virtual void CustomizeHeader(
+        TSharedRef<IPropertyHandle>      StructHandle,
+        FDetailWidgetRow&                HeaderRow,
         IPropertyTypeCustomizationUtils& Utils) override;
 
-    virtual void CustomizeChildren(TSharedRef<IPropertyHandle> PropertyHandle,
-        IDetailChildrenBuilder& ChildBuilder,
+    // Iterates all children of FLootTableEntry.
+    // Children without the GameCoreInterfaceFilter meta tag are added normally.
+    // Children with the tag get a filtered SObjectPropertyEntryBox instead.
+    virtual void CustomizeChildren(
+        TSharedRef<IPropertyHandle>      StructHandle,
+        IDetailChildrenBuilder&          ChildBuilder,
         IPropertyTypeCustomizationUtils& Utils) override;
-
-private:
-    // Builds an SObjectPropertyEntryBox filtered to ILootRewardable implementors.
-    // Used for the RewardDefinition slot only; all other children rendered normally.
-    TSharedRef<SWidget> BuildFilteredAssetPicker(
-        TSharedRef<IPropertyHandle> RewardDefinitionHandle);
-
-    // Filter callback passed to the asset picker.
-    // Returns true only for assets whose class ImplementsInterface(ULootRewardable::StaticClass()).
-    bool OnShouldFilterAsset(const FAssetData& AssetData) const;
 };
 ```
 
-Registered in the editor module startup:
+### `CustomizeChildren` Implementation
 
 ```cpp
-void FGameCoreEditorModule::StartupModule()
+void FFLootTableEntryCustomization::CustomizeChildren(
+    TSharedRef<IPropertyHandle>      StructHandle,
+    IDetailChildrenBuilder&          ChildBuilder,
+    IPropertyTypeCustomizationUtils& Utils)
 {
-    FPropertyEditorModule& PropertyModule =
-        FModuleManager::LoadModuleChecked<FPropertyEditorModule>("PropertyEditor");
+    uint32 NumChildren = 0;
+    StructHandle->GetNumChildren(NumChildren);
 
-    PropertyModule.RegisterCustomPropertyTypeLayout(
-        FLootTableEntry::StaticStruct()->GetFName(),
-        FOnGetPropertyTypeCustomizationInstance::CreateStatic(
-            &FFLootTableEntryCustomization::MakeInstance));
+    for (uint32 i = 0; i < NumChildren; ++i)
+    {
+        TSharedRef<IPropertyHandle> ChildHandle =
+            StructHandle->GetChildHandle(i).ToSharedRef();
+
+        // Check for the interface filter meta tag.
+        const FString InterfaceName = ChildHandle->GetProperty()
+            ? ChildHandle->GetProperty()->GetMetaData(TEXT("GameCoreInterfaceFilter"))
+            : FString();
+
+        if (!InterfaceName.IsEmpty())
+        {
+            // Resolve the interface UClass by name from the meta value.
+            // Convention: meta value is the interface class name without the U prefix.
+            // e.g. "LootRewardable" resolves to ULootRewardable::StaticClass().
+            UClass* InterfaceClass = FindObject<UClass>(
+                ANY_PACKAGE, *FString::Printf(TEXT("U%s"), *InterfaceName));
+
+            if (InterfaceClass)
+            {
+                // Replace default widget with a filtered asset picker.
+                ChildBuilder.AddCustomRow(
+                    ChildHandle->GetPropertyDisplayName())
+                .NameContent()
+                [
+                    ChildHandle->CreatePropertyNameWidget()
+                ]
+                .ValueContent()
+                [
+                    SNew(SObjectPropertyEntryBox)
+                        .PropertyHandle(ChildHandle)
+                        .AllowedClass(UObject::StaticClass())
+                        .OnShouldFilterAsset_Static(
+                            &GameCoreEditorUtils::AssetImplementsInterface,
+                            InterfaceClass)
+                        .ThumbnailPool(Utils.GetThumbnailPool())
+                ];
+                continue;
+            }
+        }
+
+        // Default rendering for all other children.
+        ChildBuilder.AddProperty(ChildHandle);
+    }
 }
+```
+
+**Key points:**
+- The meta value `"LootRewardable"` is resolved to `ULootRewardable::StaticClass()` at customization time via `FindObject` — no hardcoded class references in the customization itself.
+- Adding the meta tag to any future `TSoftObjectPtr<UObject>` property in any struct registered with this customization pattern automatically gets the filtered picker — no changes to the customization code.
+- `GameCoreEditorUtils::AssetImplementsInterface` does the actual filtering — see [GameCoreEditorUtils](../GameCore%20Editor/GameCoreEditorUtils.md).
+
+### Registration
+
+```cpp
+// In FGameCoreEditorModule::StartupModule()
+PropertyModule.RegisterCustomPropertyTypeLayout(
+    FLootTableEntry::StaticStruct()->GetFName(),
+    FOnGetPropertyTypeCustomizationInstance::CreateStatic(
+        &FFLootTableEntryCustomization::MakeInstance));
 ```
 
 ---
 
 ## Reusability
 
-`FFLootTableEntryCustomization::OnShouldFilterAsset` uses only `UClass::ImplementsInterface` — a generic UE mechanism. The same filter pattern can be extracted into a shared utility:
+The entire filtering mechanism is interface-agnostic:
 
-```cpp
-// GameCoreEditor/Utils/GameCoreEditorUtils.h
-namespace GameCoreEditorUtils
-{
-    // Returns a filter delegate that accepts only assets implementing the given interface.
-    FOnShouldFilterAsset MakeInterfaceFilter(UClass* InterfaceClass);
-}
-```
+| Component | What it does | How to reuse |
+|---|---|---|
+| `GameCoreEditorUtils::AssetImplementsInterface` | Filter predicate | Pass any `UClass*` as the interface argument |
+| `meta = (GameCoreInterfaceFilter = "X")` | Marks a property for filtered picking | Add to any `TSoftObjectPtr<UObject>` property in any customized struct |
+| `FFLootTableEntryCustomization::CustomizeChildren` | Reads the meta tag and wires the filter | Register a new `IPropertyTypeCustomization` for a different struct; same `CustomizeChildren` pattern |
 
-Any future `IPropertyTypeCustomization` in GameCore that needs interface-filtered picking reuses `MakeInterfaceFilter` without duplicating the predicate logic.
+A new struct that needs interface-filtered picking requires: one new `IPropertyTypeCustomization` class (copy the `CustomizeChildren` pattern), one `RegisterCustomPropertyTypeLayout` call, and the `meta` tag on the target property. `GameCoreEditorUtils` needs no changes.
 
 ---
 
@@ -117,5 +184,5 @@ Any future `IPropertyTypeCustomization` in GameCore that needs interface-filtere
 
 - `ILootRewardable` lives in the **runtime** `GameCore` module — implementing it requires no editor dependency.
 - `FFLootTableEntryCustomization` lives in the **editor-only** `GameCoreEditor` module — never compiled into shipping builds.
-- The soft reference in `FLootReward::RewardDefinition` remains `TSoftObjectPtr<UObject>` at the C++ level. The interface filter is an editor-only authoring constraint, not a runtime type check. The fulfillment layer casts to the expected type after loading.
-- If a non-`ILootRewardable` asset is somehow loaded at runtime (e.g. hand-edited asset file), `FLootReward::IsValid()` still returns true — the `RewardType` tag drives routing. The fulfillment layer is responsible for safe casting.
+- The `TSoftObjectPtr<UObject>` type on `RewardDefinition` is intentional. The interface filter is an editor authoring constraint, not a C++ type constraint. The fulfillment layer casts to the expected type after async load.
+- If a non-`ILootRewardable` asset is hand-edited into an asset file at runtime, `FLootReward::IsValid()` still returns true — `RewardType` drives routing. The fulfillment layer handles safe casting.
