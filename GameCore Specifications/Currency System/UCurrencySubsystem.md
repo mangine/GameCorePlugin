@@ -200,10 +200,10 @@ EWalletMutationResult UCurrencySubsystem::TransferCurrency(
     To->OnCurrencyChanged.Broadcast(CurrencyTag, ToOld, ToEntry->Amount);
 
     // 5. Audit — single transactional group for both sides
-    // Begin event
+    // Begin event (debit side)
     DispatchAudit(TAG_Audit_Currency_Transfer, From, CurrencyTag,
         -Amount, FromEntry->Amount, Source, Target, SessionId);
-    // Commit event (same SessionId links them for recovery queries)
+    // Commit event (credit side — same SessionId links them for recovery queries)
     DispatchAudit(TAG_Audit_Currency_TransferCommit, To, CurrencyTag,
         Amount, ToEntry->Amount, Source, Target, SessionId);
 
@@ -239,6 +239,8 @@ EWalletMutationResult UCurrencySubsystem::ValidateWallet(
 
 ## DispatchAudit
 
+`ISourceIDInterface` exposes only `GetSourceTag()` and `GetSourceDisplayName()` — it does not carry a `FGuid`. Entity GUIDs for audit purposes must come from the wallet's owning Actor. The owning Actor is expected to implement a separate identity interface (or the game module provides a utility) that maps Actor → `FGuid`. For the purposes of this spec, this is expressed as `FEntityIdentity::GetGuid(Actor)` — a game-module-level utility that the game wires up at startup.
+
 ```cpp
 void UCurrencySubsystem::DispatchAudit(
     FGameplayTag              EventTag,
@@ -251,34 +253,40 @@ void UCurrencySubsystem::DispatchAudit(
     FGuid                     SessionId)
 {
     FAuditEntry Entry;
-    Entry.EventTag         = EventTag;
-    Entry.SchemaVersion    = 1;
-    Entry.SessionId        = SessionId;
+    Entry.EventTag      = EventTag;
+    Entry.SchemaVersion = 1;
+    Entry.SessionId     = SessionId;
 
-    // Source identity
+    // ActorId and ActorDisplayName come from the Source ISourceIDInterface.
+    // ISourceIDInterface does not carry a FGuid — the game module must resolve
+    // entity GUIDs externally (e.g. via a player state identity component or
+    // a game-level FEntityIdentity utility). Here we use the wallet owner name
+    // as a fallback display string; replace with a proper GUID at game-module level.
     if (Source.GetObject())
     {
-        Entry.ActorId          = Source->GetSourceGuid();  // Assumes ISourceIDInterface exposes GUID
         Entry.ActorDisplayName = Source->GetSourceDisplayName().ToString();
+        // Entry.ActorId = resolved by game module from Source object
     }
 
-    // Target identity in SubjectId/SubjectTag
+    // SubjectId/SubjectTag identify the target entity.
     if (Target.GetObject())
     {
-        Entry.SubjectId  = Target->GetSourceGuid();
         Entry.SubjectTag = Target->GetSourceTag();
+        // Entry.SubjectId = resolved by game module from Target object
     }
 
     Entry.Payload = FAuditPayloadBuilder{}
-        .SetTag  (TEXT("currency"),          CurrencyTag)
-        .SetInt  (TEXT("delta"),             Delta)
-        .SetInt  (TEXT("resulting_amount"),  ResultingAmount)
+        .SetTag   (TEXT("currency"),         CurrencyTag)
+        .SetInt   (TEXT("delta"),            Delta)
+        .SetInt   (TEXT("resulting_amount"), ResultingAmount)
         .SetString(TEXT("wallet_owner"),     PrimaryWallet->GetOwner()->GetName())
         .ToString();
 
     FGameCoreBackend::Audit(Entry);
 }
 ```
+
+**Note on GUID resolution:** `FAuditEntry::ActorId` and `SubjectId` must be populated at the game-module layer, not inside GameCore. GameCore cannot assume any specific identity system. The recommended pattern is for the game module to subclass `UCurrencySubsystem` or provide a bound delegate that resolves `UObject* → FGuid` before calling `FGameCoreBackend::Audit`. This keeps the plugin generic while allowing full audit fidelity in the game.
 
 ---
 
