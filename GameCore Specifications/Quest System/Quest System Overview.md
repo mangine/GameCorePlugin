@@ -11,14 +11,16 @@
 
 | File | Contents |
 |---|---|
-| [GameCore Changes](GameCore%20Changes.md) | `IGroupProvider`, `FRequirementPayload`, `FRequirementContext` addition, `URequirement_Persisted` |
+| [Requirements and Design Decisions](Requirements%20and%20Design%20Decisions.md) | Original requirements, features added during design, architectural decisions and rationale, rejected features |
+| [GameCore Changes](GameCore%20Changes.md) | Cross-reference: GameCore additions made for the quest system |
 | [Data Assets & Definitions](Data%20Assets%20and%20Definitions.md) | `UQuestDefinition`, `USharedQuestDefinition`, `UQuestStageDefinition`, all supporting structs and enums |
 | [Runtime Structs](Runtime%20Structs.md) | `FQuestRuntime`, `FQuestTrackerEntry`, `FQuestRuntimeArray`, replication details |
 | [UQuestComponent](UQuestComponent.md) | Per-player component: accept, fail, complete, persistence, watcher integration |
 | [USharedQuestCoordinator](USharedQuestCoordinator.md) | Shared quest coordinator: group tracker, scaling, disconnect snapshot |
-| [UQuestRegistrySubsystem](UQuestRegistrySubsystem.md) | World subsystem: definition loading, cadence resets, server clock |
+| [UQuestRegistrySubsystem](UQuestRegistrySubsystem.md) | Game instance subsystem: definition loading, cadence resets, server clock |
 | [Requirement Types](Requirement%20Types.md) | Quest-module-owned requirement subclasses |
 | [GMS Events](GMS%20Events.md) | All GameplayMessage events emitted by the quest system |
+| [Integration Guide](Integration%20Guide.md) | Setup checklist, tracker bridge pattern, UI integration, system interfaces |
 | [File Structure](File%20Structure.md) | Module layout, Build.cs dependencies |
 
 ---
@@ -51,8 +53,8 @@ EQuestCheckAuthority::ServerAuthoritative
 
 EQuestCheckAuthority::ClientValidated
   Unlock watcher: runs on SERVER and OWNING CLIENT.
-    Client watcher fires ServerRPC_RequestAccept on pass (UI responsiveness).
-    Server re-evaluates from authoritative context — never trusts client result.
+    Client watcher fires ServerRPC_AcceptQuest on pass (UI responsiveness).
+    Server always re-evaluates before accepting.
   Completion: client watcher fires ServerRPC_RequestValidation on pass.
     Server re-evaluates authoritatively. Never trusts client result.
   Use for: common side quests, daily quests, high-volume quests.
@@ -86,7 +88,7 @@ This wiring bridge lives entirely in the game module.
 
 ---
 
-## Quest Lifecycle State Machine (conceptual)
+## Quest Lifecycle
 
 ```
 [Locked] ──(UnlockRequirements pass)──> [Available]
