@@ -28,6 +28,9 @@ struct GAMECORE_API FLootTableEntry
 
     // ── Reward Payload ───────────────────────────────────────────────────────
 
+    // Authored reward: RewardType tag + RewardDefinition asset.
+    // Quantity is NOT set here — it is resolved from the Quantity range below
+    // and written into the output FLootReward by the roller.
     // Mutually exclusive with NestedTable. If both are set, NestedTable takes priority
     // and Reward is ignored. An ensure() fires in non-shipping builds.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Reward",
@@ -41,7 +44,8 @@ struct GAMECORE_API FLootTableEntry
 
     // ── Quantity ─────────────────────────────────────────────────────────────
 
-    // Quantity awarded when this entry is selected. Applied to FLootReward.Quantity.
+    // Quantity range for this entry. The roller samples this range using
+    // QuantityDistribution and writes the result into FLootReward::Quantity on output.
     // Ignored when NestedTable is set — quantity comes from the sub-table's entries.
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Quantity")
     FInt32Range Quantity = FInt32Range(1);
@@ -74,6 +78,8 @@ enum class EQuantityDistribution : uint8
 
 ## Notes
 
+- `Reward.Quantity` is always 0 in the authored struct — it is not read by the roller. The roller resolves quantity from `FLootTableEntry::Quantity` and writes it into the output `FLootReward::Quantity`.
 - `EntryRequirements` uses the same `URequirement` pattern as the Interaction System and Quest System. Synchronous-only — the roller never suspends.
 - `NestedTable` is a soft reference. The roller loads it synchronously via `LoadSynchronous()` — tables must be small enough that sync load is acceptable on the server. Large tables should be pre-loaded by the caller.
 - A single entry **cannot** be both a leaf reward and a nested table. `ensure(!Reward.IsValid() || NestedTable.IsNull())` fires in non-shipping builds if both are configured.
+- See [FLootReward](FLootReward.md) for `RewardDefinition` field details and the `ILootRewardable` editor picker filtering.
