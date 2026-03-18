@@ -11,7 +11,6 @@ All types on this page are pure data — no mutable runtime state. They are load
 **File:** `Quest/Enums/QuestEnums.h`
 
 ```cpp
-// How many times and under what conditions a quest can be attempted.
 UENUM(BlueprintType)
 enum class EQuestLifecycle : uint8
 {
@@ -21,7 +20,6 @@ enum class EQuestLifecycle : uint8
     Evergreen                UMETA(DisplayName = "Evergreen"),
 };
 
-// Whether the quest must be validated on server first or client first.
 UENUM(BlueprintType)
 enum class EQuestCheckAuthority : uint8
 {
@@ -29,17 +27,15 @@ enum class EQuestCheckAuthority : uint8
     ClientValidated          UMETA(DisplayName = "Client Validated"),
 };
 
-// Periodic reset cadence for repeatable quests.
 UENUM(BlueprintType)
 enum class EQuestResetCadence : uint8
 {
     None                     UMETA(DisplayName = "None"),
-    Daily                    UMETA(DisplayName = "Daily"),       // 00:00 UTC
-    Weekly                   UMETA(DisplayName = "Weekly"),      // Monday 00:00 UTC
-    EventBound               UMETA(DisplayName = "Event Bound"), // Governed by ExpiryTimestamp
+    Daily                    UMETA(DisplayName = "Daily"),
+    Weekly                   UMETA(DisplayName = "Weekly"),
+    EventBound               UMETA(DisplayName = "Event Bound"),
 };
 
-// Role of this player in a shared quest run.
 UENUM(BlueprintType)
 enum class EQuestMemberRole : uint8
 {
@@ -47,7 +43,6 @@ enum class EQuestMemberRole : uint8
     Helper                   UMETA(DisplayName = "Helper"),
 };
 
-// Difficulty classification shown in quest UI.
 UENUM(BlueprintType)
 enum class EQuestDifficulty : uint8
 {
@@ -59,18 +54,8 @@ enum class EQuestDifficulty : uint8
     Legendary   UMETA(DisplayName = "Legendary"),
 };
 
-// Group size constraint for shared quests. Defined here for use by USharedQuestDefinition.
-// Has no effect on UQuestDefinition — the base quest system has no group concept.
-UENUM(BlueprintType)
-enum class EGroupRequirement : uint8
-{
-    None                     UMETA(DisplayName = "None"),
-    GroupOptional            UMETA(DisplayName = "Group Optional"),
-    GroupRequired            UMETA(DisplayName = "Group Required"),
-    GroupOnly                UMETA(DisplayName = "Group Only"),
-};
-
 // How a group collectively accepts a shared quest.
+// Only used by USharedQuestDefinition.
 UENUM(BlueprintType)
 enum class ESharedQuestAcceptance : uint8
 {
@@ -87,7 +72,7 @@ enum class ESharedQuestAcceptance : uint8
 
 ```cpp
 USTRUCT(BlueprintType)
-struct PIRATEQUESTS_API FQuestDisplayData
+struct GAMECORE_API FQuestDisplayData
 {
     GENERATED_BODY()
 
@@ -117,7 +102,7 @@ struct PIRATEQUESTS_API FQuestDisplayData
 
 ```cpp
 USTRUCT(BlueprintType)
-struct PIRATEQUESTS_API FQuestProgressTrackerDef
+struct GAMECORE_API FQuestProgressTrackerDef
 {
     GENERATED_BODY()
 
@@ -128,14 +113,16 @@ struct PIRATEQUESTS_API FQuestProgressTrackerDef
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, meta=(ClampMin=1))
     int32 TargetValue = 1;
 
-    // Per-additional-member multiplier. 0 = non-scalable (direct copy on de-scale).
+    // Per-additional-member multiplier for shared quests.
+    // 0 = non-scalable; shared members contribute but target stays fixed.
     // EffectiveTarget = TargetValue + (GroupSize - 1) * TargetValue * ScalingMultiplier
+    // When GroupSize == 1 (solo), GetEffectiveTarget always returns TargetValue.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly,
               meta=(ClampMin=0.0f, ClampMax=1.0f))
     float ScalingMultiplier = 0.0f;
 
-    // If true, no persistent counter is maintained. CompletionRequirements
-    // re-evaluate this condition on every check from live world state.
+    // If true, no persistent counter is maintained.
+    // CompletionRequirements re-evaluate from live world state on every check.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly)
     bool bReEvaluateOnly = false;
 
@@ -156,32 +143,25 @@ struct PIRATEQUESTS_API FQuestProgressTrackerDef
 
 ```cpp
 UCLASS(EditInlineNew, CollapseCategories, BlueprintType)
-class PIRATEQUESTS_API UQuestStageDefinition : public UObject
+class GAMECORE_API UQuestStageDefinition : public UObject
 {
     GENERATED_BODY()
 public:
-    // Must match a state tag in UQuestDefinition::StageGraph.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Stage")
     FGameplayTag StageTag;
 
-    // Requirements evaluated to determine if this stage is complete.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Stage")
     TObjectPtr<URequirementList> CompletionRequirements;
 
-    // Trackers active while this stage is the current stage.
-    // Entries with bReEvaluateOnly=false produce a live FQuestTrackerEntry
-    // in FQuestRuntime when this stage becomes active.
     UPROPERTY(EditDefaultsOnly, Instanced, BlueprintReadOnly, Category="Stage")
     TArray<FQuestProgressTrackerDef> Trackers;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Stage")
     FText StageObjectiveText;
 
-    // Entering this state triggers the quest failure flow in UQuestComponent.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Stage")
     bool bIsFailureState = false;
 
-    // Entering this state triggers the quest completion flow in UQuestComponent.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Stage")
     bool bIsCompletionState = false;
 
@@ -197,11 +177,11 @@ public:
 
 **File:** `Quest/Data/QuestDefinition.h / .cpp`
 
-The base class. Contains everything needed for a solo quest system. Has no group or sharing concepts.
+Base class. Contains everything needed for a solo quest. No group or sharing concepts.
 
 ```cpp
 UCLASS(BlueprintType)
-class PIRATEQUESTS_API UQuestDefinition : public UPrimaryDataAsset
+class GAMECORE_API UQuestDefinition : public UPrimaryDataAsset
 {
     GENERATED_BODY()
 public:
@@ -212,23 +192,19 @@ public:
               meta=(Categories="Quest.Id"))
     FGameplayTag QuestId;
 
-    // Added to CompletedQuestTags on permanent close (complete or SingleAttempt fail).
-    // Used as O(1) pre-filter before loading the definition.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest",
               meta=(Categories="Quest.Completed"))
     FGameplayTag QuestCompletedTag;
 
-    // ── Live-ops ────────────────────────────────────────────────────────────
+    // ── Live-ops ───────────────────────────────────────────────────────────
 
-    // Kill switch for bugged or temporarily disabled quests.
-    // Disabled quests are excluded from candidate unlock lists.
-    // Active quests with bEnabled=false are removed from ActiveQuests on login
-    // WITHOUT adding QuestCompletedTag — so re-enabling the quest makes it
-    // available again immediately.
+    // Kill switch. Disabled quests are excluded from candidate unlock lists.
+    // Active disabled quests are removed on login WITHOUT adding QuestCompletedTag
+    // so re-enabling makes them immediately available again.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest")
     bool bEnabled = true;
 
-    // ── Lifecycle & Rules ───────────────────────────────────────────────────
+    // ── Lifecycle & Rules ──────────────────────────────────────────────────
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Rules")
     EQuestLifecycle Lifecycle = EQuestLifecycle::RetryUntilComplete;
@@ -243,7 +219,7 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Rules")
     int64 ExpiryTimestamp = 0;
 
-    // ── Stage Graph ───────────────────────────────────────────────────────────
+    // ── Stage Graph ─────────────────────────────────────────────────────────
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Stages")
     TObjectPtr<UStateMachineAsset> StageGraph;
@@ -251,34 +227,31 @@ public:
     UPROPERTY(EditDefaultsOnly, Instanced, BlueprintReadOnly, Category="Quest|Stages")
     TArray<TObjectPtr<UQuestStageDefinition>> Stages;
 
-    // ── Requirements ───────────────────────────────────────────────────────────
+    // ── Requirements ────────────────────────────────────────────────────────
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Requirements")
     TObjectPtr<URequirementList> UnlockRequirements;
 
-    // ── Rewards ───────────────────────────────────────────────────────────────
+    // ── Rewards ──────────────────────────────────────────────────────────────
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Rewards")
     TSoftObjectPtr<ULootTable> FirstTimeRewardTable;
 
-    // Used for Evergreen repeats and RetryAndAssist helper runs.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Rewards")
     TSoftObjectPtr<ULootTable> RepeatingRewardTable;
 
     // ── Categorisation & Display ──────────────────────────────────────────────
 
-    // Mapped to icon via UQuestMarkerDataAsset. e.g. Quest.Marker.MainStory
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Display")
     FGameplayTag QuestMarkerTag;
 
-    // Freeform UI filtering. e.g. Quest.Category.Story, Quest.Category.Combat
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Display")
     FGameplayTagContainer QuestCategories;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Display")
     FQuestDisplayData Display;
 
-    // ── API ───────────────────────────────────────────────────────────────────
+    // ── API ──────────────────────────────────────────────────────────────────
 
     const UQuestStageDefinition* FindStage(const FGameplayTag& StageTag) const;
 
@@ -290,9 +263,6 @@ public:
 #if WITH_EDITOR
     virtual EDataValidationResult IsDataValid(
         FDataValidationContext& Context) const override;
-    // Validates: QuestId set, QuestCompletedTag set, StageGraph set,
-    // all Stages have a matching StateTag in StageGraph,
-    // at least one bIsCompletionState stage exists.
 #endif
 };
 ```
@@ -303,79 +273,41 @@ public:
 
 **File:** `Quest/Data/SharedQuestDefinition.h / .cpp`
 
-Extends `UQuestDefinition` with group/sharing configuration. The base quest system has no knowledge of this class. `USharedQuestComponent` upcasts to it when present.
+Extends `UQuestDefinition` with group enrollment configuration. The base quest system has no knowledge of this class. `USharedQuestComponent` upcasts to it when present. When played solo (no `IGroupProvider` bound), behaves identically to `UQuestDefinition` — `ScalingMultiplier` returns `TargetValue` unchanged for `GroupSize == 1`.
 
 ```cpp
 UCLASS(BlueprintType)
-class PIRATEQUESTS_API USharedQuestDefinition : public UQuestDefinition
+class GAMECORE_API USharedQuestDefinition : public UQuestDefinition
 {
     GENERATED_BODY()
 public:
 
-    // ── Group Constraints ────────────────────────────────────────────────────
+    // ── Group Enrollment ───────────────────────────────────────────────────
 
+    // How the group collectively accepts this quest.
+    // IndividualAccept: each member accepts independently.
+    // LeaderAccept: leader triggers enrollment for all; members have a grace
+    //               window to opt out via the external group system.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Group")
-    EGroupRequirement GroupRequirement = EGroupRequirement::None;
-
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Group",
-              meta=(EditCondition="GroupRequirement != EGroupRequirement::None",
-                    ClampMin=2, ClampMax=40))
-    int32 MinGroupSize = 2;
-
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Group",
-              meta=(EditCondition="GroupRequirement != EGroupRequirement::None",
-                    ClampMin=2, ClampMax=40))
-    int32 MaxGroupSize = 5;
-
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Group",
-              meta=(EditCondition="GroupRequirement != EGroupRequirement::None"))
     ESharedQuestAcceptance AcceptanceMode = ESharedQuestAcceptance::IndividualAccept;
 
-    // Opt-out grace window after leader accepts on behalf of the group.
+    // Grace window duration passed to OnRequestGroupEnrollment on the coordinator.
     // Only meaningful when AcceptanceMode == LeaderAccept.
+    // The external group system owns the timer — this value is metadata only.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Group",
               meta=(EditCondition="AcceptanceMode == ESharedQuestAcceptance::LeaderAccept",
                     ClampMin=0.0f))
     float LeaderAcceptGraceSeconds = 10.0f;
 
-    // True if this quest supports passive tracker contribution from group members
-    // who have the quest active independently (not formally shared).
-    // When true, USharedQuestComponent fans out tracker increments from group
-    // member kill/interaction events to this player's active quest trackers.
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest|Group")
-    bool bAllowPassiveGroupContribution = true;
-
-    // ── API ───────────────────────────────────────────────────────────────────
-
-    bool SupportsGroup() const
-    {
-        return GroupRequirement != EGroupRequirement::None;
-    }
-
-    // True if the player satisfies the group size constraint via IGroupProvider.
-    // Returns true unconditionally if GroupRequirement == None.
-    bool IsGroupSizeValid(int32 CurrentGroupSize) const
-    {
-        if (GroupRequirement == EGroupRequirement::None) return true;
-        if (GroupRequirement == EGroupRequirement::GroupOnly ||
-            GroupRequirement == EGroupRequirement::GroupRequired)
-        {
-            return CurrentGroupSize >= MinGroupSize &&
-                   CurrentGroupSize <= MaxGroupSize;
-        }
-        // GroupOptional: any size is valid
-        return true;
-    }
-
     virtual FPrimaryAssetId GetPrimaryAssetId() const override
     {
+        // Same asset type as base — registry loads both identically.
         return FPrimaryAssetId(TEXT("QuestDefinition"), GetFName());
-        // Same asset type as base — loaded by the same registry.
     }
 };
 ```
 
-> **Design note:** Both `UQuestDefinition` and `USharedQuestDefinition` register under the `"QuestDefinition"` primary asset type. `UQuestRegistrySubsystem` loads all of them identically. `USharedQuestComponent::ServerRPC_AcceptQuest` upcasts the loaded definition to `USharedQuestDefinition*` — if the cast fails, it falls back to solo behavior. This means a `USharedQuestComponent` can accept and run plain `UQuestDefinition` assets without issue.
+> **Design note:** Group size constraints (minimum/maximum party size) are expressed as `URequirement_GroupSize` in `UnlockRequirements`, evaluated through the normal requirement system. `USharedQuestDefinition` does not duplicate this logic. Designers add or omit a group size requirement as they see fit per quest.
 
 ---
 
@@ -385,7 +317,7 @@ public:
 
 ```cpp
 UCLASS(BlueprintType)
-class PIRATEQUESTS_API UQuestMarkerDataAsset : public UDataAsset
+class GAMECORE_API UQuestMarkerDataAsset : public UDataAsset
 {
     GENERATED_BODY()
 public:
