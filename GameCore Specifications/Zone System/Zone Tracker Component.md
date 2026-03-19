@@ -72,7 +72,7 @@ void UZoneTrackerComponent::TickComponent(
 
 ### `EvaluateZones`
 
-Core logic: diff the old and new zone sets, fire GMS messages for each transition.
+Core logic: diff the old and new zone sets, fire EventBus2 messages for each transition.
 
 ```cpp
 void UZoneTrackerComponent::EvaluateZones()
@@ -113,8 +113,13 @@ void UZoneTrackerComponent::BroadcastTransition(AZoneActor* Zone, bool bEntered)
     Msg.DynamicState = Zone->DynamicState;
     Msg.bEntered     = bEntered;
 
-    UGameplayMessageSubsystem& GMS = UGameplayMessageSubsystem::Get(this);
-    GMS.BroadcastMessage(GameCore::Zone::Tags::Channel_Transition, Msg);
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    {
+        Bus->Broadcast<FZoneTransitionMessage>(
+            GameCore::Zone::Tags::Channel_Transition,
+            Msg,
+            EGameCoreEventScope::Both);
+    }
 }
 ```
 
@@ -137,3 +142,4 @@ FVector UZoneTrackerComponent::GetQueryLocation() const
 - **Client authority:** The component runs on every net role. On the client it fires events for local cosmetics immediately. On the server it fires events for authoritative gameplay consequences. Both are correct — listeners must be authoritative about what they do with the event, not the event itself.
 - **Stale actor safety:** `QueryZonesAtPoint` uses `TWeakObjectPtr` internally; the returned array contains only valid pointers. No explicit validity check needed in `EvaluateZones`.
 - **Initial state:** On `BeginPlay`, `CurrentZones` is empty. The first `EvaluateZones` call will generate `bEntered = true` for all zones the actor starts inside. This is correct and intentional — listeners always get an initial enter event.
+- **Scope is `Both`:** Zone transitions are cosmetically meaningful on the client and authoritatively meaningful on the server. Both machines broadcast independently — this is correct and intentional.

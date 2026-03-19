@@ -102,41 +102,37 @@ void UMySystem::BeginPlay()
 {
     Super::BeginPlay();
 
-    if (UGameCoreEventSubsystem* Bus = UGameCoreEventSubsystem::Get(this))
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
     {
         AlignmentHandle = Bus->StartListening<FAlignmentChangedMessage>(
             GameCoreEventTags::Alignment_Changed,
             this,
-            &UMySystem::OnAlignmentChanged);
+            [this](FGameplayTag, const FAlignmentChangedMessage& Msg)
+            {
+                if (Msg.PlayerState != MyTrackedPlayerState) return;
+
+                for (const FAlignmentChangedEntry& Entry : Msg.Changes)
+                {
+                    if (Entry.AlignmentTag == AlignmentTags::GoodEvil)
+                    {
+                        HandleGoodEvilChanged(Msg.PlayerState, Entry.NewEffective, Entry.AppliedDelta);
+                    }
+                }
+            });
     }
 }
 
 void UMySystem::EndPlay(const EEndPlayReason::Type Reason)
 {
-    if (UGameCoreEventSubsystem* Bus = UGameCoreEventSubsystem::Get(this))
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
     {
         Bus->StopListening(AlignmentHandle);
     }
     Super::EndPlay(Reason);
 }
-
-void UMySystem::OnAlignmentChanged(FGameplayTag Channel, const FAlignmentChangedMessage& Msg)
-{
-    // Early-out if this is not the player we care about.
-    if (Msg.PlayerState != MyTrackedPlayerState) return;
-
-    for (const FAlignmentChangedEntry& Entry : Msg.Changes)
-    {
-        if (Entry.AlignmentTag == AlignmentTags::GoodEvil)
-        {
-            // React: Entry.NewEffective is ready to use — no definition asset needed.
-            HandleGoodEvilChanged(Msg.PlayerState, Entry.NewEffective, Entry.AppliedDelta);
-        }
-    }
-}
 ```
 
-> **Always store the handle and call `StopListening` in `EndPlay`.** Leaked handles keep a dangling reference inside GMS.
+> **Always store the handle and call `StopListening` in `EndPlay`.** Leaked handles keep a dangling lambda inside GMS.
 
 ---
 

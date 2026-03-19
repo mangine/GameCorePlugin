@@ -1,6 +1,6 @@
 # GMS Messages & Channel Tags
 
-All Zone System events are broadcast via `UGameplayMessageSubsystem`. No delegates are declared on zone actors or components.
+All Zone System events are broadcast via `UGameCoreEventBus2`. No delegates are declared on zone actors or components.
 
 ---
 
@@ -100,8 +100,14 @@ void AZoneActor::SetOwnerTag(FGameplayTag NewOwner)
     Msg.ZoneActor    = this;
     Msg.StaticData   = DataAsset;
     Msg.DynamicState = DynamicState;
-    UGameplayMessageSubsystem::Get(this).BroadcastMessage(
-        GameCore::Zone::Tags::Channel_StateChanged, Msg);
+
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    {
+        Bus->Broadcast<FZoneStateChangedMessage>(
+            GameCore::Zone::Tags::Channel_StateChanged,
+            Msg,
+            EGameCoreEventScope::Both);
+    }
 }
 ```
 
@@ -112,40 +118,62 @@ void AZoneActor::SetOwnerTag(FGameplayTag NewOwner)
 ### React to zone enter/exit (any system)
 
 ```cpp
-ListenerHandle = GMS.RegisterListener<FZoneTransitionMessage>(
-    GameCore::Zone::Tags::Channel_Transition,
-    this,
-    &UMyWeatherSystem::OnZoneTransition
-);
-
-void UMyWeatherSystem::OnZoneTransition(
-    FGameplayTag Channel, const FZoneTransitionMessage& Msg)
+void UMyWeatherSystem::BeginPlay()
 {
-    if (!Msg.StaticData) return;
+    Super::BeginPlay();
 
-    if (Msg.StaticData->ZoneTypeTag.MatchesTag(MyTags::ZoneType_Weather))
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
     {
-        if (Msg.bEntered) ApplyWeatherPreset(Msg.StaticData);
-        else              ClearWeatherPreset();
+        TransitionHandle = Bus->StartListening<FZoneTransitionMessage>(
+            GameCore::Zone::Tags::Channel_Transition,
+            this,
+            [this](FGameplayTag, const FZoneTransitionMessage& Msg)
+            {
+                if (!Msg.StaticData) return;
+                if (Msg.StaticData->ZoneTypeTag.MatchesTag(MyTags::ZoneType_Weather))
+                {
+                    if (Msg.bEntered) ApplyWeatherPreset(Msg.StaticData);
+                    else              ClearWeatherPreset();
+                }
+            });
     }
+}
+
+void UMyWeatherSystem::EndPlay(const EEndPlayReason::Type Reason)
+{
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+        Bus->StopListening(TransitionHandle);
+    Super::EndPlay(Reason);
 }
 ```
 
 ### React to ownership change
 
 ```cpp
-ListenerHandle = GMS.RegisterListener<FZoneStateChangedMessage>(
-    GameCore::Zone::Tags::Channel_StateChanged,
-    this,
-    &UMyTerritoryHUD::OnZoneStateChanged
-);
-
-void UMyTerritoryHUD::OnZoneStateChanged(
-    FGameplayTag Channel, const FZoneStateChangedMessage& Msg)
+void UMyTerritoryHUD::BeginPlay()
 {
-    if (Msg.StaticData->ZoneTypeTag.MatchesTag(MyTags::ZoneType_Territory))
-        RefreshTerritoryUI(Msg.ZoneActor, Msg.DynamicState.OwnerTag);
+    Super::BeginPlay();
+
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    {
+        StateHandle = Bus->StartListening<FZoneStateChangedMessage>(
+            GameCore::Zone::Tags::Channel_StateChanged,
+            this,
+            [this](FGameplayTag, const FZoneStateChangedMessage& Msg)
+            {
+                if (!Msg.StaticData) return;
+                if (Msg.StaticData->ZoneTypeTag.MatchesTag(MyTags::ZoneType_Territory))
+                    RefreshTerritoryUI(Msg.ZoneActor, Msg.DynamicState.OwnerTag);
+            });
+    }
+}
+
+void UMyTerritoryHUD::EndPlay(const EEndPlayReason::Type Reason)
+{
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+        Bus->StopListening(StateHandle);
+    Super::EndPlay(Reason);
 }
 ```
 
-> **Important:** Always unregister the listener handle in `EndPlay` or the owning object's destructor to avoid dangling callbacks.
+> **Always call `StopListening` in `EndPlay`.** Leaked handles keep a dangling lambda inside GMS.
