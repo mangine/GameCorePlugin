@@ -24,6 +24,10 @@
  * FInstancedStruct-based event bus. Identical contract to UGameCoreEventSubsystem (GMS1)
  * but the payload is always FInstancedStruct, enabling runtime-dynamic message types.
  *
+ * Two StartListening overloads are provided:
+ *   - StartListening<T>  — typed; unwraps FInstancedStruct to T automatically.
+ *   - StartListening     — raw FInstancedStruct; for callers that need to inspect type at runtime.
+ *
  * Both subsystems coexist. Do not remove GMS1 until migration is complete.
  */
 UCLASS()
@@ -58,9 +62,6 @@ public:
      * @param Channel   The channel tag. Must be a valid leaf tag.
      * @param Message   The wrapped struct. Passed by value — caller should MoveTemp.
      * @param Scope     Scope guard. Default: ServerOnly.
-     *
-     * The scope guard is evaluated before forwarding to GMS.
-     * If the guard fails (wrong machine), the broadcast is silently dropped.
      */
     void Broadcast(
         FGameplayTag Channel,
@@ -68,17 +69,42 @@ public:
         EGameCoreEventScope Scope = EGameCoreEventScope::ServerOnly);
 
     // -------------------------------------------------------------------------
-    // Listen / Unlisten
+    // Listen / Unlisten — typed overload (preferred)
     // -------------------------------------------------------------------------
 
     /**
-     * Register a listener on a channel.
+     * Register a typed listener on a channel.
+     *
+     * The bus unwraps FInstancedStruct to T internally via GetPtr<T>().
+     * If the inner struct type does not match T, the callback is silently skipped.
+     * This is the preferred overload — callers never touch FInstancedStruct directly.
      *
      * @param Channel   The channel tag to listen on.
-     * @param Owner     The owning UObject. Used only for lifetime bookkeeping by the caller;
-     *                  GMS2 does not dereference this pointer internally.
+     * @param Owner     Caller-side bookkeeping only; not dereferenced by the bus.
+     * @param Callback  TFunction receiving (Channel, const T&).
+     *
+     * @return A handle. Store it — pass it to StopListening in EndPlay.
+     */
+    template<typename T>
+    FGameplayMessageListenerHandle StartListening(
+        FGameplayTag Channel,
+        UObject* Owner,
+        TFunction<void(FGameplayTag, const T&)> Callback);
+
+    // -------------------------------------------------------------------------
+    // Listen / Unlisten — raw FInstancedStruct overload
+    // -------------------------------------------------------------------------
+
+    /**
+     * Register a raw listener on a channel.
+     *
+     * Use this overload when the message type is not known at compile time
+     * and the caller needs to inspect the inner struct type at runtime
+     * via Message.GetScriptStruct() or Message.GetPtr<T>() manually.
+     *
+     * @param Channel   The channel tag to listen on.
+     * @param Owner     Caller-side bookkeeping only; not dereferenced by the bus.
      * @param Callback  TFunction receiving (Channel, const FInstancedStruct&).
-     *                  Use GetPtr<T>() inside the callback to unwrap the payload.
      *
      * @return A handle. Store it — pass it to StopListening in EndPlay.
      */
@@ -95,11 +121,8 @@ public:
 
 private:
 
-    /** Evaluates the scope guard. Returns true if the broadcast should proceed. */
     bool PassesScopeGuard(EGameCoreEventScope Scope) const;
 
-    /** Cached at Initialize time. GMS is a UWorldSubsystem guaranteed to outlive
-     *  all other subsystems in the same world. Raw pointer is safe. */
     UPROPERTY()
     TObjectPtr<UGameplayMessageSubsystem> GMS;
 };
@@ -107,7 +130,54 @@ private:
 
 ---
 
-## Implementation
+## Template Implementation (must live in the header)
+
+```cpp
+// GameCoreEventBus2.h — below the class declaration
+
+template<typename T>
+FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
+    FGameplayTag Channel,
+    UObject* Owner,
+    TFunction<void(FGameplayTag, const T&)> Callback)
+{
+    if (!GMS || !Channel.IsValid() || !Callback) return FGameplayMessageListenerHandle{};
+
+    // Register on GMS as FInstancedStruct. On each broadcast, unwrap to T.
+    // If the inner type does not match T, GetPtr<T>() returns nullptr — skip silently.
+    return GMS->RegisterListener<FInstancedStruct>(
+        Channel,
+        [CB = MoveTemp(Callback)](FGameplayTag InChannel, const FInstancedStruct& InMsg)
+        {
+            if (const T* TypedMsg = InMsg.GetPtr<T>())
+            {
+                CB(InChannel, *TypedMsg);
+            }
+            // Type mismatch: silently skipped. This is a programmer error
+            // (wrong struct type on channel) caught during development via ensureMsgf below.
+#if !UE_BUILD_SHIPPING
+            else
+            {
+                ensureMsgf(false,
+                    TEXT("UGameCoreEventBus2::StartListening<T> — type mismatch on channel %s. "
+                         "Expected %s, got %s."),
+                    *InChannel.ToString(),
+                    *T::StaticStruct()->GetName(),
+                    InMsg.IsValid() ? *InMsg.GetScriptStruct()->GetName() : TEXT("(empty)"));
+            }
+#endif
+        });
+}
+```
+
+**Notes:**
+- The template must be defined in the `.h` file, not the `.cpp`, because it is instantiated at the call site.
+- The `ensureMsgf` in non-shipping builds surfaces type mismatches immediately during development. In shipping it is compiled out — the mismatch is a silent skip with zero overhead.
+- `T::StaticStruct()` requires `T` to be a `USTRUCT`. This is always true for valid GMS2 message types.
+
+---
+
+## Non-Template Implementation (.cpp)
 
 ### Initialize / Deinitialize
 
@@ -115,11 +185,9 @@ private:
 void UGameCoreEventBus2::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-
-    // Declare GMS as a dependency so the collection initializes it first.
     Collection.InitializeDependency<UGameplayMessageSubsystem>();
     GMS = GetWorld()->GetSubsystem<UGameplayMessageSubsystem>();
-    check(GMS); // Always valid after InitializeDependency
+    check(GMS);
 }
 
 void UGameCoreEventBus2::Deinitialize()
@@ -144,7 +212,7 @@ UGameCoreEventBus2* UGameCoreEventBus2::Get(const UObject* WorldContext)
 }
 ```
 
-> **Do not cache the subsystem pointer as a member in other classes.** Component lifetime can outlive world transitions. Always call `Get(this)` inline.
+> **Do not cache the subsystem pointer as a member in other classes.** Always call `Get(this)` inline.
 
 ### Broadcast
 
@@ -156,23 +224,18 @@ void UGameCoreEventBus2::Broadcast(
 {
     if (!PassesScopeGuard(Scope)) return;
 
-    if (!ensureMsgf(Channel.IsValid(), TEXT("UGameCoreEventBus2::Broadcast — invalid channel tag")))
-        return;
+    if (!ensureMsgf(Channel.IsValid(),
+        TEXT("UGameCoreEventBus2::Broadcast — invalid channel tag"))) return;
 
-    if (!ensureMsgf(Message.IsValid(), TEXT("UGameCoreEventBus2::Broadcast — empty FInstancedStruct on channel %s"),
-        *Channel.ToString()))
-        return;
+    if (!ensureMsgf(Message.IsValid(),
+        TEXT("UGameCoreEventBus2::Broadcast — empty FInstancedStruct on channel %s"),
+        *Channel.ToString())) return;
 
     GMS->BroadcastMessage<FInstancedStruct>(Channel, Message);
 }
 ```
 
-**Notes:**
-- `Message` is taken by value so the caller can `MoveTemp` to avoid a copy.
-- An empty `FInstancedStruct` (default-constructed, no inner type) is a programmer error — the `ensureMsgf` fires in non-shipping builds.
-- GMS copies the struct internally before returning; `Message` can be destroyed after `Broadcast` returns.
-
-### StartListening
+### StartListening (raw overload)
 
 ```cpp
 FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
@@ -182,9 +245,6 @@ FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
 {
     if (!GMS || !Channel.IsValid() || !Callback) return FGameplayMessageListenerHandle{};
 
-    // GMS::RegisterListener requires a member function pointer.
-    // We bridge TFunction via a UObject trampoline wrapper.
-    // The simplest bridge: use the lambda-capturing overload of RegisterListener.
     return GMS->RegisterListener<FInstancedStruct>(
         Channel,
         [CB = MoveTemp(Callback)](FGameplayTag InChannel, const FInstancedStruct& InMsg)
@@ -193,8 +253,6 @@ FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
         });
 }
 ```
-
-> **GMS `RegisterListener` lambda overload:** `UGameplayMessageSubsystem::RegisterListener<T>` has an overload accepting a `TFunction<void(FGameplayTag, const T&)>`. This is the overload used here — no member function pointer required.
 
 ### StopListening
 
@@ -219,27 +277,70 @@ bool UGameCoreEventBus2::PassesScopeGuard(EGameCoreEventScope Scope) const
 
     switch (Scope)
     {
-    case EGameCoreEventScope::ServerOnly:
-        return World->GetNetMode() != NM_Client;
-
-    case EGameCoreEventScope::ClientOnly:
-        return World->GetNetMode() == NM_Client;
-
-    case EGameCoreEventScope::Both:
-        return true;
-
-    default:
-        return false;
+    case EGameCoreEventScope::ServerOnly:  return World->GetNetMode() != NM_Client;
+    case EGameCoreEventScope::ClientOnly:  return World->GetNetMode() == NM_Client;
+    case EGameCoreEventScope::Both:        return true;
+    default:                               return false;
     }
 }
 ```
 
 ---
 
+## Usage Examples
+
+### Typed overload (preferred)
+
+```cpp
+FGameplayMessageListenerHandle LevelUpHandle;
+
+void UMySystem::BeginPlay()
+{
+    Super::BeginPlay();
+
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    {
+        LevelUpHandle = Bus->StartListening<FProgressionLevelUpMessage>(
+            GameCoreEventTags::Progression_LevelUp,
+            this,
+            [this](FGameplayTag Channel, const FProgressionLevelUpMessage& Msg)
+            {
+                // Msg is already unwrapped — no GetPtr needed.
+                UE_LOG(LogTemp, Log, TEXT("Level up to %d"), Msg.NewLevel);
+            });
+    }
+}
+
+void UMySystem::EndPlay(const EEndPlayReason::Type Reason)
+{
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    {
+        Bus->StopListening(LevelUpHandle);
+    }
+    Super::EndPlay(Reason);
+}
+```
+
+### Raw overload (runtime type inspection)
+
+```cpp
+Handle = Bus->StartListening(
+    MyTags::SomeChannel,
+    this,
+    [](FGameplayTag Channel, const FInstancedStruct& Message)
+    {
+        // Inspect type at runtime.
+        if (const FMyTypeA* A = Message.GetPtr<FMyTypeA>()) { /* ... */ }
+        else if (const FMyTypeB* B = Message.GetPtr<FMyTypeB>()) { /* ... */ }
+    });
+```
+
+---
+
 ## Important Notes
 
-- **GMS is synchronous.** `BroadcastMessage` invokes all listeners inline before returning. Listeners with heavy logic should defer their work (e.g. queue a tick task) rather than processing inline.
-- **`FInstancedStruct` owns its memory.** Each `BroadcastMessage` call causes GMS to copy the struct into its internal storage. The `FInstancedStruct` passed to `Broadcast` can be stack-allocated — no heap management needed at call sites.
-- **Type safety is the listener's responsibility.** GMS2 carries no compile-time type constraint per channel. Mismatches between broadcaster struct type and `GetPtr<T>()` in the listener return `nullptr` — handle gracefully.
+- **GMS is synchronous.** All listeners are invoked inline during `Broadcast`. Heavy work must be deferred by the listener.
+- **Template lives in the header.** The typed `StartListening<T>` must be defined in `GameCoreEventBus2.h` — not the `.cpp` — due to C++ template instantiation rules.
+- **Type mismatch fires `ensureMsgf` in non-shipping builds.** In shipping, mismatches are a silent skip. Design channels so only one struct type is ever broadcast on a given tag.
+- **`T` must be a `USTRUCT`.** `T::StaticStruct()` is called inside the template. Non-USTRUCT types will not compile.
 - **Always store the handle and call `StopListening` in `EndPlay`.** Leaked handles keep a dangling lambda inside GMS.
-- **`Owner` parameter is not dereferenced by the bus.** It is a caller-side bookkeeping hint only. The bus does not hold a reference to it. If you need automatic unregistration tied to owner lifetime, call `StopListening` in `EndPlay` manually — there is no auto-cleanup.
