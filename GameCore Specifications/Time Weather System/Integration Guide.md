@@ -6,11 +6,10 @@ End-to-end setup, wiring, and usage samples.
 
 ---
 
-## Module Setup
+## Module Dependencies
 
 ```csharp
-// GameCore.Build.cs — no additional dependencies needed.
-// TimeWeather lives entirely within the GameCore module.
+// In your game module's .Build.cs:
 PublicDependencyModuleNames.AddRange(new string[]
 {
     "GameCore",
@@ -19,32 +18,96 @@ PublicDependencyModuleNames.AddRange(new string[]
 });
 ```
 
+No additional modules are required. The Time Weather System lives entirely within `GameCore`.
+
 ---
 
-## Step 1 — Create a UTimeWeatherConfig Asset
+## Step 1 — Project Settings
 
-1. Right-click in Content Browser → **GameCore → Time Weather Config**.
-2. Set `DayDurationSeconds` (e.g. `1200` = 20-minute days).
-3. Set `YearLengthDays` (e.g. `120` = 4 seasons × 30 days each).
-4. Set `ServerEpochOffsetSeconds` to align day 0 with your desired calendar reference (or leave 0).
-5. Set `WeatherSeedBase` to any fixed integer.
-6. Assign a `UWeatherContextAsset` to `GlobalContext`.
-
-Register the config in `DefaultGame.ini`:
+Create a `UTimeWeatherConfig` data asset and register it:
 
 ```ini
+; DefaultGame.ini
 [/Script/GameCore.TimeWeatherProjectSettings]
 TimeWeatherConfig=/Game/Data/TimeWeather/DA_TimeWeatherConfig.DA_TimeWeatherConfig
 ```
 
+This is the only INI change required. The subsystem reads this at `Initialize` via `GetDefault<UTimeWeatherProjectSettings>()`.
+
 ---
 
-## Step 2 — Create a Global UWeatherContextAsset
+## Step 2 — UTimeWeatherConfig Asset
 
-1. Right-click → **GameCore → Weather Context Asset**.
-2. Add `USeasonDefinition` assets to the `Seasons` array in order (Spring, Summer, Autumn, Winter).
-3. Assign a `UWeatherSequence` (Random or Graph) to each season.
-4. Set `DefaultDayNightCurve` (a `UCurveFloat` with X=day time, Y=daylight).
+Right-click in the Content Browser → **GameCore → Time Weather Config**. Typical values:
+
+| Property | Example Value | Notes |
+|---|---|---|
+| `ServerEpochOffsetSeconds` | `1735689600` | 2025-01-01 UTC → in-game day 0 = game launch |
+| `DayDurationSeconds` | `1200` | 20-minute days |
+| `YearLengthDays` | `120` | 4 seasons × 30 days |
+| `WeatherSeedBase` | `7331` | Any integer; change to reseed all weather globally |
+| `GlobalContext` | `DA_Context_World` | Must be set |
+| `DawnThreshold` | `0.25` | Quarter-day |
+| `DuskThreshold` | `0.75` | Three-quarter-day |
+
+`IsDataValid` will error in the editor if `GlobalContext` is null or thresholds are invalid.
+
+---
+
+## Step 3 — AGameState Subclass (Required)
+
+The subsystem replicates `FGameTimeSnapshot` to clients via `AGameState`. The game module must provide the subclass:
+
+```cpp
+// MyGameState.h
+UCLASS()
+class AMyGameState : public AGameState
+{
+    GENERATED_BODY()
+public:
+    // Replicated to all clients. Updated once per day by UTimeWeatherSubsystem.
+    UPROPERTY(ReplicatedUsing=OnRep_TimeSnapshot)
+    FGameTimeSnapshot TimeSnapshot;
+
+    UFUNCTION()
+    void OnRep_TimeSnapshot()
+    {
+        // Notify client systems that the snapshot has updated.
+        // Clients can now call TimeSnapshot.GetNormalizedDayTime(FPlatformTime::Seconds())
+        // for accurate local time without further server calls.
+        OnTimeSnapshotUpdated.Broadcast(TimeSnapshot);
+    }
+
+    DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+        FOnTimeSnapshotUpdated, const FGameTimeSnapshot&, Snapshot);
+    UPROPERTY(BlueprintAssignable)
+    FOnTimeSnapshotUpdated OnTimeSnapshotUpdated;
+
+    virtual void GetLifetimeReplicatedProps(
+        TArray<FLifetimeProperty>& OutLifetimeProps) const override
+    {
+        Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+        DOREPLIFETIME(AMyGameState, TimeSnapshot);
+    }
+};
+```
+
+`UTimeWeatherSubsystem::PushSnapshotToClients` casts to `AMyGameState` and sets `TimeSnapshot`. Make sure `DefaultEngine.ini` references your subclass:
+
+```ini
+[/Script/Engine.GameMode]
+GameStateClass=/Script/MyGame.MyGameState
+```
+
+---
+
+## Step 4 — Global Context Asset
+
+Create a `UWeatherContextAsset` at e.g. `/Game/Data/TimeWeather/DA_Context_World`:
+
+- Add four `USeasonDefinition` assets to `Seasons` in order: Spring, Summer, Autumn, Winter.
+- Assign a `UCurveFloat` to `DefaultDayNightCurve` (X=day time [0,1), Y=daylight [0,1]).
+- Leave `DaysPerSeason = 0` to divide `YearLengthDays` equally.
 
 **Minimal single-weather world (no seasons):**
 - Leave `Seasons` empty.
@@ -53,52 +116,53 @@ TimeWeatherConfig=/Game/Data/TimeWeather/DA_TimeWeatherConfig.DA_TimeWeatherConf
 
 ---
 
-## Step 3 — Define Season Assets
+## Step 5 — Season Assets
 
 ```
 DA_Season_Summer:
-  SeasonTag = Season.Summer
-  TransitionInPercent = 15
-  DayNightCurve = <long-day curve>
-  WeatherSequence = DA_Seq_Summer_Random
+  SeasonTag            = Season.Summer
+  TransitionInPercent  = 15          // first 15% of Summer blends in from Spring
+  DayNightCurve        = Curve_LongDay
+  WeatherSequence      = DA_Seq_Summer
   TimedEvents:
-    - Event = DA_Event_HeavyRain
-      WindowStart = 0.5   // noon
-      WindowEnd   = 0.75  // late afternoon
-      DailyProbability = 0.35
+    [0] Event=DA_Event_HeavyRain  WindowStart=0.5  WindowEnd=0.75  DailyProbability=0.35
+    [1] Event=DA_Event_Thunderstorm WindowStart=0.6 WindowEnd=0.8  DailyProbability=0.1
 ```
 
 ---
 
-## Step 4 — Define Weather Sequences
+## Step 6 — Weather Sequences
 
-**Random with neighbour filter:**
+**Random with neighbour filter (recommended for most regions):**
 
 ```
-DA_Seq_Summer_Random (UWeatherSequence_Random):
+DA_Seq_Summer (UWeatherSequence_Random):
   KeyframesPerDay = 3
   Entries:
-    - WeatherTag = Weather.Clear       Weight=3  ValidPredecessors=[]
-    - WeatherTag = Weather.PartlyCloudy Weight=2  ValidPredecessors=[]
-    - WeatherTag = Weather.Overcast     Weight=1  ValidPredecessors=[Weather.PartlyCloudy, Weather.Rain]
-    - WeatherTag = Weather.Rain         Weight=1  ValidPredecessors=[Weather.Overcast]
-      TransitionMin=120  TransitionMax=240
+    { WeatherTag=Weather.Clear,       Weight=3, ValidPredecessors=[] }
+    { WeatherTag=Weather.PartlyCloudy, Weight=2, ValidPredecessors=[] }
+    { WeatherTag=Weather.Overcast,     Weight=1,
+      ValidPredecessors=[Weather.PartlyCloudy, Weather.Rain],
+      TransitionMin=120, TransitionMax=240 }
+    { WeatherTag=Weather.Rain,         Weight=1,
+      ValidPredecessors=[Weather.Overcast],
+      TransitionMin=180, TransitionMax=360 }
 ```
 
-With this config, `Weather.Rain` can only follow `Weather.Overcast`, and `Weather.Overcast` can only follow `Weather.PartlyCloudy` or `Weather.Rain`. Clear skies never jump directly to rain.
+With this config: Rain can only follow Overcast; Overcast can only follow PartlyCloudy or Rain. Clear skies never jump directly to rain.
 
 ---
 
-## Step 5 — Add a Permanent Night Region (No Seasons)
+## Step 7 — Permanent Night / Seasonless Region
 
 ```
-DA_Context_Permafrost (UWeatherContextAsset):
-  Seasons = []                         // empty = no season cycling
-  DefaultDayNightCurve = DA_Curve_PermanentNight   // flat curve at Y=0
-  DefaultWeatherSequence = DA_Seq_Blizzard_Simple
+DA_Context_Permafrost:
+  Seasons              = []                        // no season cycling
+  DefaultDayNightCurve = DA_Curve_PermanentNight   // UCurveFloat flat at Y=0
+  DefaultWeatherSequence = DA_Seq_Blizzard
 ```
 
-Region actor:
+Region actor implementing `IWeatherContextProvider`:
 
 ```cpp
 UCLASS()
@@ -106,11 +170,12 @@ class APermafrostRegion : public AActor, public IWeatherContextProvider
 {
     GENERATED_BODY()
 
-    UPROPERTY(EditInstanceOnly)
-    TObjectPtr<UWeatherContextAsset> ContextAsset;
+    // Set once in the editor per placed instance. Never auto-generate at runtime.
+    UPROPERTY(EditInstanceOnly, Category="TimeWeather")
+    FGuid ContextIdGuid;
 
-    UPROPERTY(EditInstanceOnly)
-    FGuid ContextIdGuid; // set once in editor, never changes
+    UPROPERTY(EditInstanceOnly, Category="TimeWeather")
+    TObjectPtr<UWeatherContextAsset> ContextAsset;
 
     virtual UWeatherContextAsset* GetWeatherContext_Implementation() const override
     { return ContextAsset; }
@@ -136,30 +201,33 @@ class APermafrostRegion : public AActor, public IWeatherContextProvider
 };
 ```
 
+**Editor workflow:** After placing the actor, click **Generate GUID** (add an `CallInEditor` helper or use the UE GUID generator) and save the level. The GUID must be stable across sessions.
+
 ---
 
-## Querying Weather State
+## Querying Weather State (Server)
 
 ```cpp
-// On any server system — query global context:
-if (auto* Sub = GetWorld()->GetSubsystem<UTimeWeatherSubsystem>())
-{
-    FWeatherBlendState State = Sub->GetCurrentWeatherState();
-    // State.BaseWeatherA, BaseWeatherB, BlendAlpha
-    // State.OverlayWeather, OverlayAlpha
-    // State.CurrentSeason
-}
+// Global context:
+auto* Sub = GetWorld()->GetSubsystem<UTimeWeatherSubsystem>();
+FWeatherBlendState State = Sub->GetCurrentWeatherState();
+// State.BaseWeatherA, BaseWeatherB, BlendAlpha — lerp your VFX params
+// State.OverlayWeather, OverlayAlpha — apply storm/fog overlay
+// State.CurrentSeason — adjust foliage, spawn tables, etc.
 
-// Query a specific region:
+// Specific region:
 FWeatherBlendState RegionState = Sub->GetCurrentWeatherState(MyRegionActor);
+
+// Daylight intensity:
+float Light = Sub->GetDaylightIntensity(); // [0,1]
 ```
 
 ---
 
-## Subscribing to Weather Events
+## Subscribing to Weather Events (Server)
 
 ```cpp
-// Sea system subscribing to weather events to adjust wave simulation:
+// Sea system: adjust wave simulation on storm events.
 void USeaSimulationComponent::BeginPlay()
 {
     Super::BeginPlay();
@@ -167,55 +235,55 @@ void USeaSimulationComponent::BeginPlay()
 
     if (auto* Bus = UGameCoreEventSubsystem::Get(this))
     {
-        Bus->GetSubsystem<UGameplayMessageSubsystem>()
-            ->RegisterListener<FWeatherEvent_EventActivated>(
-                TAG_GameCoreEvent_Weather_EventActivated,
-                this, &USeaSimulationComponent::OnWeatherEventActivated);
+        // Use GMS listener directly on the underlying UGameplayMessageSubsystem.
+        auto* GMS = GetWorld()->GetSubsystem<UGameplayMessageSubsystem>();
+        GMS->RegisterListener<FWeatherEvent_EventActivated>(
+            TAG_GameCoreEvent_Weather_EventActivated,
+            this, &USeaSimulationComponent::OnWeatherEventActivated);
     }
 }
 
 void USeaSimulationComponent::OnWeatherEventActivated(
-    FGameplayTag Channel, const FWeatherEvent_EventActivated& Msg)
+    FGameplayTag, const FWeatherEvent_EventActivated& Msg)
 {
     if (Msg.EventWeatherTag.MatchesTag(TAG_Weather_Storm))
-        SetWaveIntensity(FMath::Lerp(BaseWaveIntensity, StormWaveIntensity,
-            1.f)); // FadeIn handled by event — just react to activation
+        SetTargetWaveIntensity(StormWaveIntensity);
+        // Actual blend happens in your wave tick using Msg.FadeInSeconds.
 }
 ```
 
 ---
 
-## Triggering an External Event
+## Triggering / Cancelling an External Event
 
 ```cpp
-// Boss ability triggers a storm:
-void ABossActor::OnBossEnrage()
+// Boss enrages — trigger a storm on the global context.
+void ABossActor::OnEnrage()
 {
-    if (auto* Sub = GetWorld()->GetSubsystem<UTimeWeatherSubsystem>())
-    {
-        StormEventHandle = Sub->TriggerOverlayEvent(StormEventDefinition);
-    }
+    auto* Sub = GetWorld()->GetSubsystem<UTimeWeatherSubsystem>();
+    StormHandle = Sub->TriggerOverlayEvent(StormEventDef); // global
 }
 
-// Boss dies — cancel it:
-void ABossActor::OnBossDied()
+// Boss dies — begin proportional fade-out.
+void ABossActor::OnDeath()
 {
-    if (auto* Sub = GetWorld()->GetSubsystem<UTimeWeatherSubsystem>())
-        Sub->CancelOverlayEvent(StormEventHandle);
+    auto* Sub = GetWorld()->GetSubsystem<UTimeWeatherSubsystem>();
+    Sub->CancelOverlayEvent(StormHandle);
 }
 ```
 
 ---
 
-## Querying Active Events (Cross-System)
+## Cross-System Event Query
 
 ```cpp
-// Any system checks if any storm is currently active:
-if (auto* Bus = UGameCoreEventSubsystem::Get(this))
-{
-    bool bStormActive = Bus->IsEventActive(TAG_Weather_Storm);
-    // Returns true for Weather.Storm.Heavy, Weather.Storm.Light, etc.
-}
+// Is any storm currently active on any context?
+auto* Bus = UGameCoreEventSubsystem::Get(this);
+bool bStormActive = Bus->IsEventActive(TAG_Weather_Storm);
+// Matches Weather.Storm, Weather.Storm.Heavy, Weather.Storm.Light, etc. (tag hierarchy).
+
+// Get all active storm event GUIDs:
+TArray<FGuid> Storms = Bus->GetActiveEvents(TAG_Weather_Storm);
 ```
 
 ---
@@ -223,54 +291,75 @@ if (auto* Bus = UGameCoreEventSubsystem::Get(this))
 ## Getting Normalized Day Time on a Client
 
 ```cpp
-// AGameState holds the replicated snapshot:
-const FGameTimeSnapshot& Snap = GetGameState<AMyGameState>()->TimeSnapshot;
-float NormTime = Snap.GetNormalizedDayTime((int64)FPlatformTime::Seconds());
-float Daylight = MyDayNightCurve->GetFloatValue(NormTime);
+// On any client-side actor or component:
+if (AMyGameState* GS = GetWorld()->GetGameState<AMyGameState>())
+{
+    const FGameTimeSnapshot& Snap = GS->TimeSnapshot;
+    float NormTime = Snap.GetNormalizedDayTime(FPlatformTime::Seconds());
+    float Daylight = MyDayNightCurve->GetFloatValue(NormTime);
+    // Use Daylight to drive sky material parameter, post-process exposure, etc.
+}
+```
+
+---
+
+## Region Boundary Blending (Future / Area System Integration)
+
+```cpp
+// The area system computes SpatialAlpha [0,1] for the player's position
+// between two regions, then calls:
+FWeatherBlendState Merged = UTimeWeatherSubsystem::GetBlendedWeatherState(
+    Sub->GetCurrentWeatherState(RegionA),
+    Sub->GetCurrentWeatherState(RegionB),
+    SpatialAlpha);
+// Feed Merged into your VFX/audio systems.
 ```
 
 ---
 
 ## Gameplay Tags Required
 
-Add to `DefaultGameplayTags.ini` (see [GMS Events](GMS%20Events.md) for the full list plus season and weather tags for your game):
+Add to `DefaultGameplayTags.ini`:
 
 ```ini
-; Time events
-+GameplayTagList=(Tag="GameCoreEvent.Time.DawnBegan")
-+GameplayTagList=(Tag="GameCoreEvent.Time.DuskBegan")
-+GameplayTagList=(Tag="GameCoreEvent.Time.DayRolledOver")
-+GameplayTagList=(Tag="GameCoreEvent.Time.SeasonChanged")
+; ---- Time events ----
++GameplayTagList=(Tag="GameCoreEvent.Time.DawnBegan",DevComment="Fires once per day per context at DawnThreshold")
++GameplayTagList=(Tag="GameCoreEvent.Time.DuskBegan",DevComment="Fires once per day per context at DuskThreshold")
++GameplayTagList=(Tag="GameCoreEvent.Time.DayRolledOver",DevComment="Fires when in-game day index increments")
++GameplayTagList=(Tag="GameCoreEvent.Time.SeasonChanged",DevComment="Fires when current season tag changes for a context")
 
-; Weather events
-+GameplayTagList=(Tag="GameCoreEvent.Weather.StateChanged")
-+GameplayTagList=(Tag="GameCoreEvent.Weather.EventActivated")
-+GameplayTagList=(Tag="GameCoreEvent.Weather.EventCompleted")
+; ---- Weather events ----
++GameplayTagList=(Tag="GameCoreEvent.Weather.StateChanged",DevComment="Fires when base or overlay weather tag changes")
++GameplayTagList=(Tag="GameCoreEvent.Weather.EventActivated",DevComment="Fires when an overlay event becomes top priority")
++GameplayTagList=(Tag="GameCoreEvent.Weather.EventCompleted",DevComment="Fires when an overlay event finishes and is removed")
 
-; Season tags (game-defined)
+; ---- Season tags (game-defined, opaque to this system) ----
 +GameplayTagList=(Tag="Season.Spring")
 +GameplayTagList=(Tag="Season.Summer")
 +GameplayTagList=(Tag="Season.Autumn")
 +GameplayTagList=(Tag="Season.Winter")
 +GameplayTagList=(Tag="Season.Permafrost")
 
-; Weather tags (game-defined — this system treats them as opaque tags)
+; ---- Weather state tags (game-defined, opaque to this system) ----
 +GameplayTagList=(Tag="Weather.Clear")
 +GameplayTagList=(Tag="Weather.PartlyCloudy")
 +GameplayTagList=(Tag="Weather.Overcast")
 +GameplayTagList=(Tag="Weather.Rain")
 +GameplayTagList=(Tag="Weather.Storm")
 +GameplayTagList=(Tag="Weather.Storm.Heavy")
++GameplayTagList=(Tag="Weather.Storm.Light")
 +GameplayTagList=(Tag="Weather.Fog")
++GameplayTagList=(Tag="Weather.Blizzard")
 ```
 
-**Note:** Weather tags are completely opaque to the Time Weather System — it never interprets them. Your VFX/audio systems decide what each tag means visually.
+Weather and season tags are **completely opaque** to the Time Weather System. It passes them through as `FGameplayTag` values. Your VFX, audio, and gameplay systems decide what each tag means.
 
 ---
 
 ## What This System Does NOT Do
 
-- Does not know what `Weather.Rain` looks like. That is the VFX system's problem.
-- Does not replicate `FWeatherBlendState` to clients automatically. If you need client-side weather reactions, add a replicated property on `AGameState` and update it from the `GameCoreEvent.Weather.StateChanged` subscription on the server.
-- Does not spatial-query which region a player is in. That is the area system's problem — it calls `GetCurrentWeatherState(RegionProvider)` and supplies `SpatialAlpha` to `GetBlendedWeatherState`.
-- Does not manage any timers beyond the per-tick delta. All event lifecycle math uses wall-clock `FPlatformTime::Seconds()` comparisons, not Unreal timer handles, to avoid timer drift from frame rate variance.
+- Does not render anything. No sky, no particles, no post-process.
+- Does not replicate `FWeatherBlendState` to clients automatically. If clients need it, add a replicated property on `AGameState` and update it from the `GameCoreEvent.Weather.StateChanged` subscription on the server.
+- Does not query spatial data. Region boundary blending requires the area system to supply the alpha.
+- Does not persist state. Server restarts recompute from the deterministic seed.
+- Does not use Unreal `FTimerHandle` for event lifecycle — wall-clock comparisons via `FPlatformTime::Seconds()` avoid timer drift.
