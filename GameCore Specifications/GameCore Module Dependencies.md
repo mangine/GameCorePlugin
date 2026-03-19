@@ -64,6 +64,11 @@ Progression System  → GameplayTags
                     → Requirement System (optional, progression prerequisites)
                     → Backend (optional, audit via FGameCoreBackend)
                     → GAS (optional, personal XP multiplier attribute)
+
+Dialogue System     → GameplayTags
+                    → GameplayMessageSubsystem (GMS)  (UDialogueNode_Event broadcast)
+                    → Requirement System  (URequirement_Composite on condition/choice nodes)
+                    → Backend  (logging via FGameCoreBackend — TAG_Log_Dialogue)
 ```
 
 ---
@@ -92,6 +97,7 @@ No feature system depends on another feature system. They communicate exclusivel
 | State Machine | `GameplayTags`, Event Bus | Tags System |
 | Progression | `GameplayTags`, Event Bus, Serialization | Requirement System, Backend, GAS |
 | Interaction | `GameplayTags`, Tags System | Requirement System |
+| **Dialogue** | **`GameplayTags`, GMS, Requirement System, Backend** | — |
 
 ---
 

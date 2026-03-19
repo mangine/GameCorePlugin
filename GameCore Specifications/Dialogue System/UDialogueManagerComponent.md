@@ -9,11 +9,12 @@
 
 ## Responsibilities
 
-- Receives `FDialogueClientState` pushed from `UDialogueComponent` via reliable ClientRPC.
+- Receives `FDialogueClientState` pushed from `UDialogueComponent` via reliable `ClientRPC_ReceiveDialogueState`.
+- Populates `SessionOwners` automatically from `FDialogueClientState::OwnerComponent` — no separate registration RPC.
 - Broadcasts UI-facing delegates so widgets bind without knowledge of `UDialogueComponent`.
-- Sends `ServerRPC_SubmitChoice` and `ServerRPC_AcknowledgeLine` to the NPC's `UDialogueComponent`.
-- On `EndPlay` (player disconnect), notifies all active `UDialogueComponent` instances that this player has left, so Chooser-disconnect handling fires correctly.
-- Handles multiple concurrent sessions (rare, but valid in group content).
+- Sends `ServerRPC_SubmitChoice` and `ServerRPC_AcknowledgeLine` to the owning `UDialogueComponent`.
+- On `EndPlay` (player disconnect), notifies all active `UDialogueComponent` instances directly as a server-side call so Chooser-disconnect handling fires correctly.
+- Handles multiple concurrent sessions (rare but valid in group content).
 
 ---
 
@@ -26,7 +27,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnDialogueStateReceived,
     const FDialogueClientState&, State);
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnDialogueSessionEnded,
-    FGuid, SessionID,
+    FGuid,              SessionID,
     EDialogueEndReason, Reason);
 
 UCLASS(ClassGroup = (GameCore), meta = (BlueprintSpawnableComponent))
@@ -39,19 +40,16 @@ public:
 
     // ── Delegates (UI binds here) ─────────────────────────────────────────────
 
-    // Fires on the owning client whenever new dialogue state arrives.
-    // UI widget binds here to update speaker, text, and choices.
     UPROPERTY(BlueprintAssignable, Category = "Dialogue")
     FOnDialogueStateReceived OnDialogueStateReceived;
 
-    // Fires on the owning client when a session ends.
     UPROPERTY(BlueprintAssignable, Category = "Dialogue")
     FOnDialogueSessionEnded OnDialogueSessionEnded;
 
     // ── Client API (called by UI) ─────────────────────────────────────────────
 
-    // Submit a choice for the given session. Validates that the session is active
-    // and the component is not in Observer mode before sending the RPC.
+    // Submit a choice for the given session.
+    // Suppressed silently if bIsObserver or session is not waiting for a choice.
     UFUNCTION(BlueprintCallable, Category = "Dialogue")
     void SubmitChoice(FGuid SessionID, int32 ChoiceIndex);
 
@@ -59,7 +57,7 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Dialogue")
     void AcknowledgeLine(FGuid SessionID);
 
-    // Returns the most recent FDialogueClientState for a session. Nullable.
+    // Returns the most recent FDialogueClientState for a session.
     UFUNCTION(BlueprintPure, Category = "Dialogue")
     bool GetActiveState(FGuid SessionID, FDialogueClientState& OutState) const;
 
@@ -69,17 +67,15 @@ public:
 
     // ── Server RPCs ──────────────────────────────────────────────────────────
 
+    // Routes choice to the owning UDialogueComponent as a direct server-side call.
     UFUNCTION(Server, Reliable)
     void ServerRPC_SubmitChoice(FGuid SessionID, int32 ChoiceIndex,
                                 UDialogueComponent* TargetComponent);
 
+    // Routes ACK to the owning UDialogueComponent as a direct server-side call.
     UFUNCTION(Server, Reliable)
     void ServerRPC_AcknowledgeLine(FGuid SessionID,
                                    UDialogueComponent* TargetComponent);
-
-    // Called by UDialogueComponent on the server to notify this player has left a session.
-    UFUNCTION(Server, Reliable)
-    void ServerRPC_NotifyDisconnect(FGuid SessionID, UDialogueComponent* TargetComponent);
 
     // ── Client RPCs (called by UDialogueComponent on the server) ─────────────
 
@@ -90,10 +86,13 @@ public:
     void ClientRPC_DialogueEnded(FGuid SessionID, EDialogueEndReason Reason);
 
 private:
-    // Most recent state per active session. Keyed by SessionID.
+    // Most recent client state per session. Keyed by SessionID.
     TMap<FGuid, FDialogueClientState> ActiveStates;
 
-    // Track which UDialogueComponent owns each session so disconnect RPCs route correctly.
+    // Maps SessionID → owning UDialogueComponent.
+    // Populated from FDialogueClientState::OwnerComponent in ClientRPC_ReceiveDialogueState.
+    // Used by SubmitChoice / AcknowledgeLine to route the server RPC to the correct component.
+    // Used by EndPlay to notify disconnects.
     TMap<FGuid, TWeakObjectPtr<UDialogueComponent>> SessionOwners;
 };
 ```
@@ -109,6 +108,13 @@ void UDialogueManagerComponent::ClientRPC_ReceiveDialogueState_Implementation(
     const FDialogueClientState& State)
 {
     ActiveStates.Add(State.SessionID, State);
+
+    // Populate SessionOwners from the carried OwnerComponent reference.
+    // UDialogueComponent is replicated (SetIsReplicated(true) in its constructor)
+    // so OwnerComponent is valid on the client by the time this RPC executes.
+    if (State.OwnerComponent)
+        SessionOwners.Add(State.SessionID, State.OwnerComponent);
+
     OnDialogueStateReceived.Broadcast(State);
 }
 ```
@@ -132,15 +138,28 @@ void UDialogueManagerComponent::SubmitChoice(FGuid SessionID, int32 ChoiceIndex)
 {
     const FDialogueClientState* State = ActiveStates.Find(SessionID);
     if (!State) return;
-
-    // Silently suppress if Observer — do not send RPC.
-    if (State->bIsObserver) return;
+    if (State->bIsObserver)       return; // Observers cannot submit choices.
     if (!State->bWaitingForChoice) return;
 
     const TWeakObjectPtr<UDialogueComponent>* OwnerWeak = SessionOwners.Find(SessionID);
     if (!OwnerWeak || !OwnerWeak->IsValid()) return;
 
     ServerRPC_SubmitChoice(SessionID, ChoiceIndex, OwnerWeak->Get());
+}
+```
+
+### AcknowledgeLine
+
+```cpp
+void UDialogueManagerComponent::AcknowledgeLine(FGuid SessionID)
+{
+    const FDialogueClientState* State = ActiveStates.Find(SessionID);
+    if (!State || !State->bWaitingForACK) return;
+
+    const TWeakObjectPtr<UDialogueComponent>* OwnerWeak = SessionOwners.Find(SessionID);
+    if (!OwnerWeak || !OwnerWeak->IsValid()) return;
+
+    ServerRPC_AcknowledgeLine(SessionID, OwnerWeak->Get());
 }
 ```
 
@@ -151,11 +170,35 @@ void UDialogueManagerComponent::ServerRPC_SubmitChoice_Implementation(
     FGuid SessionID, int32 ChoiceIndex, UDialogueComponent* TargetComponent)
 {
     if (!TargetComponent) return;
-    APawn* OwnerPawn = Cast<APlayerState>(GetOwner()) ?
-        Cast<APlayerState>(GetOwner())->GetPawn() : nullptr;
-    if (!OwnerPawn) return;
+
+    // Resolve the pawn from the owning PlayerState.
+    APlayerState* PS = Cast<APlayerState>(GetOwner());
+    APawn* OwnerPawn = PS ? PS->GetPawn() : nullptr;
+    if (!OwnerPawn)
+    {
+        FGameCoreBackend::GetLogging(TAG_Log_Dialogue)->LogWarning(
+            TEXT("DialogueManagerComponent"),
+            TEXT("ServerRPC_SubmitChoice: owning pawn not found."));
+        return;
+    }
 
     TargetComponent->Server_ReceiveChoice(SessionID, OwnerPawn, ChoiceIndex);
+}
+```
+
+### ServerRPC_AcknowledgeLine
+
+```cpp
+void UDialogueManagerComponent::ServerRPC_AcknowledgeLine_Implementation(
+    FGuid SessionID, UDialogueComponent* TargetComponent)
+{
+    if (!TargetComponent) return;
+
+    APlayerState* PS = Cast<APlayerState>(GetOwner());
+    APawn* OwnerPawn = PS ? PS->GetPawn() : nullptr;
+    if (!OwnerPawn) return;
+
+    TargetComponent->Server_ReceiveACK(SessionID, OwnerPawn);
 }
 ```
 
@@ -164,40 +207,17 @@ void UDialogueManagerComponent::ServerRPC_SubmitChoice_Implementation(
 ```cpp
 void UDialogueManagerComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    // Notify all UDialogueComponents that this player is leaving their sessions.
+    // This executes on the server when the player connection closes.
+    // Notify every UDialogueComponent that owns a session this player is part of.
+    // Direct method call — no RPC round-trip needed because we are already on the server.
     for (auto& Pair : SessionOwners)
     {
         if (UDialogueComponent* DC = Pair.Value.Get())
-        {
-            ServerRPC_NotifyDisconnect(Pair.Key, DC);
-        }
+            DC->Server_NotifyChooserDisconnect(Pair.Key);
     }
+
     Super::EndPlay(EndPlayReason);
 }
 ```
 
-> **Note:** `ServerRPC_NotifyDisconnect` is called from `EndPlay` which runs on the server when the connection closes. On the server, `ServerRPC_*` functions are called locally, so this correctly reaches `UDialogueComponent::Server_NotifyChooserDisconnect` without a round-trip.
-
----
-
-## Session Owner Registration
-
-`UDialogueComponent::PushClientState` calls `Manager->ClientRPC_ReceiveDialogueState`, which is a client RPC and does not return a value. The `SessionOwners` map on `UDialogueManagerComponent` must be populated separately.
-
-`UDialogueComponent` calls a server-side direct method (not an RPC) on `UDialogueManagerComponent` to register the session owner when a session starts:
-
-```cpp
-// In UDialogueComponent::RunSession, after confirming the manager exists:
-void UDialogueComponent::RegisterSessionOwner(UDialogueManagerComponent* Manager, FGuid SessionID)
-{
-    // Direct server-to-server call — no RPC needed.
-    Manager->Server_RegisterSessionOwner(SessionID, this);
-}
-
-// On UDialogueManagerComponent:
-void UDialogueManagerComponent::Server_RegisterSessionOwner(
-    FGuid SessionID, UDialogueComponent* Owner)
-{
-    SessionOwners.Add(SessionID, Owner);
-}
-```
+> **Why direct call, not ServerRPC:** `EndPlay` on `APlayerState` runs on the server when the connection is torn down. Calling a `Server` RPC from `EndPlay` at that point is undefined — the net connection may already be closed. Calling `DC->Server_NotifyChooserDisconnect` directly is the correct UE5 pattern for disconnect notification.
