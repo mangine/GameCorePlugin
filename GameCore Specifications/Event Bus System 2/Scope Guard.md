@@ -1,14 +1,12 @@
 # Scope Guard
 
-**Sub-page of:** [Event Bus System 2](../Event%20Bus%20System%202.md)
+**Sub-page of:** [Event Bus System](../Event%20Bus%20System%202.md)
 
-The scope guard is identical to the one in GMS1 (`UGameCoreEventSubsystem`). It is documented here in full for GMS2 implementors who may not have read the GMS1 spec.
+`EGameCoreEventScope` is defined in `GameCoreEventBus2.h` and controls which machine a broadcast is permitted to fire on.
 
 ---
 
 ## EGameCoreEventScope
-
-`EGameCoreEventScope` is defined in `GameCoreEventSubsystem.h` (GMS1 header) and shared by both buses. **Do not redefine it for GMS2** — include the GMS1 header.
 
 ```cpp
 /**
@@ -39,9 +37,9 @@ enum class EGameCoreEventScope : uint8
 ## Evaluation Logic
 
 ```
-ServerOnly → NM_Client?  → DROP
-ClientOnly → not NM_Client? → DROP
-Both       → always PASS
+ServerOnly → NM_Client?       → DROP
+ClientOnly → not NM_Client?   → DROP
+Both       →                  → always PASS
 ```
 
 Standalone (`NM_Standalone`) is treated as server — `ServerOnly` passes on standalone.

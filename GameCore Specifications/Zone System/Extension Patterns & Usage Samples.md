@@ -131,46 +131,54 @@ The server sets siege state:
 ```cpp
 // Server-side event system
 Zone->AddDynamicTag(PirateZoneTags::State_UnderSiege);
-// All clients automatically receive the tag via replication + OnRep_DynamicState GMS broadcast
+// All clients automatically receive the tag via replication + OnRep_DynamicState EventBus2 broadcast
 ```
 
 ---
 
 ## 6. Reacting to Zone Transitions (Player enters territory)
 
-Listen for `FZoneTransitionMessage` via GMS. Filter by zone type inside the handler.
+Listen for `FZoneTransitionMessage` via `UGameCoreEventBus2`.
 
 ```cpp
 // UPirateTerritorySystem::BeginPlay
-UGameplayMessageSubsystem& GMS = UGameplayMessageSubsystem::Get(this);
-TransitionHandle = GMS.RegisterListener<FZoneTransitionMessage>(
-    GameCore::Zone::Tags::Channel_Transition,
-    this,
-    &UPirateTerritorySystem::OnZoneTransition
-);
-
-void UPirateTerritorySystem::OnZoneTransition(
-    FGameplayTag Channel, const FZoneTransitionMessage& Msg)
+void UPirateTerritorySystem::BeginPlay()
 {
-    if (!Msg.StaticData) return;
-    if (!Msg.StaticData->ZoneTypeTag.MatchesTag(PirateZoneTags::ZoneType_Territory)) return;
+    Super::BeginPlay();
 
-    const UPirateZoneDataAsset* Data = Cast<UPirateZoneDataAsset>(Msg.StaticData);
-    if (!Data) return;
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    {
+        TransitionHandle = Bus->StartListening<FZoneTransitionMessage>(
+            GameCore::Zone::Tags::Channel_Transition,
+            this,
+            [this](FGameplayTag, const FZoneTransitionMessage& Msg)
+            {
+                if (!Msg.StaticData) return;
+                if (!Msg.StaticData->ZoneTypeTag.MatchesTag(PirateZoneTags::ZoneType_Territory)) return;
 
-    if (Msg.bEntered)
-    {
-        NotifyPlayerEnteredTerritory(Msg.TrackedActor, Data, Msg.DynamicState.OwnerTag);
-        ApplyTaxModifier(Msg.TrackedActor, Data->TaxRate);
-    }
-    else
-    {
-        RemoveTaxModifier(Msg.TrackedActor);
+                const UPirateZoneDataAsset* Data = Cast<UPirateZoneDataAsset>(Msg.StaticData);
+                if (!Data) return;
+
+                if (Msg.bEntered)
+                {
+                    NotifyPlayerEnteredTerritory(Msg.TrackedActor, Data, Msg.DynamicState.OwnerTag);
+                    ApplyTaxModifier(Msg.TrackedActor, Data->TaxRate);
+                }
+                else
+                {
+                    RemoveTaxModifier(Msg.TrackedActor);
+                }
+            });
     }
 }
 
 // UPirateTerritorySystem::EndPlay
-UGameplayMessageSubsystem::Get(this).UnregisterListener(TransitionHandle);
+void UPirateTerritorySystem::EndPlay(const EEndPlayReason::Type Reason)
+{
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+        Bus->StopListening(TransitionHandle);
+    Super::EndPlay(Reason);
+}
 ```
 
 ---
@@ -180,20 +188,29 @@ UGameplayMessageSubsystem::Get(this).UnregisterListener(TransitionHandle);
 Listen on `Channel_StateChanged` to update HUD, minimap, or AI patrol targets when a zone changes hands.
 
 ```cpp
-StateHandle = GMS.RegisterListener<FZoneStateChangedMessage>(
-    GameCore::Zone::Tags::Channel_StateChanged,
-    this,
-    &UMinimapSystem::OnZoneStateChanged
-);
-
-void UMinimapSystem::OnZoneStateChanged(
-    FGameplayTag Channel, const FZoneStateChangedMessage& Msg)
+void UMinimapSystem::BeginPlay()
 {
-    if (!Msg.StaticData) return;
-    if (!Msg.StaticData->ZoneTypeTag.MatchesTag(PirateZoneTags::ZoneType_Territory)) return;
+    Super::BeginPlay();
 
-    // Refresh minimap colour for this zone based on new owner
-    RefreshZoneColour(Msg.ZoneActor, Msg.DynamicState.OwnerTag);
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    {
+        StateHandle = Bus->StartListening<FZoneStateChangedMessage>(
+            GameCore::Zone::Tags::Channel_StateChanged,
+            this,
+            [this](FGameplayTag, const FZoneStateChangedMessage& Msg)
+            {
+                if (!Msg.StaticData) return;
+                if (!Msg.StaticData->ZoneTypeTag.MatchesTag(PirateZoneTags::ZoneType_Territory)) return;
+                RefreshZoneColour(Msg.ZoneActor, Msg.DynamicState.OwnerTag);
+            });
+    }
+}
+
+void UMinimapSystem::EndPlay(const EEndPlayReason::Type Reason)
+{
+    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+        Bus->StopListening(StateHandle);
+    Super::EndPlay(Reason);
 }
 ```
 

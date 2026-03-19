@@ -2,7 +2,7 @@
 
 **Sub-page of:** [Notification System Overview](Notification%20System%20Overview.md)
 
-This page covers how GMS channels are connected to the notification subsystem, how to write
+This page covers how EventBus2 channels are connected to the notification subsystem, how to write
 channel bindings in C++ and Blueprint, and the listener registration pattern.
 
 ---
@@ -10,7 +10,7 @@ channel bindings in C++ and Blueprint, and the listener registration pattern.
 ## How It Works
 
 ```
-GMS channel fires (e.g. GameCoreEvent.Progression.LevelUp)
+EventBus2 channel fires (e.g. GameCoreEvent.Progression.LevelUp)
     └─► UNotificationChannelBinding (registered in UNotificationChannelConfig)
             └─► BuildEntry() returns FNotificationEntry
                     └─► UGameCoreNotificationSubsystem::HandleIncomingEntry
@@ -25,7 +25,7 @@ The subsystem never touches game-specific message structs. The binding is the on
 
 For channels with a known C++ struct, subclass `UNotificationChannelBinding` and hold a typed
 listener inside the binding itself. The subsystem calls `RegisterChannelListeners` which invokes
-`RegisterTypedListener()` on each binding.
+`RegisterListener()` on each binding.
 
 ```cpp
 // In game module — NOT in GameCore.
@@ -38,7 +38,7 @@ public:
     virtual FNotificationEntry BuildEntry_Implementation(const FGameplayTag& Channel) const override
     {
         // At the time BuildEntry is called, LastMessage has been populated
-        // by the typed GMS listener below.
+        // by the typed EventBus2 listener below.
         FNotificationEntry Entry;
         Entry.CategoryTag    = FGameplayTag::RequestGameplayTag("Notification.Category.Progression");
         Entry.Title          = FText::Format(
@@ -49,17 +49,14 @@ public:
         return Entry;
     }
 
-    // Called by the subsystem's typed GMS listener before BuildEntry.
-    // The subsystem registers this listener when iterating ChannelConfig->Bindings.
-    // See RegisterTypedListener pattern below.
     mutable FProgressionLevelUpMessage LastMessage;
 };
 ```
 
 ### Typed Listener Registration Pattern
 
-The subsystem's `RegisterChannelListeners` must be extended to support typed bindings.
-The clean approach is a virtual on `UNotificationChannelBinding`:
+The virtual on `UNotificationChannelBinding` accepts `UGameCoreEventBus2*` — no raw GMS pointer
+crosses the boundary.
 
 ```cpp
 // In UNotificationChannelBinding:
@@ -67,36 +64,35 @@ class UNotificationChannelBinding
 {
     // ...
 
-    // Override to register a typed GMS listener and populate internal state before BuildEntry.
-    // Default implementation registers a no-op listener and calls BuildEntry directly.
+    // Override to register a typed EventBus2 listener and populate internal state before BuildEntry.
+    // Default implementation registers a raw FInstancedStruct listener and calls BuildEntry directly.
     // The subsystem passes itself so the binding can call HandleIncomingEntry.
     virtual void RegisterListener(
-        UGameplayMessageSubsystem* GMS,
+        UGameCoreEventBus2* Bus,
         UGameCoreNotificationSubsystem* Subsystem,
         TArray<FGameplayMessageListenerHandle>& OutHandles);
 };
 ```
 
-Default implementation (for Blueprint bindings):
+Default implementation (for Blueprint bindings — payload ignored, game state pulled inside `BuildEntry`):
 
 ```cpp
 void UNotificationChannelBinding::RegisterListener(
-    UGameplayMessageSubsystem* GMS,
+    UGameCoreEventBus2* Bus,
     UGameCoreNotificationSubsystem* Subsystem,
     TArray<FGameplayMessageListenerHandle>& OutHandles)
 {
-    // Registers a listener that fires on ANY message on Channel.
-    // Uses FGameplayTag as a dummy type — actual payload is ignored at this level.
-    // Blueprint bindings query game state themselves inside BuildEntry.
-    FGameplayMessageListenerHandle Handle =
-        GMS->RegisterListener<FGameplayTag>(
-            Channel,
-            [this, Subsystem](FGameplayTag InChannel, const FGameplayTag&)
-            {
-                FNotificationEntry Entry = BuildEntry(InChannel);
-                if (!Entry.CategoryTag.IsValid()) return; // Binding suppressed
-                Subsystem->HandleIncomingEntry(Entry);
-            });
+    if (!Bus) return;
+
+    FGameplayMessageListenerHandle Handle = Bus->StartListening(
+        Channel,
+        this,
+        [this, Subsystem](FGameplayTag InChannel, const FInstancedStruct&)
+        {
+            FNotificationEntry Entry = BuildEntry(InChannel);
+            if (!Entry.CategoryTag.IsValid()) return; // Binding suppressed
+            Subsystem->HandleIncomingEntry(Entry);
+        });
     OutHandles.Add(Handle);
 }
 ```
@@ -105,39 +101,40 @@ C++ typed override for `ULevelUpNotificationBinding`:
 
 ```cpp
 void ULevelUpNotificationBinding::RegisterListener(
-    UGameplayMessageSubsystem* GMS,
+    UGameCoreEventBus2* Bus,
     UGameCoreNotificationSubsystem* Subsystem,
     TArray<FGameplayMessageListenerHandle>& OutHandles)
 {
-    FGameplayMessageListenerHandle Handle =
-        GMS->RegisterListener<FProgressionLevelUpMessage>(
-            Channel,
-            [this, Subsystem](FGameplayTag InChannel, const FProgressionLevelUpMessage& Msg)
-            {
-                LastMessage = Msg;  // Capture before BuildEntry reads it.
-                FNotificationEntry Entry = BuildEntry(InChannel);
-                if (!Entry.CategoryTag.IsValid()) return;
-                Subsystem->HandleIncomingEntry(Entry);
-            });
+    if (!Bus) return;
+
+    FGameplayMessageListenerHandle Handle = Bus->StartListening<FProgressionLevelUpMessage>(
+        Channel,
+        this,
+        [this, Subsystem](FGameplayTag InChannel, const FProgressionLevelUpMessage& Msg)
+        {
+            LastMessage = Msg;  // Capture before BuildEntry reads it.
+            FNotificationEntry Entry = BuildEntry(InChannel);
+            if (!Entry.CategoryTag.IsValid()) return;
+            Subsystem->HandleIncomingEntry(Entry);
+        });
     OutHandles.Add(Handle);
 }
 ```
 
-Subsystem `RegisterChannelListeners` then becomes simply:
+Subsystem `RegisterChannelListeners`:
 
 ```cpp
 void UGameCoreNotificationSubsystem::RegisterChannelListeners()
 {
     if (!ChannelConfig) return;
 
-    UGameplayMessageSubsystem* GMS =
-        GetWorld() ? GetWorld()->GetSubsystem<UGameplayMessageSubsystem>() : nullptr;
-    if (!GMS) return;
+    UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this);
+    if (!Bus) return;
 
     for (UNotificationChannelBinding* Binding : ChannelConfig->Bindings)
     {
         if (Binding && Binding->Channel.IsValid())
-            Binding->RegisterListener(GMS, this, ListenerHandles);
+            Binding->RegisterListener(Bus, this, ListenerHandles);
     }
 }
 ```
@@ -146,7 +143,7 @@ void UGameCoreNotificationSubsystem::RegisterChannelListeners()
 
 ## Blueprint Binding
 
-Blueprint bindings cannot receive a typed struct from GMS. Instead, they use the GMS event as a
+Blueprint bindings cannot receive a typed struct directly. Instead, they use the EventBus2 event as a
 trigger and pull the data they need from already-replicated game state.
 
 **Example:** A Blueprint `UQuestNotificationBinding` that fires when a quest starts:
@@ -192,13 +189,13 @@ void UGameCoreNotificationSubsystem::HandleIncomingEntry(FNotificationEntry Entr
 
 ---
 
-## GMS Scope Note
+## Scope Note
 
-GMS events that trigger notifications are typically `ClientOnly` — the data has been replicated to
-the client already, and the client fires a local GMS broadcast to trigger UI. The Notification
+EventBus2 events that trigger notifications are typically `ClientOnly` — the data has been replicated to
+the client already, and the client fires a local EventBus2 broadcast to trigger UI. The Notification
 System sits entirely in client space and does not care about scope; it only sees events that have
 already been dispatched on the local machine.
 
-If a `ServerOnly` GMS event is subscribed to in a binding, it will only fire in listen-server or
+If a `ServerOnly` event is subscribed to in a binding, it will only fire in listen-server or
 standalone builds, not on a dedicated client. This is almost certainly a misconfiguration —
 document this restriction clearly in the binding's comment.

@@ -1,18 +1,10 @@
 # GameCore Event Messages
 
-**Sub-page of:** [Event Bus System](../Event%20Bus%20System.md)
+**Sub-page of:** [Event Bus System](../Event%20Bus%20System%202.md)
 
-All message structs broadcast through `UGameCoreEventSubsystem` are defined in `GameCoreEventMessages.h`. Each event has exactly one struct. Structs are plain `USTRUCT`s — no UObject overhead, stack-allocated, passed by const reference.
+All message structs broadcast through `UGameCoreEventBus2` are plain `USTRUCT`s — no UObject overhead, stack-allocated, wrapped into `FInstancedStruct` at the broadcast site. Message structs are defined alongside the system that owns them, not in a central file.
 
-Every channel entry below declares its **Scope** (`EGameCoreEventScope`) and **Origin machine**. These are mandatory fields for all channels — new channels must document both.
-
----
-
-## File Location
-
-```
-GameCore/Source/GameCore/EventBus/GameCoreEventMessages.h
-```
+Every channel entry below declares its **Scope** (`EGameCoreEventScope`) and **Origin machine**. These are mandatory fields for all channels.
 
 ---
 
@@ -54,7 +46,7 @@ Cached via `UGameplayTagsManager::AddNativeGameplayTag` in `StartupModule`. Zero
 **Channel:** `GameCoreEvent.Progression.LevelUp`
 **Scope:** `ServerOnly`
 **Origin:** `ULevelingComponent::ProcessLevelUp` — server only.
-**Client reaction:** Clients react via `FFastArraySerializer` replication of `ProgressionData`. No client-side GMS broadcast is fired for this event.
+**Client reaction:** Clients react via `FFastArraySerializer` replication of `ProgressionData`. No client-side broadcast is fired for this event.
 
 ```cpp
 USTRUCT(BlueprintType)
@@ -69,7 +61,7 @@ struct GAMECORE_API FProgressionLevelUpMessage
 };
 ```
 
-**Consumers:** quest system, achievement system, watcher integration adapter (replaces direct delegate binding to `ULevelingComponent`), UI level-up feedback, audio/VFX triggers.
+**Consumers:** quest system, achievement system, watcher integration adapter, UI level-up feedback, audio/VFX triggers.
 
 ---
 
@@ -132,7 +124,7 @@ struct GAMECORE_API FProgressionPointPoolChangedMessage
 **Channel:** `GameCoreEvent.StateMachine.StateChanged`
 **Scope:** `Both`
 **Origin:** `UStateMachineComponent::EnterState` — fires on whichever authority the component runs.
-**Scope rationale:** State machine components declare an `AuthorityMode` (`ServerOnly`, `ClientOnly`, `Both`). The broadcast scope matches the mode — a `ServerOnly` component fires only on the server; a `Both` component fires on both machines independently. The broadcaster is responsible for passing the correct scope.
+**Scope rationale:** State machine components declare an `AuthorityMode` (`ServerOnly`, `ClientOnly`, `Both`). The broadcast scope matches the mode — a `ServerOnly` component fires only on the server; a `Both` component fires on both machines independently.
 
 ```cpp
 USTRUCT(BlueprintType)
@@ -156,7 +148,7 @@ struct GAMECORE_API FStateMachineStateChangedMessage
 
 **Consumers:** quest systems, NPC AI coordinators, ship system, UI state displays, audio state machines.
 
-> `StateMachineAsset` lets listeners early-out without casting. A quest listener checks `if (Message.StateMachineAsset != ExpectedAsset) return;`.
+> `StateMachineAsset` lets listeners early-out without casting: `if (Message.StateMachineAsset != ExpectedAsset) return;`
 
 ---
 
