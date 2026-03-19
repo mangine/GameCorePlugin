@@ -2,7 +2,7 @@
 
 **Sub-page of:** [Quest System](Quest%20System%20Overview.md)
 
-All events are broadcast via `UGameCoreEventSubsystem` (the GMS wrapper). Channels follow the `GameCoreEvent.Quest.*` namespace. The quest system emits events and never directly calls other systems — all downstream reactions (rewards, journal, achievements, UI, analytics) subscribe to these channels.
+All events are broadcast via `UGameCoreEventBus` (the GMS wrapper). Channels follow the `GameCoreEvent.Quest.*` namespace. The quest system emits events and never directly calls other systems — all downstream reactions (rewards, journal, achievements, UI, analytics) subscribe to these channels.
 
 ---
 
