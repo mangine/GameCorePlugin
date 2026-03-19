@@ -2,9 +2,11 @@
 
 ## Role
 
-Actor component that lives on `APlayerState`. Owns runtime stat values for one player, auto-registers GMS listeners from `UStatDefinition` assets, and persists values via `IPersistableComponent`.
+Actor component that lives on `APlayerState`. Owns runtime stat values for one player and persists them via `IPersistableComponent`.
 
 All stat mutation is server-authoritative. Methods that mutate state check `GetOwner()->HasAuthority()` and early-out on clients.
+
+> **GMS Note:** `UStatComponent` does **not** auto-register GMS listeners. GMS requires typed listeners at compile time and does not support untyped/wildcard registration. The game module is responsible for all GMS subscriptions and calls `AddToStat()` directly. See [Integration](./Integration.md).
 
 ---
 
@@ -19,8 +21,13 @@ class GAMECORE_API UStatComponent : public UActorComponent, public IPersistableC
 
 public:
     // Authored in the PlayerState Blueprint. One entry per tracked stat.
+    // Serves as the authoritative list of which stats exist for this player.
     UPROPERTY(EditDefaultsOnly, Category="Stats")
     TArray<TObjectPtr<UStatDefinition>> Definitions;
+
+    // Configurable flush interval in seconds. Default: 10s.
+    UPROPERTY(EditDefaultsOnly, Category="Stats", meta=(ClampMin="1.0"))
+    float FlushIntervalSeconds = 10.f;
 
     // -------------------------------------------------------
     // Public API (server-authoritative)
@@ -54,16 +61,9 @@ private:
     // Dirty set — tags modified since last flush.
     TSet<FGameplayTag> DirtyStats;
 
-    // GMS listener handles, stored to unregister on EndPlay.
-    TArray<FGameplayMessageListenerHandle> ListenerHandles;
-
     // Flush timer handle.
     FTimerHandle FlushTimerHandle;
 
-    void RegisterGMSListeners();
-    void UnregisterGMSListeners();
-    void OnMessageReceived(FGameplayTag ChannelTag, const FInstancedStruct& Payload,
-                           UStatIncrementRule* Rule, UStatDefinition* Definition);
     void FlushDirtyStats();
 
     // Non-shipping validation: duplicate StatTags, null Rules, etc.
@@ -85,84 +85,16 @@ void UStatComponent::BeginPlay()
 #endif
 
     if (!GetOwner()->HasAuthority())
-        return; // listeners registered server-side only
+        return;
 
-    RegisterGMSListeners();
-
-    // Flush dirty stats every 10 seconds (configurable).
+    // Flush dirty stats on a repeating timer.
     GetWorld()->GetTimerManager().SetTimer(
         FlushTimerHandle,
         this,
         &UStatComponent::FlushDirtyStats,
-        10.f,
+        FlushIntervalSeconds,
         true
     );
-}
-```
-
----
-
-## RegisterGMSListeners
-
-For each Definition, for each Rule — register one untyped GMS listener. Multiple rules on the same channel produce independent listeners; the component routes each to the correct rule.
-
-```cpp
-void UStatComponent::RegisterGMSListeners()
-{
-    UGameplayMessageSubsystem& GMS = UGameplayMessageSubsystem::Get(this);
-
-    for (UStatDefinition* Def : Definitions)
-    {
-        if (!Def) continue;
-
-        for (UStatIncrementRule* Rule : Def->Rules)
-        {
-            if (!Rule) continue;
-
-            FGameplayTag Channel = Rule->GetChannelTag();
-            if (!Channel.IsValid()) continue;
-
-            // Capture Rule and Def by pointer — both are UObjects, safe as long as component is alive.
-            FGameplayMessageListenerHandle Handle = GMS.RegisterListener<FInstancedStruct>(
-                Channel,
-                [this, Rule, Def](FGameplayTag Tag, const FInstancedStruct& Payload)
-                {
-                    OnMessageReceived(Tag, Payload, Rule, Def);
-                }
-            );
-
-            ListenerHandles.Add(MoveTemp(Handle));
-        }
-    }
-}
-```
-
-> **Note:** GMS supports untyped / `FInstancedStruct` channel registration. If your GMS integration uses strongly-typed channels, wrap the listener registration in a thin adapter or broadcast `FInstancedStruct` wrappers from your message senders. See Integration page.
-
----
-
-## OnMessageReceived
-
-```cpp
-void UStatComponent::OnMessageReceived(
-    FGameplayTag ChannelTag,
-    const FInstancedStruct& Payload,
-    UStatIncrementRule* Rule,
-    UStatDefinition* Definition)
-{
-    if (!GetOwner()->HasAuthority()) return;
-
-    // Evaluate requirements if set.
-    if (Definition->TrackingRequirements)
-    {
-        if (!Definition->TrackingRequirements->AreRequirementsMet(GetOwner()))
-            return;
-    }
-
-    const float Delta = Rule->ExtractIncrement(Payload);
-    if (Delta <= 0.f) return;
-
-    AddToStat(Definition->StatTag, Delta);
 }
 ```
 
@@ -175,6 +107,17 @@ void UStatComponent::AddToStat(FGameplayTag StatTag, float Delta)
 {
     if (!GetOwner()->HasAuthority()) return;
     if (Delta <= 0.f) return;
+
+    // Check requirements if a matching definition exists.
+    for (const UStatDefinition* Def : Definitions)
+    {
+        if (Def && Def->StatTag == StatTag && Def->TrackingRequirements)
+        {
+            if (!Def->TrackingRequirements->AreRequirementsMet(GetOwner()))
+                return;
+            break;
+        }
+    }
 
     float& Value = RuntimeValues.FindOrAdd(StatTag, 0.f);
     Value += Delta;
@@ -195,6 +138,8 @@ void UStatComponent::AddToStat(FGameplayTag StatTag, float Delta)
 }
 ```
 
+> **Note:** The requirements loop is O(n) over `Definitions`. For projects with large definition arrays, consider building a `TMap<FGameplayTag, UStatDefinition*>` cache at `BeginPlay`.
+
 ---
 
 ## Persistence
@@ -208,13 +153,21 @@ void UStatComponent::Serialize_Implementation(FGameCoreArchive& Ar)
 void UStatComponent::FlushDirtyStats()
 {
     if (DirtyStats.Num() == 0) return;
-    // Triggers UPersistenceSubsystem to serialize this component to DB.
     UPersistenceSubsystem::Get(this).RequestFlush(this);
     DirtyStats.Empty();
 }
 ```
 
 Flush is also triggered on `EndPlay` to capture any stats modified in the final frame.
+
+```cpp
+void UStatComponent::EndPlay(const EEndPlayReason::Type Reason)
+{
+    FlushDirtyStats();
+    GetWorld()->GetTimerManager().ClearTimer(FlushTimerHandle);
+    Super::EndPlay(Reason);
+}
+```
 
 ---
 

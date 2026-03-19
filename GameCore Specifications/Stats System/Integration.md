@@ -29,27 +29,71 @@ Broadcast channel tag: `Event.Stat.Changed`
 
 ---
 
-## GMS Payload Convention
+## GMS Integration — Game Module Responsibility
 
-`UStatComponent` registers listeners expecting `FInstancedStruct` payloads on GMS channels. Your game-side message senders must broadcast an `FInstancedStruct` wrapping the actual message struct.
+GMS requires typed listeners at compile time (`RegisterListener<T>`). `UStatComponent` does not auto-register any GMS listeners. The game module owns all GMS subscriptions and calls `AddToStat()` after receiving a typed message.
 
-**Sender side (game module):**
+This means:
+- No double-broadcasting of messages.
+- No `FInstancedStruct` wrapping required.
+- Full type safety — the game module reads payload fields directly.
+- One GMS listener block per message type, registered once at startup (e.g. in a `UGameInstanceSubsystem` or `AGameMode`).
+
+### Game Module Wiring Example
+
 ```cpp
-// When an enemy dies:
-FEnemyKilledMessage Msg;
-Msg.EnemyTag   = EnemyGameplayTag;
-Msg.KillerActor = Killer;
+// In UMyStatWiringSubsystem : UGameInstanceSubsystem (game module)
+// Or in AGameMode::BeginPlay — wherever your GMS subscriptions live.
 
-FInstancedStruct Payload;
-Payload.InitializeAs<FEnemyKilledMessage>(Msg);
+void UMyStatWiringSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
 
-UGameplayMessageSubsystem::Get(World).BroadcastMessage(
-    TAG_GameplayMessage_Combat_EnemyKilled,
-    Payload
-);
+    UGameplayMessageSubsystem& GMS = UGameplayMessageSubsystem::Get(this);
+
+    // Fixed increment — 1 kill = 1 unit
+    EnemyKilledHandle = GMS.RegisterListener<FEnemyKilledMessage>(
+        TAG_GameplayMessage_Combat_EnemyKilled,
+        [this](FGameplayTag, const FEnemyKilledMessage& Msg)
+        {
+            if (UStatComponent* Stats = GetStatComponentForPlayer(Msg.KillerPlayerId))
+                Stats->AddToStat(TAG_Stat_EnemiesKilled, 1.f);
+        }
+    );
+
+    // Payload-driven increment — use damage value from typed struct
+    DamageDealtHandle = GMS.RegisterListener<FDamageDealtMessage>(
+        TAG_GameplayMessage_Combat_DamageDealt,
+        [this](FGameplayTag, const FDamageDealtMessage& Msg)
+        {
+            if (UStatComponent* Stats = GetStatComponentForPlayer(Msg.InstigatorPlayerId))
+                Stats->AddToStat(TAG_Stat_TotalDamageDealt, Msg.DamageAmount);
+        }
+    );
+}
+
+void UMyStatWiringSubsystem::Deinitialize()
+{
+    EnemyKilledHandle.Unregister();
+    DamageDealtHandle.Unregister();
+    Super::Deinitialize();
+}
 ```
 
-If your messages are already broadcast as strongly-typed structs (not `FInstancedStruct`), wrap the broadcast at the call site or add a secondary `FInstancedStruct` broadcast in parallel. The stat system only needs the `FInstancedStruct` channel.
+### Helper: GetStatComponentForPlayer
+
+```cpp
+UStatComponent* UMyStatWiringSubsystem::GetStatComponentForPlayer(const FUniqueNetIdRepl& PlayerId)
+{
+    // Iterate PlayerStates to find the matching one.
+    for (APlayerState* PS : GetWorld()->GetGameState()->PlayerArray)
+    {
+        if (PS && PS->GetUniqueId() == PlayerId)
+            return PS->FindComponentByClass<UStatComponent>();
+    }
+    return nullptr;
+}
+```
 
 ---
 
@@ -74,7 +118,7 @@ void UAchievementSubsystem::OnStatChanged(const FStatChangedEvent& Event)
 
 ## Quest System Integration
 
-Quest objectives that track stats subscribe to `TAG_Event_StatChanged` and compare `Event.StatTag` against objective tags. No direct dependency on `UStatComponent`.
+Quest objectives subscribe to `TAG_Event_StatChanged` and compare against their tracked stat tag. No direct dependency on `UStatComponent`.
 
 ```cpp
 void UStatObjective::OnStatChanged(const FStatChangedEvent& Event)
@@ -92,12 +136,11 @@ void UStatObjective::OnStatChanged(const FStatChangedEvent& Event)
 
 ## Manual Increment (non-event-driven)
 
-For stat increments that are not driven by a GMS message (e.g., reward on quest completion):
+For increments not driven by a GMS message (e.g. quest completion reward, login bonus):
 
 ```cpp
 // Server only.
-APlayerState* PS = GetPlayerState();
-if (UStatComponent* Stats = PS->FindComponentByClass<UStatComponent>())
+if (UStatComponent* Stats = PlayerState->FindComponentByClass<UStatComponent>())
 {
     Stats->AddToStat(TAG_Stat_QuestsCompleted, 1.f);
 }
@@ -111,16 +154,16 @@ if (UStatComponent* Stats = PS->FindComponentByClass<UStatComponent>())
 float Kills = Stats->GetStat(TAG_Stat_EnemiesKilled);
 ```
 
-`GetStat` is safe to call client-side for display purposes. The value is replicated via the standard `APlayerState` replication path — add `RuntimeValues` to a replicated property or use a separate replicated subset if only certain stats need client visibility.
+`GetStat` is safe to call client-side for display purposes. For stats that need client visibility, replicate a subset via the standard `APlayerState` replication path — `RuntimeValues` itself is server-only.
 
 ---
 
 ## Persistence Notes
 
-- `UStatComponent` flushes dirty stats every 10 seconds by default (configurable via project settings or a `UPROPERTY` on the component).
+- `UStatComponent` flushes dirty stats on a repeating timer (`FlushIntervalSeconds`, default 10s, configurable per component instance).
 - Flush is forced on `EndPlay` — no stat loss on clean disconnect.
 - On player login, `UPersistenceSubsystem` deserializes `RuntimeValues` into the component before `BeginPlay` fires on any dependent system.
-- Stats are per-character, not per-account. If account-level stats are needed (e.g. total playtime across characters), a separate account-scoped persistence record is required — out of scope for this system.
+- Stats are per-character. Account-level stats (e.g. total playtime across characters) require a separate account-scoped persistence record — out of scope for this system.
 
 ---
 
@@ -130,6 +173,6 @@ float Kills = Stats->GetStat(TAG_Stat_EnemiesKilled);
 |---|---|
 | Requirement System (`URequirementSet`) | Optional per definition |
 | Event Bus (`UGameCoreEventBus`) | Required — broadcasts `FStatChangedEvent` |
-| GMS (`UGameplayMessageSubsystem`) | Required — message source for auto-rules |
+| GMS (`UGameplayMessageSubsystem`) | Game module only — not used by GameCore directly |
 | Serialization System (`IPersistableComponent`) | Required — persistence |
 | Achievement System | None (subscribes to Event Bus; no direct dep) |
