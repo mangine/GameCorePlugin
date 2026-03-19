@@ -1,50 +1,28 @@
-# Event Bus System 2
+# Event Bus System
 
 **Part of: GameCore Plugin** | **Status: Active Specification** | **UE Version: 5.7**
 
-Event Bus System 2 (`UGameCoreEventBus2`) is a `UWorldSubsystem` that mirrors Event Bus System 1 (`UGameCoreEventSubsystem`) in all architectural decisions — same `FGameplayTag` channels, same scope guard, same static accessor pattern — but uses a single strongly-typed `FInstancedStruct` as the universal message payload instead of a per-channel template type.
-
-This enables **dynamic registration**: a broadcaster can wrap any `USTRUCT` into an `FInstancedStruct` and broadcast it without the channel being known to the bus at compile time. The listener receives the `FInstancedStruct` and unwraps it with `Get<T>()`.
-
-Both systems coexist during migration. Neither depends on the other. GMS1 is not removed.
+The Event Bus System (`UGameCoreEventBus2`) is a `UWorldSubsystem` wrapper around Unreal's `UGameplayMessageSubsystem` (GMS). It provides a single, cached broadcast point for all cross-system events emitted by GameCore modules, using `FInstancedStruct` as the universal payload type to enable both strongly-typed and runtime-dynamic message dispatch.
 
 ---
 
-## Why a Second Bus
+## Purpose
 
-GMS1 is strongly typed per channel — `StartListening<T>` binds the callback to a specific struct type via `UScriptStruct`. This is correct for well-known system events (level-up, state change, etc.) but requires all message types to be known at the point of listener registration.
+Delegates are the right tool for intra-system wiring — they are synchronous, typed, and zero-overhead when no listeners are bound. However, they force every external consumer to take a direct reference to the component that owns the delegate, creating coupling that undermines GameCore's module-independence guarantee.
 
-GMS2 solves cases where the message type is only known at runtime — for example, a system that dynamically registers handlers keyed by `FGameplayTag` without compile-time knowledge of the payload struct. The payload identity is carried inside `FInstancedStruct` and interrogated at runtime with `GetScriptStruct()` or `Get<T>()`.
-
----
-
-## Key Decisions
-
-| Decision | Rationale |
-|---|---|
-| `FInstancedStruct` as universal payload | Carries `UScriptStruct*` + owned memory; matches GMS's internal layout. No UObject overhead. |
-| `FGameplayTag` channels retained | Same routing semantics as GMS1. No new channel primitive needed. |
-| `TFunction` callback instead of member pointer | No template `T` to bind against; `TFunction` captures the lambda or method uniformly. |
-| `EGameCoreEventScope` scope guard | Identical to GMS1. Enforces server/client correctness at broadcast site. |
-| `FGameplayMessageListenerHandle` for unregistration | Reuses the existing GMS handle type; no new handle type needed. |
-| `InitializeDependency<UGameplayMessageSubsystem>` | Guarantees GMS is alive before `UGameCoreEventBus2::Initialize` runs. |
-| Subsystem named `UGameCoreEventBus2` | Mirrors GMS1 naming convention (`UGameCoreEventSubsystem`), adds `2` suffix for migration clarity. |
-| GMS1 (`UGameCoreEventSubsystem`) renamed alias | Class is now also referred to as `UGameCoreEventBus` in documentation for clarity; no code rename needed unless team agrees. |
+`UGameCoreEventBus2` solves this by acting as a single, world-scoped broadcast bus. Any system can broadcast a typed message to a named channel. Any other system can listen to that channel with zero knowledge of the broadcaster.
 
 ---
 
-## Requirements
+## Design Rules
 
-To recreate this module from scratch a developer must:
-
-1. Create `UGameCoreEventBus2 : public UWorldSubsystem`.
-2. In `Initialize`, call `Collection.InitializeDependency<UGameplayMessageSubsystem>()` then cache `GMS`.
-3. Implement `Broadcast(FGameplayTag, FInstancedStruct, EGameCoreEventScope)` — scope guard first, then `GMS->BroadcastMessage<FInstancedStruct>(Channel, Message)`.
-4. Implement `StartListening(FGameplayTag, UObject*, TFunction<void(FGameplayTag, const FInstancedStruct&)>)` — calls `GMS->RegisterListener<FInstancedStruct>` forwarding the `TFunction` via a lambda capture.
-5. Implement `StopListening(FGameplayMessageListenerHandle&)` — unregisters and resets the handle.
-6. Implement `static UGameCoreEventBus2* Get(const UObject*)` — same `GEngine->GetWorldFromContextObject` pattern as GMS1.
-7. Add `StructUtils` to module `PublicDependencyModuleNames` (provides `FInstancedStruct`).
-8. Ensure `GameplayMessageRuntime` is also in dependencies (provides `FGameplayMessageListenerHandle`).
+- **Delegates stay for intra-system wiring.** A component may still fire its own delegate and call `Broadcast` in the same mutation — the delegate is for systems inside the same module; the bus is for everything else.
+- **One struct per event type.** Never share a payload struct between two unrelated events.
+- **Channel tags follow `GameCoreEvent.<System>.<Event>`.** Defined in `DefaultGameplayTags.ini` inside the owning module. Never in a central tags file.
+- **Every channel must declare its scope.** The broadcaster decides scope — the bus enforces it. Document scope and origin in `GameCore Event Messages.md`. Default is `ServerOnly`.
+- **Never call `UGameplayMessageSubsystem` directly** from GameCore module code. Always go through `UGameCoreEventBus2`.
+- **`ClientOnly` requires prior replication.** A client-side broadcast is a notification layer only — the data it references must already exist on the client via `FFastArraySerializer` or a replicated property before the broadcast fires.
+- **Do not cache `UGameCoreEventBus2` as a member.** Subsystem lifetime is tied to the world; components may outlive a world transition. Use `UGameCoreEventBus2::Get(this)` inline at call sites.
 
 ---
 
@@ -59,7 +37,7 @@ GameCore/
             └── GameCoreEventBus2.cpp
 ```
 
-No `GameCoreEventMessages` file for GMS2 — message structs remain owned by their originating systems. GMS2 does not define any message types.
+Message structs are owned by their originating systems, not by the bus itself.
 
 ---
 
@@ -79,25 +57,26 @@ PublicDependencyModuleNames.AddRange(new string[]
 
 ## Quick Usage Guide
 
-### 1 — Broadcasting
+### Broadcasting
 
 ```cpp
-// Wrap any USTRUCT into FInstancedStruct and broadcast.
+// External call sites — construct FInstancedStruct explicitly.
 FMyCustomMessage Msg;
 Msg.SomeField = 42;
-
-FInstancedStruct Payload = FInstancedStruct::Make(Msg);
 
 if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
 {
     Bus->Broadcast(
         MyTags::SomeChannel,
-        MoveTemp(Payload),
+        FInstancedStruct::Make(Msg),
         EGameCoreEventScope::ServerOnly);
 }
+
+// Internal GameCore systems — use the typed overload.
+Bus->Broadcast<FMyCustomMessage>(MyTags::SomeChannel, Msg, EGameCoreEventScope::ServerOnly);
 ```
 
-### 2 — Listening
+### Listening
 
 ```cpp
 FGameplayMessageListenerHandle Handle;
@@ -108,15 +87,12 @@ void UMySystem::BeginPlay()
 
     if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
     {
-        Handle = Bus->StartListening(
+        Handle = Bus->StartListening<FMyCustomMessage>(
             MyTags::SomeChannel,
             this,
-            [this](FGameplayTag Channel, const FInstancedStruct& Message)
+            [this](FGameplayTag, const FMyCustomMessage& Msg)
             {
-                if (const FMyCustomMessage* Msg = Message.GetPtr<FMyCustomMessage>())
-                {
-                    // Use Msg->SomeField
-                }
+                // Use Msg.SomeField
             });
     }
 }
@@ -124,27 +100,52 @@ void UMySystem::BeginPlay()
 void UMySystem::EndPlay(const EEndPlayReason::Type Reason)
 {
     if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
-    {
         Bus->StopListening(Handle);
-    }
     Super::EndPlay(Reason);
 }
 ```
 
-### 3 — Dynamic Registration Pattern
+### Dynamic Registration (runtime-unknown type)
 
 ```cpp
-// Register handlers keyed by tag at runtime — the bus does not care about struct type.
-TMap<FGameplayTag, FGameplayMessageListenerHandle> DynamicHandles;
-
-void RegisterHandler(FGameplayTag Channel, TFunction<void(FGameplayTag, const FInstancedStruct&)> Fn)
-{
-    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+// When the struct type is only known at runtime — use the raw FInstancedStruct overload.
+Handle = Bus->StartListening(
+    MyTags::SomeChannel,
+    this,
+    [](FGameplayTag, const FInstancedStruct& Message)
     {
-        DynamicHandles.Add(Channel, Bus->StartListening(Channel, this, MoveTemp(Fn)));
-    }
-}
+        if (const FMyTypeA* A = Message.GetPtr<FMyTypeA>()) { /* ... */ }
+        else if (const FMyTypeB* B = Message.GetPtr<FMyTypeB>()) { /* ... */ }
+    });
 ```
+
+---
+
+## Channel Tag Conventions
+
+All GameCore channels follow `GameCoreEvent.<System>.<Event>`. Defined per-module in `DefaultGameplayTags.ini`.
+
+Every channel entry in `GameCore Event Messages.md` must declare its **Scope** and **Origin machine**.
+
+```
+GameCoreEvent
+  ├── Progression
+  │     ├── LevelUp          [ServerOnly]
+  │     ├── XPChanged        [ServerOnly]
+  │     └── PointPoolChanged [ServerOnly]
+  └── StateMachine
+        ├── StateChanged     [Both — depends on component AuthorityMode]
+        └── TransitionBlocked[Both — depends on component AuthorityMode]
+```
+
+---
+
+## Known Limitations
+
+- **GMS is synchronous.** `BroadcastMessage` calls all listeners inline before returning. Heavy listener logic on a hot-path broadcast (e.g. `XPChanged`) should be deferred by the listener, not by the bus.
+- **`XPChanged` and `PointPoolChanged` can be high-frequency.** Batching must be applied at the call site — accumulate server-side, broadcast once per frame or threshold. The bus does not throttle.
+- **Scope is not a replication primitive.** The bus never sends data across the network. Scope only guards against broadcasting on the wrong machine.
+- **No cross-world channels.** Each `UGameCoreEventBus2` instance is world-scoped. Broadcasts do not cross world boundaries.
 
 ---
 
@@ -153,5 +154,5 @@ void RegisterHandler(FGameplayTag Channel, TFunction<void(FGameplayTag, const FI
 | Sub-Page | Covers |
 |---|---|
 | [UGameCoreEventBus2](Event%20Bus%20System%202/UGameCoreEventBus2.md) | Class definition, all methods, implementation notes |
-| [Scope Guard](Event%20Bus%20System%202/Scope%20Guard.md) | `EGameCoreEventScope` — shared with GMS1, documented here for GMS2 context |
-| [Migration Guide](Event%20Bus%20System%202/Migration%20Guide.md) | How to migrate a GMS1 channel to GMS2; coexistence rules |
+| [Scope Guard](Event%20Bus%20System%202/Scope%20Guard.md) | `EGameCoreEventScope` enum, evaluation rules |
+| [GameCore Event Messages](Event%20Bus%20System%202/GameCore%20Event%20Messages.md) | All message structs and channel tag definitions |
