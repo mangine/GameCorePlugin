@@ -30,6 +30,10 @@
  * StartListening overloads:
  *   - StartListening<T>  — typed; unwraps FInstancedStruct to T automatically.
  *   - StartListening     — raw FInstancedStruct; for callers that need runtime type inspection.
+ *
+ * TAG MATCHING IS EXACT. GMS does not support parent tag subscription.
+ * Subscribing to GameCoreEvent.Combat will NOT receive events on
+ * GameCoreEvent.Combat.EnemyKilled. Always subscribe to the specific leaf tag.
  */
 UCLASS()
 class GAMECORE_API UGameCoreEventBus : public UWorldSubsystem
@@ -93,6 +97,9 @@ public:
      * If the inner struct type does not match T, the callback is silently skipped
      * and an ensure fires in non-shipping builds.
      *
+     * IMPORTANT: Tag matching is exact. This listener will only fire for events
+     * broadcast on exactly this Channel tag — not on any child tags.
+     *
      * @return A handle. Store it — pass it to StopListening in EndPlay.
      */
     template<typename T>
@@ -107,6 +114,9 @@ public:
 
     /**
      * Register a raw listener. Use when the message type is only known at runtime.
+     *
+     * IMPORTANT: Tag matching is exact. This listener will only fire for events
+     * broadcast on exactly this Channel tag — not on any child tags.
      *
      * @return A handle. Store it — pass it to StopListening in EndPlay.
      */
@@ -345,3 +355,4 @@ Handle = Bus->StartListening(
 - **Both templates live in the header.** Template instantiation happens at the call site.
 - **`T` must be a `USTRUCT`** for both `Broadcast<T>` and `StartListening<T>`.
 - **Always store the handle and call `StopListening` in `EndPlay`.** Leaked handles keep a dangling lambda inside GMS.
+- **Tag matching is exact — no parent tag subscription.** `StartListening` on `GameCoreEvent.Combat` will not receive events broadcast on `GameCoreEvent.Combat.EnemyKilled`. Subscribe to the specific leaf tag. This is a GMS constraint — `UGameplayMessageSubsystem::RegisterListener` does not support hierarchical tag matching.

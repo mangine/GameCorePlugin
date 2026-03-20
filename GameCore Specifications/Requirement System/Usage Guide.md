@@ -2,368 +2,223 @@
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-This guide covers the three usage patterns for the Requirement System: one-shot imperative evaluation, reactive watched evaluation, and payload-injected evaluation for persisted data. Read this before implementing a new consuming system.
+Practical guide for integrating the Requirement System. Covers all three usage patterns with full code examples.
 
 ---
 
-# Pattern 1 — One-Shot Imperative Evaluation
+# Pattern 1 — Imperative One-Shot Check
 
-Use when a system needs to check a gate at a specific moment: confirming an RPC, validating an action before executing it, responding to a player request.
+Use when a system needs to validate a gate at a specific moment: confirming an RPC, checking interaction eligibility, validating an action.
 
-**When to use:** Interaction confirmation, ability activation, crafting, purchase validation, any server RPC handler that gates a gameplay action.
+**When:** Interaction confirmation, ability activation, crafting, server RPC handlers.
 
 ## Flow
 
 ```
-Server RPC received
-  → Build FRequirementContext from RPC connection
-  → Call List->Evaluate(Context)  [or EvaluateAsync for async requirements]
+Caller builds FRequirementContext from current world state
+  → List->Evaluate(Ctx)
+  → FRequirementResult { bPassed, FailureReason }
+  → If Fail: send FailureReason to client via RPC
   → If Pass: execute the action
-  → If Fail: send ClientRPC with FRequirementResult.FailureReason
 ```
 
-## Synchronous Example
+## Example — Server RPC confirming a mine action
 
 ```cpp
-// Server-side RPC handler confirming a mine action.
+// Define a snapshot struct in the Leveling/Inventory module:
+USTRUCT()
+struct FMineActionContext
+{
+    GENERATED_BODY()
+    UPROPERTY() TObjectPtr<APlayerState> PlayerState = nullptr;
+    UPROPERTY() TObjectPtr<UWorld>       World       = nullptr;
+};
+
+// In the server RPC handler:
 void UOreNodeComponent::Server_RequestMine_Implementation(APlayerController* Instigator)
 {
-    // Always construct context server-side. Never trust client-provided references.
-    FRequirementContext Ctx;
-    Ctx.PlayerState = Instigator->GetPlayerState<APlayerState>();
-    Ctx.World       = GetWorld();
-    Ctx.Instigator  = Instigator->GetPawn();
+    FMineActionContext CtxData;
+    CtxData.PlayerState = Instigator->GetPlayerState<APlayerState>();
+    CtxData.World       = GetWorld();
+
+    FRequirementContext Ctx = FRequirementContext::Make(CtxData);
 
     FRequirementResult Result = NodeDefinition->MineRequirements->Evaluate(Ctx);
     if (!Result.bPassed)
     {
-        // Send failure reason to the requesting client only.
         Instigator->ClientRPC_ShowRequirementFailure(Result.FailureReason);
         return;
     }
-
-    ExecuteMine(Ctx.PlayerState);
-}
-```
-
-## Async Example
-
-```cpp
-void UEntitlementGate::Server_RequestUnlock_Implementation(APlayerController* PC)
-{
-    FRequirementContext Ctx;
-    Ctx.PlayerState = PC->GetPlayerState<APlayerState>();
-    Ctx.World       = GetWorld();
-
-    // List contains a URequirement_BackendEntitlement — must use async path.
-    UnlockDefinition->Requirements->EvaluateAsync(Ctx,
-        [this, PC](FRequirementResult Result)
-        {
-            if (!Result.bPassed)
-            {
-                PC->ClientRPC_ShowRequirementFailure(Result.FailureReason);
-                return;
-            }
-            GrantUnlock(PC->GetPlayerState<APlayerState>());
-        });
-    // Do not proceed past this point — wait for the callback.
+    ExecuteMine(CtxData.PlayerState);
 }
 ```
 
 **Rules:**
-- Always construct `FRequirementContext` on the server from the RPC connection. Never use a client-provided actor reference as the subject.
-- For async evaluation, do not execute the gated action outside the callback.
-- Use `ValidateRequirements` at `BeginPlay` on every requirement array your system holds, to catch authoring errors early.
+- Always build context on the server from the RPC connection. Never use client-provided actor references as the subject.
+- Run `URequirementLibrary::ValidateRequirements` at `BeginPlay` on any list your system holds, to catch authoring errors early.
 
 ---
 
 # Pattern 2 — Reactive Watched Evaluation
 
-Use when a system needs to know *when* requirements become met or unmet over time, without polling. Typical use: quest availability, ability unlock visibility, UI state.
+Use when a system needs to know when requirements become met or unmet over time, without polling.
 
-**When to use:** Any system that shows "requirements met" UI, unlocks features reactively, or needs to respond to player state changes without a timer.
+**When:** Quest availability, ability unlock visibility, UI state, NPC dialogue gate.
 
 ## Flow
 
 ```
-System initialises (after BeginPlay)
-  → RegisterSet(List, OnDirty, ContextBuilder?)
-  → Store FRequirementSetHandle
+Setup:
+  Bind List->OnResultChanged
+  Call List->Register(World)         ← subscribes to watcher manager
+  [initial evaluation runs immediately inside Register]
 
-Player state changes (level up, item gained, quest completed, ...)
-  → Owning module fires WatcherManager->NotifyPlayerEvent(PlayerState, EventTag)
-  → WatcherComponent marks watching sets dirty
-  → Coalescing timer fires FlushPendingEvaluations()
-  → Each dirty set: ContextBuilder called, then List->Evaluate(Context)
-  → OnDirty(Handle, bAllPassed) fires on owning system
-  → System reacts (show unlock UI, enable button, progress quest)
+State changes (player levels up, gains item, completes quest, ...):
+  Owning module fires event on UGameCoreEventBus with RequirementEvent.* tag
+  URequirementWatcherManager receives it, coalesces per frame
+  End of frame: List->NotifyEvent(Tag, Payload) called
+  List->EvaluateAllFromEvent(Context)
+  If pass/fail changed → OnResultChanged.Broadcast(bPassed)
+  Bound callback fires
 
-System tears down
-  → UnregisterSet(Handle)
+Teardown:
+  List->Unregister(World)
+  List->OnResultChanged.RemoveAll(this)
 ```
 
-## Registration Example
+## Example — Quest availability tracking
 
 ```cpp
-void UQuestAvailabilityTracker::BeginTracking(URequirementList* List)
+// UQuestComponent registering availability requirements for a quest:
+void UQuestComponent::StartTrackingAvailability(URequirementList* AvailabilityList)
 {
-    URequirementWatcherComponent* Watcher =
-        PlayerState->FindComponentByClass<URequirementWatcherComponent>();
-    check(Watcher);
+    check(AvailabilityList);
 
-    // No ContextBuilder needed — requirements read directly from PlayerState.
-    WatchHandle = Watcher->RegisterSet(
-        List,
-        FOnRequirementSetDirty::CreateUObject(this, &UQuestAvailabilityTracker::OnAvailabilityChanged)
-    );
+    // Bind before Register so the initial evaluation fires our callback.
+    AvailabilityList->OnResultChanged.AddUObject(
+        this, &UQuestComponent::OnAvailabilityChanged);
+
+    AvailabilityList->Register(GetWorld());
+    ActiveAvailabilityList = AvailabilityList;
 }
 
-void UQuestAvailabilityTracker::OnAvailabilityChanged(FRequirementSetHandle Handle, bool bAllPassed)
+void UQuestComponent::OnAvailabilityChanged(bool bPassed)
 {
-    if (bAllPassed)
-        BroadcastQuestAvailable();
+    if (bPassed)
+        BroadcastQuestAvailable(QuestDefinition);
     else
-        BroadcastQuestUnavailable();
+        BroadcastQuestUnavailable(QuestDefinition);
 }
 
-void UQuestAvailabilityTracker::StopTracking()
+void UQuestComponent::StopTrackingAvailability()
 {
-    if (URequirementWatcherComponent* Watcher =
-        PlayerState->FindComponentByClass<URequirementWatcherComponent>())
+    if (ActiveAvailabilityList)
     {
-        Watcher->UnregisterSet(WatchHandle);
+        ActiveAvailabilityList->Unregister(GetWorld());
+        ActiveAvailabilityList->OnResultChanged.RemoveAll(this);
+        ActiveAvailabilityList = nullptr;
     }
-    WatchHandle = {};
 }
 ```
 
-## Firing Invalidation Events
-
-Every system that changes state requirements may watch must fire the appropriate tag:
+## Example — Firing the event from the leveling system
 
 ```cpp
-// In ULevelingComponent, after granting XP that caused a level-up:
-void ULevelingComponent::OnLevelUp(int32 NewLevel)
+void ULevelingComponent::OnLevelUp(APlayerState* PS, int32 OldLevel, int32 NewLevel)
 {
-    // ... apply level-up effects ...
+    // Apply level-up effects ...
 
-    // Notify all watcher components watching level-related requirements.
-    if (URequirementWatcherManager* Mgr = GetWorld()->GetSubsystem<URequirementWatcherManager>())
+    FLevelChangedEvent Payload;
+    Payload.PlayerState = PS;
+    Payload.OldLevel    = OldLevel;
+    Payload.NewLevel    = NewLevel;
+
+    UGameCoreEventBus* Bus = GetWorld()->GetSubsystem<UGameCoreEventBus>();
+    if (Bus)
     {
-        Mgr->NotifyPlayerEvent(
-            GetOwner<APlayerState>(),
-            FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged"));
+        Bus->Broadcast(
+            FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged"),
+            FInstancedStruct::Make(Payload));
     }
+    // No direct call to URequirementWatcherManager needed.
 }
 ```
 
 **Rules:**
-- Always store the `FRequirementSetHandle`. Discarding it means you cannot unregister.
-- Always call `UnregisterSet` when the tracking is no longer needed — the component cleans up on `EndPlay` but mid-session leaks waste subscription slots.
-- Never call `RegisterSet` or `UnregisterSet` from inside a `ContextBuilder` lambda.
-- Tune `FlushDelaySeconds` per set: 0.5s is the default (acceptable for quest unlock); use 0.1s for UI that needs to feel responsive.
+- Always bind `OnResultChanged` before `Register()` so the initial evaluation fires the callback.
+- Always call `Unregister()` when the system no longer needs to track — stale weak pointers are cleaned up lazily but explicit unregister is cleaner.
+- `Unregister` does not remove delegate bindings. Call `OnResultChanged.RemoveAll(this)` separately.
 
 ---
 
-# Pattern 3 — Payload-Injected Evaluation (Persisted Data)
+# Pattern 3 — Mixed Lists (Imperative + Event requirements)
 
-Use when a requirement needs to read runtime counter or float data that is owned by the consuming system and not derivable from world state alone. Typical use: quest kill counts, delivery counts, time-elapsed trackers.
+A single `URequirementList` may contain requirements that support both evaluation paths. Requirements that are imperative-only return their result from `Evaluate`. Requirements that are event-only return `Fail` from `Evaluate` and evaluate correctly from `EvaluateFromEvent`.
 
-**When to use:** Any requirement that checks "has the player done X amount of Y" where X is tracked by the owning system, not by a world-state query.
+**Design rule:** If a list contains event-only requirements, it should be used with `Register()` for reactive evaluation. Calling `Evaluate()` imperatively on such a list will return incorrect results (the event-only requirements will fail).
 
-## Flow
+`ValidateRequirements` does not detect event-only requirements in imperatively-evaluated lists at this time — this is a known limitation. Document clearly in the Data Asset which evaluation path the list supports.
 
-```
-Owning system holds runtime tracker data (e.g. FQuestRuntime with kill count)
-  → Before Evaluate: build FRequirementPayload from tracker data
-  → Insert payload into FRequirementContext::PersistedData under domain tag
-  → Call List->Evaluate(Context)
-  → URequirement_Persisted subclass reads payload via its PayloadKey
-```
+---
 
-## Imperative Payload Example
+# Writing a New Requirement Type
 
 ```cpp
-// UQuestComponent confirming stage completion server-side:
-void UQuestComponent::CheckStageCompletion(const FQuestRuntime& QuestRuntime)
-{
-    FRequirementContext Ctx;
-    Ctx.PlayerState = GetOwner<APlayerState>();
-    Ctx.World       = GetWorld();
+// 1. Place in the module that owns the data being queried.
+//    Example: Tags/Requirements/Requirement_HasTag.h
 
-    // Build payload from the quest's tracker data.
-    FRequirementPayload Payload;
-    for (const FQuestTrackerEntry& Tracker : QuestRuntime.Trackers)
-        Payload.Counters.Add(Tracker.TrackerKey, Tracker.CurrentValue);
-
-    // Inject under the quest's domain tag so requirements can find it.
-    Ctx.PersistedData.Add(QuestRuntime.QuestId, Payload);
-
-    FRequirementResult Result = QuestRuntime.StageDef->CompletionRequirements->Evaluate(Ctx);
-    if (Result.bPassed)
-        AdvanceToNextStage(QuestRuntime);
-}
-```
-
-## Watcher ContextBuilder Example
-
-For reactive evaluation, the payload is injected via the `ContextBuilder` delegate passed to `RegisterSet`:
-
-```cpp
-void UQuestComponent::RegisterCompletionWatcher(const FQuestRuntime& QuestRuntime)
-{
-    URequirementWatcherComponent* Watcher =
-        GetOwner<APlayerState>()->FindComponentByClass<URequirementWatcherComponent>();
-
-    FGameplayTag QuestId = QuestRuntime.QuestId;
-    TWeakObjectPtr<UQuestComponent> WeakThis = this;
-
-    FRequirementSetHandle Handle = Watcher->RegisterSet(
-        QuestRuntime.StageDef->CompletionRequirements,
-        FOnRequirementSetDirty::CreateUObject(this, &UQuestComponent::OnCompletionWatcherDirty),
-        // ContextBuilder: inject tracker payload before every flush evaluation.
-        [WeakThis, QuestId](FRequirementContext& Ctx)
-        {
-            UQuestComponent* QC = WeakThis.Get();
-            if (!QC) return;
-
-            const FQuestRuntime* QR = QC->FindActiveQuest(QuestId);
-            if (!QR) return;
-
-            FRequirementPayload Payload;
-            for (const FQuestTrackerEntry& T : QR->Trackers)
-                Payload.Counters.Add(T.TrackerKey, T.CurrentValue);
-
-            Ctx.PersistedData.Add(QuestId, Payload);
-        }
-    );
-
-    ActiveWatchHandles.Add(QuestId, Handle);
-}
-```
-
-## Implementing a `URequirement_Persisted` Subclass
-
-```cpp
-// Checks that a specific tracker counter meets a minimum value.
-// Payload is injected by the owning quest system under the quest's domain tag.
-UCLASS(DisplayName = "Tracker Count")
-class URequirement_TrackerCount : public URequirement_Persisted
+UCLASS(DisplayName = "Has Gameplay Tag")
+class URequirement_HasTag : public URequirement
 {
     GENERATED_BODY()
 public:
-    // Which counter within the payload to check.
-    UPROPERTY(EditDefaultsOnly, Category = "Requirement",
-        meta = (Categories = "Quest.Counter"))
-    FGameplayTag CounterKey;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Requirement")
+    FGameplayTag RequiredTag;
 
-    // Minimum value required to pass.
-    UPROPERTY(EditDefaultsOnly, Category = "Requirement", meta = (ClampMin = "1"))
-    int32 RequiredCount = 1;
-
-    virtual ERequirementDataAuthority GetDataAuthority() const override
+    virtual FRequirementResult Evaluate(const FRequirementContext& Context) const override
     {
-        // Payload is built from replicated FQuestRuntime — available on both sides.
-        return ERequirementDataAuthority::Both;
-    }
+        // Accept any context struct that carries a PlayerState.
+        // Define FPlayerContext in a shared header all requirements can include.
+        const FPlayerContext* Ctx = Context.Data.GetPtr<FPlayerContext>();
+        if (!Ctx || !Ctx->PlayerState)
+            return FRequirementResult::Fail(LOCTEXT("NoContext", "No player context."));
 
-    virtual FRequirementResult EvaluateWithPayload(
-        const FRequirementContext& Context,
-        const FRequirementPayload& Payload) const override
-    {
-        int32 Current = 0;
-        if (!Payload.GetCounter(CounterKey, Current))
+        UAbilitySystemComponent* ASC =
+            Ctx->PlayerState->FindComponentByClass<UAbilitySystemComponent>();
+        if (!ASC || !ASC->HasMatchingGameplayTag(RequiredTag))
         {
             return FRequirementResult::Fail(
-                FText::Format(LOCTEXT("TrackerMissing", "Tracker '{0}' not found."),
-                    FText::FromName(CounterKey.GetTagName())));
-        }
-
-        if (Current < RequiredCount)
-        {
-            return FRequirementResult::Fail(
-                FText::Format(LOCTEXT("TrackerInsufficient", "{0} / {1}"),
-                    FText::AsNumber(Current), FText::AsNumber(RequiredCount)));
+                FText::Format(LOCTEXT("MissingTag", "Missing tag: {0}"),
+                    FText::FromName(RequiredTag.GetTagName())));
         }
         return FRequirementResult::Pass();
     }
 
     virtual void GetWatchedEvents_Implementation(FGameplayTagContainer& OutEvents) const override
     {
-        // Invalidated when any quest tracker value changes.
-        OutEvents.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Quest.TrackerUpdated"));
+        OutEvents.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Tag.TagAdded"));
+        OutEvents.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Tag.TagRemoved"));
     }
 
 #if WITH_EDITOR
     virtual FString GetDescription() const override
     {
-        return FString::Printf(TEXT("%s >= %d"), *CounterKey.ToString(), RequiredCount);
+        return FString::Printf(TEXT("Has Tag: %s"), *RequiredTag.ToString());
     }
 #endif
 };
-```
-
-**Rules:**
-- `PayloadKey` is inherited from `URequirement_Persisted` — it is the domain tag (e.g. QuestId). It must match the key injected into `PersistedData` by the owning system's `ContextBuilder`.
-- `CounterKey` is the inner tag within the payload — the specific counter name.
-- Never subclass `URequirement` directly when you need payload data. Always go through `URequirement_Persisted` so the domain lookup is sealed and consistent.
-
----
-
-# Adding a New Requirement Type — Full Checklist
-
-```
-1. Subclass URequirement (or URequirement_Persisted if reading payload data).
-   File lives inside the module that owns the data being queried:
-     Quest data       → Quest/Requirements/
-     Inventory data   → Inventory/Requirements/
-     Leveling data    → Leveling/Requirements/
-     Tag data         → Tags/Requirements/
-     Base logic only  → Requirements/
-
-2. UCLASS macro:
-   UCLASS(DisplayName = "Human Readable Name", Blueprintable)
-   Do NOT add Abstract. Do NOT add EditInlineNew (inherited).
-
-3. Add "Requirements" to PublicDependencyModuleNames in Build.cs.
-
-4. Config properties:
-   UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Requirement")
-   No mutable state. No TObjectPtr to runtime actors.
-
-5. Override GetDataAuthority().
-   Be precise — ClientOnly only if all data is replicated,
-   ServerOnly if any data is server-only, Both only if genuinely correct on both sides.
-
-6. Override Evaluate() for sync, or IsAsync() + EvaluateAsync() for async.
-   Async: always wrap OnComplete with MakeGuardedCallback before any early-return path.
-   Persisted: override EvaluateWithPayload() instead — never override Evaluate().
-
-7. Override GetWatchedEvents_Implementation().
-   Return empty if on-demand only (watcher will never watch this type).
-   Cache FGameplayTag handles — use AddNativeGameplayTag at module startup.
-
-8. Set bIsMonotonic = true in CDO constructor if the condition can never revert.
-   Common: QuestCompleted, MinLevel once a minimum is reached.
-   Never: item possession, tag presence, cooldowns.
-
-9. Override GetDescription() inside #if WITH_EDITOR.
-   Include the configured property values: "MinLevel >= 20", "Has Tag: Status.Ready".
-
-10. No registration step. UE reflection discovers the subclass automatically.
 ```
 
 ---
 
 # Common Mistakes
 
-| Mistake | Consequence | Correct approach |
+| Mistake | Consequence | Fix |
 |---|---|---|
-| Calling `URequirementLibrary::EvaluateAll` directly | Bypasses list operator and authority validation | Call `List->Evaluate(Context)` |
-| Capturing `FRequirementContext` by reference in async lambda | Dangling reference — context is a stack variable | Capture specific values from context |
-| Not calling `MakeGuardedCallback` in `EvaluateAsync` | No timeout, possible double-fire | Call `MakeGuardedCallback` before any early return |
-| Adding a typed component pointer to `FRequirementContext` | Breaks `Requirements/` zero-dependency rule | Use `PlayerState->FindComponentByClass<T>()` inside the requirement |
-| Subclassing `URequirement` for payload data without going through `URequirement_Persisted` | Inconsistent domain key lookup | Subclass `URequirement_Persisted`, override `EvaluateWithPayload` |
-| Marking a reversible condition `bIsMonotonic` | Cache never invalidates, requirement is permanently stuck at Pass | Only set on conditions that are logically permanent |
-| Discarding `FRequirementSetHandle` | Cannot unregister, leaks subscription until PlayerState EndPlay | Always store the handle |
-| Calling `RegisterSet` from inside a `ContextBuilder` | Re-entrant watcher mutation, undefined behaviour | Defer registration to after flush completes |
+| Calling `URequirementLibrary::EvaluateAll` directly | Bypasses list operator and authority | Call `List->Evaluate(Ctx)` |
+| Not binding `OnResultChanged` before `Register()` | Misses initial evaluation callback | Bind first, then Register |
+| Forgetting `Unregister()` | Stale weak ptr in watcher, cleaned lazily | Always Unregister at teardown |
+| Adding typed fields to `FRequirementContext` | Breaks zero-dependency rule | Put data in `FInstancedStruct Data` |
+| Storing per-player state on `URequirement` | Data corruption across concurrent evaluations | URequirement is stateless — move state to the caller |
+| Imperatively evaluating a list with event-only requirements | Event-only requirements return Fail | Use `Register()` + `OnResultChanged` for such lists |
+| Mutating the requirement instance inside `Evaluate` | Thread-safety violation, state corruption | `Evaluate` must be `const` and stateless |
