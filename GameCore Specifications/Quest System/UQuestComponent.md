@@ -33,7 +33,6 @@ public:
 
     // Quest system configuration asset. Loaded at BeginPlay.
     // Controls MaxActiveQuests and other tunables without recompiling.
-    // If null, component uses built-in defaults.
     UPROPERTY(EditDefaultsOnly, Category="Quest")
     TSoftObjectPtr<UQuestConfigDataAsset> QuestConfig;
 
@@ -61,9 +60,8 @@ public:
     // ── Public Server API ───────────────────────────────────────────────────
 
     // Entry point for all tracker progress. Called by external integration layers.
-    // The quest system has NO GMS subscriptions — this is the only way progress
-    // enters the system. Virtual so USharedQuestComponent can route through
-    // USharedQuestCoordinator for formally shared group quests.
+    // No GMS subscriptions inside this component — this is the only way
+    // progress enters the system.
     UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category="Quest")
     virtual void Server_IncrementTracker(
         const FGameplayTag& QuestId,
@@ -77,14 +75,13 @@ public:
     void Server_ForceFailQuest(const FGameplayTag& QuestId);
 
     // Removes CompletedQuestTag for quests matching the given cadence,
-    // and re-registers their unlock watchers. Called by UQuestRegistrySubsystem
-    // on Daily/Weekly reset. Never adds to ActiveQuests — player must accept again.
+    // re-registers their unlock watchers. Called by UQuestRegistrySubsystem
+    // on Daily/Weekly reset.
     void FlushCadenceResets(EQuestResetCadence Cadence);
 
     FQuestRuntime*       FindActiveQuest(const FGameplayTag& QuestId);
     const FQuestRuntime* FindActiveQuest(const FGameplayTag& QuestId) const;
 
-    // Returns the resolved MaxActiveQuests from QuestConfig, or default 20.
     int32 GetMaxActiveQuests() const;
 
     // ── RPCs ───────────────────────────────────────────────────────────────────
@@ -110,21 +107,15 @@ public:
 
     virtual FName  GetPersistenceKey()  const override { return TEXT("QuestComponent"); }
     virtual uint32 GetSchemaVersion()   const override { return 1; }
-    virtual void   Serialize_Save(FArchive& Ar) override; // see Runtime Structs.md
+    virtual void   Serialize_Save(FArchive& Ar) override;
     virtual void   Serialize_Load(FArchive& Ar, uint32 SavedVersion) override;
     virtual void   Migrate(FArchive& Ar, uint32 FromVersion, uint32 ToVersion) override;
 
 protected:
-    // Watcher handles for unlock requirement sets. Keyed by QuestId.
-    // Unregistered when quest becomes Active or permanently closed.
-    TMap<FGameplayTag, FRequirementSetHandle> UnlockWatcherHandles;
-
-    // Watcher handles for stage completion requirement sets. Keyed by QuestId.
-    // Replaced on stage advance.
-    TMap<FGameplayTag, FRequirementSetHandle> CompletionWatcherHandles;
-
-    UPROPERTY()
-    TObjectPtr<URequirementWatcherComponent> WatcherComponent;
+    // Unlock watcher handles keyed by QuestId.
+    // Each handle is returned by URequirementList::RegisterWatch.
+    // Unregistered when the quest becomes Active or permanently closed.
+    TMap<FGameplayTag, FEventWatchHandle> UnlockWatcherHandles;
 
     // Loaded synchronously at BeginPlay from QuestConfig soft reference.
     UPROPERTY()
@@ -142,53 +133,74 @@ protected:
     void Internal_InitTrackers(FQuestRuntime& Runtime,
                                const UQuestStageDefinition* StageDef,
                                int32 GroupSize = 1);
-    void Internal_RegisterCompletionWatcher(const FQuestRuntime& Runtime,
-                                            const UQuestDefinition* Def);
-    void Internal_RegisterUnlockWatcher(const FGameplayTag& QuestId,
-                                        const UQuestDefinition* Def);
+
+    // Evaluates completion requirements immediately (imperative).
+    // Called by Server_IncrementTracker when a tracker reaches its target.
     void EvaluateCompletionRequirementsNow(const FGameplayTag& QuestId);
 
-    // Evaluates StageGraph transitions from the current stage using
-    // UStateMachineAsset::FindFirstPassingTransition and returns the next
-    // stage tag. Returns an invalid tag if no transition passes.
     FGameplayTag ResolveNextStage(const FQuestRuntime& Runtime,
                                   const UQuestDefinition* Def) const;
 
-    FRequirementContext BuildRequirementContext(const FQuestRuntime& Runtime,
-                                               const UQuestDefinition* Def) const;
+    // Builds a FRequirementContext containing a FPlayerContext snapshot.
+    // Quest requirements that need component data use
+    // PlayerState->FindComponentByClass<T>() inside their own Evaluate override.
+    FRequirementContext BuildRequirementContext() const;
 
-    // Called first in BeginPlay (server). Removes active quests whose
-    // definition is disabled. Non-destructive: no QuestCompletedTag added.
-    // Runs async for definitions not yet loaded, synchronously for cached ones.
+    // Step 1 of BeginPlay (server): remove disabled active quests async,
+    // then call RegisterUnlockWatchers as final step.
     void ValidateActiveQuestsOnLogin();
 
+    // Step 2 of BeginPlay (server): register unlock watchers for all
+    // candidate quests. Performs an immediate imperative baseline check
+    // for each list before handing off to the reactive watcher.
     void RegisterUnlockWatchers();
-    void RegisterClientValidatedWatchers();
+
+    // Called on owning client in BeginPlay. Registers ClientValidated
+    // completion watchers so the client can fire ServerRPC_RequestValidation
+    // when stage requirements pass.
+    void RegisterClientValidatedCompletionWatchers();
+
+    // Returns true if this quest should have an unlock watcher registered.
+    // Checks: not active, not permanently closed, bEnabled, lifecycle allows attempt.
+    bool ShouldWatchUnlock(const FGameplayTag& QuestId,
+                           const UQuestDefinition* Def) const;
 };
 ```
 
 ---
 
-## `UQuestConfigDataAsset`
+## Which Quests Get Unlock Watchers
 
-**File:** `Quest/Data/QuestConfigDataAsset.h`
+Only quests that are genuinely candidates for unlocking need a watcher. `ShouldWatchUnlock` enforces:
 
 ```cpp
-// Project-level quest system configuration. Referenced softly by UQuestComponent.
-// Change values here without touching component defaults or recompiling.
-UCLASS(BlueprintType)
-class GAMECORE_API UQuestConfigDataAsset : public UDataAsset
+bool UQuestComponent::ShouldWatchUnlock(
+    const FGameplayTag& QuestId, const UQuestDefinition* Def) const
 {
-    GENERATED_BODY()
-public:
-    // Maximum simultaneously active quests per player.
-    // Enforced server-side at ServerRPC_AcceptQuest.
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest",
-              meta=(ClampMin=1, ClampMax=200))
-    int32 MaxActiveQuests = 20;
+    if (!Def || !Def->bEnabled) return false;
 
-    // Future tunables go here: MaxDailyQuestSlots, MaxSharedQuestSlots, etc.
-};
+    // Already active — no need to watch.
+    if (FindActiveQuest(QuestId) != nullptr) return false;
+
+    // Permanently closed for this player?
+    // SingleAttempt and RetryUntilComplete quests with a QuestCompletedTag
+    // cannot be re-attempted.
+    switch (Def->Lifecycle)
+    {
+    case EQuestLifecycle::SingleAttempt:
+    case EQuestLifecycle::RetryUntilComplete:
+        if (CompletedQuestTags.HasTag(Def->QuestCompletedTag))
+            return false;
+        break;
+    case EQuestLifecycle::RetryAndAssist:
+    case EQuestLifecycle::Evergreen:
+        // Always re-watchable after cooldown — cooldown is expressed
+        // as URequirement_QuestCooldown in UnlockRequirements.
+        break;
+    }
+
+    return true;
+}
 ```
 
 ---
@@ -201,100 +213,331 @@ ServerRPC_AcceptQuest(QuestId)
   2. Duplicate check: already in ActiveQuests -> reject
   3. CompletedQuestTags pre-filter: tag present & Lifecycle is SingleAttempt -> reject
   4. UQuestRegistrySubsystem::GetOrLoadDefinitionAsync(QuestId, callback)
-     [callback may fire synchronously if already loaded, or async on first load]
   IN CALLBACK:
-  5. bEnabled check: Def->bEnabled == false -> reject
-  6. Re-evaluate UnlockRequirements server-side (always, regardless of CheckAuthority)
-     BuildRequirementContext() with empty tracker payload
+  5. bEnabled check -> reject if false
+  6. Re-evaluate UnlockRequirements server-side (always).
+     BuildRequirementContext() -> List->Evaluate(Ctx)
      -> Fail: ClientRPC_NotifyValidationRejected
   7. Create FQuestRuntime: QuestId, CurrentStageTag = StageGraph.EntryStateTag
-  8. Internal_InitTrackers for entry stage (GroupSize = 1 for base component)
+  8. Internal_InitTrackers for entry stage
   9. ActiveQuests.Items.Add(Runtime), MarkArrayDirty
  10. UQuestRegistrySubsystem::AddReference(QuestId)
  11. NotifyDirty(this)
- 12. Internal_RegisterCompletionWatcher for entry stage
- 13. Unregister UnlockWatcherHandle for this QuestId (no longer a candidate)
- 14. Broadcast GMS: GameCoreEvent.Quest.Started
- 15. Broadcast GMS: GameCoreEvent.Quest.StageStarted
- 16. ClientRPC_NotifyQuestEvent(QuestId, Started)
+ 12. Unregister UnlockWatcherHandle for this QuestId
+ 13. Broadcast GMS: GameCoreEvent.Quest.Started
+ 14. Broadcast GMS: GameCoreEvent.Quest.StageStarted
+ 15. ClientRPC_NotifyQuestEvent(QuestId, Started)
 ```
 
 ---
 
 ## Tracker Increment Flow (Server_IncrementTracker)
 
-This is the **only entry point** for progress data. No GMS subscriptions inside this component.
-
 ```
 Server_IncrementTracker(QuestId, TrackerKey, Delta)
-  1. Find FQuestRuntime* for QuestId -> not found: return
-  2. Find FQuestTrackerEntry* for TrackerKey -> not found: return
+  1. Find FQuestRuntime* -> not found: return
+  2. Find FQuestTrackerEntry* -> not found: return
   3. OldValue = Tracker.CurrentValue
-  4. Tracker.CurrentValue = FMath::Min(Tracker.CurrentValue + Delta,
-                                       Tracker.EffectiveTarget)
+  4. Tracker.CurrentValue = FMath::Min(CurrentValue + Delta, EffectiveTarget)
   5. If CurrentValue == OldValue: return (clamped, no-op)
   6. MarkItemDirty(Runtime) -> replication
   7. NotifyDirty(this)      -> persistence
-  8. URequirementWatcherManager::NotifyPlayerEvent(
-         PlayerState, RequirementEvent.Quest.TrackerUpdated)
-     // Notifies watcher for any sets watching this tag (achievements, etc.)
-     // Does NOT drive completion — that is done in step 9.
-  9. Broadcast GMS: GameCoreEvent.Quest.TrackerUpdated
- 10. If Tracker.CurrentValue >= Tracker.EffectiveTarget:
-       EvaluateCompletionRequirementsNow(QuestId)
-       // Immediate, imperative — no watcher flush delay.
+  8. Broadcast GMS: GameCoreEvent.Quest.TrackerUpdated
+     (external systems — achievements, UI — listen here)
+  9. If Tracker.CurrentValue >= Tracker.EffectiveTarget:
+       EvaluateCompletionRequirementsNow(QuestId)  <- imperative, immediate
 ```
 
-> **Single completion path.** Completion is evaluated imperatively at step 10 only. The watcher notification at step 8 serves other systems (achievements, UI progress bars) — it does not trigger another completion check. There is no completion watcher `OnDirty` callback that drives `Internal_CompleteQuest` / `Internal_FailQuest`. This avoids double-evaluation.
+> **Single completion path.** Completion is always driven imperatively from `Server_IncrementTracker` step 9. There is no reactive completion watcher — the watcher system is used exclusively for unlock detection.
+
+---
+
+## `EvaluateCompletionRequirementsNow`
+
+```cpp
+void UQuestComponent::EvaluateCompletionRequirementsNow(const FGameplayTag& QuestId)
+{
+    const FQuestRuntime* Runtime = FindActiveQuest(QuestId);
+    if (!Runtime) return;
+
+    // Load definition — must already be resident (called after tracker increment
+    // which requires the quest to be active, which requires the definition
+    // to have been loaded at accept time).
+    UQuestRegistrySubsystem* Registry =
+        GetGameInstance()->GetSubsystem<UQuestRegistrySubsystem>();
+    const UQuestDefinition* Def = Registry->FindLoadedDefinition(QuestId);
+    if (!Def) return;
+
+    const UQuestStageDefinition* Stage = Def->FindStage(Runtime->CurrentStageTag);
+    if (!Stage || !Stage->CompletionRequirements) return;
+
+    FRequirementContext Ctx = BuildRequirementContext();
+    FRequirementResult Result = Stage->CompletionRequirements->Evaluate(Ctx);
+    if (!Result.bPassed) return;
+
+    if (Stage->bIsCompletionState)      Internal_CompleteQuest(*FindActiveQuest(QuestId), Def);
+    else if (Stage->bIsFailureState)    Internal_FailQuest(*FindActiveQuest(QuestId), Def);
+    else
+    {
+        FGameplayTag Next = ResolveNextStage(*Runtime, Def);
+        if (Next.IsValid()) Internal_AdvanceStage(*FindActiveQuest(QuestId), Def, Next);
+    }
+}
+```
+
+---
+
+## `BuildRequirementContext`
+
+```cpp
+FRequirementContext UQuestComponent::BuildRequirementContext() const
+{
+    // Build a FPlayerContext snapshot. Quest requirements that need
+    // quest-specific data (tracker values, completion status, cooldown timestamps)
+    // retrieve it via PlayerState->FindComponentByClass<UQuestComponent>()
+    // inside their own Evaluate override — not via the context.
+    FPlayerContext CtxData;
+    CtxData.PlayerState = GetOwner<APlayerState>();
+    CtxData.World       = GetWorld();
+    return FRequirementContext::Make(CtxData);
+}
+```
+
+**Why no payload injection.** Prior versions injected tracker counters into `FRequirementContext::PersistedData` via `FRequirementPayload`. This was removed because:
+- It made the requirement system carry tracker concerns it should not know about.
+- Quest requirements that need component data call `FindComponentByClass<UQuestComponent>()` once per evaluation — the cost is a pointer walk through a small component list, acceptable for non-hot-path evaluation.
+- The requirement system v2 has no `PersistedData` field on `FRequirementContext`.
+
+---
+
+## BeginPlay and Login Validation
+
+```cpp
+void UQuestComponent::BeginPlay()
+{
+    Super::BeginPlay();
+
+    if (!QuestConfig.IsNull())
+        LoadedConfig = QuestConfig.LoadSynchronous();
+
+    if (GetOwnerRole() == ROLE_Authority)
+    {
+        // Server: remove disabled quests first, then register unlock watchers.
+        // Watcher registration is deferred until all async definition loads complete.
+        ValidateActiveQuestsOnLogin();
+    }
+    else if (IsOwner())
+    {
+        // Owning client only: register ClientValidated completion watchers.
+        // These allow the client to fire ServerRPC_RequestValidation when
+        // stage requirements pass, giving responsive UI feedback.
+        RegisterClientValidatedCompletionWatchers();
+    }
+}
+```
+
+---
+
+## `ValidateActiveQuestsOnLogin`
+
+Removes disabled active quests before registering watchers. Uses a shared counter to detect when all async definition loads have resolved.
+
+```cpp
+void UQuestComponent::ValidateActiveQuestsOnLogin()
+{
+    TArray<FGameplayTag> QuestIds;
+    for (const FQuestRuntime& R : ActiveQuests.Items)
+        QuestIds.Add(R.QuestId);
+
+    if (QuestIds.IsEmpty())
+    {
+        RegisterUnlockWatchers();
+        return;
+    }
+
+    TSharedRef<int32> Pending = MakeShared<int32>(QuestIds.Num());
+    TWeakObjectPtr<UQuestComponent> WeakThis = this;
+
+    UQuestRegistrySubsystem* Registry =
+        GetGameInstance()->GetSubsystem<UQuestRegistrySubsystem>();
+
+    for (const FGameplayTag& QuestId : QuestIds)
+    {
+        Registry->GetOrLoadDefinitionAsync(QuestId,
+            [WeakThis, QuestId, Pending](const UQuestDefinition* Def)
+            {
+                if (UQuestComponent* QC = WeakThis.Get())
+                {
+                    if (!Def || !Def->bEnabled)
+                    {
+                        // Non-destructive removal — no QuestCompletedTag added.
+                        QC->ActiveQuests.Items.RemoveAll(
+                            [&](const FQuestRuntime& R){ return R.QuestId == QuestId; });
+                        UE_LOG(LogQuest, Warning,
+                            TEXT("Removed disabled quest '%s' on login."),
+                            *QuestId.ToString());
+                    }
+
+                    --(*Pending);
+                    if (*Pending == 0)
+                    {
+                        if (QC->ActiveQuests.Items.Num() > 0)
+                            QC->ActiveQuests.MarkArrayDirty();
+                        QC->RegisterUnlockWatchers();
+                    }
+                }
+            });
+    }
+}
+```
+
+---
+
+## `RegisterUnlockWatchers`
+
+Called after `ValidateActiveQuestsOnLogin` completes. Iterates all known quest definitions to find candidates, then:
+1. Registers a reactive watcher via `URequirementList::RegisterWatch`.
+2. Immediately evaluates the list imperatively to establish a baseline (login snapshot).
+
+```cpp
+void UQuestComponent::RegisterUnlockWatchers()
+{
+    UQuestRegistrySubsystem* Registry =
+        GetGameInstance()->GetSubsystem<UQuestRegistrySubsystem>();
+
+    // Iterate all known quest definitions from the registry.
+    Registry->IterateAllDefinitions(
+        [this](const FGameplayTag& QuestId, const UQuestDefinition* Def)
+        {
+            if (!ShouldWatchUnlock(QuestId, Def)) return;
+            if (!Def->UnlockRequirements) return;
+
+            TWeakObjectPtr<UQuestComponent> WeakThis = this;
+
+            FEventWatchHandle Handle = Def->UnlockRequirements->RegisterWatch(
+                this,
+                [WeakThis, QuestId](bool bPassed)
+                {
+                    UQuestComponent* QC = WeakThis.Get();
+                    if (!QC) return;
+
+                    if (bPassed)
+                    {
+                        // Server: notify client that quest is now available.
+                        // Client will trigger ServerRPC_AcceptQuest on interaction.
+                        QC->ClientRPC_NotifyQuestEvent(QuestId,
+                            EQuestEventType::BecameAvailable);
+                    }
+                    else
+                    {
+                        QC->ClientRPC_NotifyQuestEvent(QuestId,
+                            EQuestEventType::BecameUnavailable);
+                    }
+                });
+
+            UnlockWatcherHandles.Add(QuestId, Handle);
+
+            // Baseline check: evaluate immediately at login without waiting
+            // for an event to fire. Informs the client of current availability.
+            FRequirementContext Ctx = BuildRequirementContext();
+            FRequirementResult Result = Def->UnlockRequirements->Evaluate(Ctx);
+            ClientRPC_NotifyQuestEvent(QuestId,
+                Result.bPassed
+                    ? EQuestEventType::BecameAvailable
+                    : EQuestEventType::BecameUnavailable);
+        });
+}
+```
+
+> **Note on `IterateAllDefinitions`.** `UQuestRegistrySubsystem` must expose an iteration method over all known quest asset IDs. Only definitions that are already resident in memory are iterated synchronously; the registry loads others on demand elsewhere. Unlock watchers for quests whose definitions are not yet loaded will be registered lazily when those definitions first load (see `UQuestRegistrySubsystem` spec).
+
+---
+
+## `RegisterClientValidatedCompletionWatchers`
+
+Called on the owning client in `BeginPlay`. Registers `ClientValidated` completion requirement watchers for all currently active quests. When requirements pass client-side, fires `ServerRPC_RequestValidation`.
+
+```cpp
+void UQuestComponent::RegisterClientValidatedCompletionWatchers()
+{
+    // Client only has access to its own replicated ActiveQuests.
+    // Definitions for active quests must already be loaded (they loaded
+    // at accept time server-side and replicated).
+    UQuestRegistrySubsystem* Registry =
+        GetGameInstance()->GetSubsystem<UQuestRegistrySubsystem>();
+
+    for (const FQuestRuntime& Runtime : ActiveQuests.Items)
+    {
+        const UQuestDefinition* Def =
+            Registry->FindLoadedDefinition(Runtime.QuestId);
+        if (!Def) continue;
+
+        const UQuestStageDefinition* Stage =
+            Def->FindStage(Runtime.CurrentStageTag);
+        if (!Stage || !Stage->CompletionRequirements) continue;
+
+        // Only register if this list is ClientValidated.
+        if (Def->CheckAuthority != EQuestCheckAuthority::ClientValidated) continue;
+
+        TWeakObjectPtr<UQuestComponent> WeakThis = this;
+        FGameplayTag QuestId    = Runtime.QuestId;
+        FGameplayTag StageTag   = Runtime.CurrentStageTag;
+
+        Stage->CompletionRequirements->RegisterWatch(
+            this,
+            [WeakThis, QuestId, StageTag](bool bPassed)
+            {
+                UQuestComponent* QC = WeakThis.Get();
+                if (!QC || !bPassed) return;
+
+                // Tell the server: client believes this stage is complete.
+                // Server re-evaluates from authoritative context before acting.
+                QC->ServerRPC_RequestValidation(QuestId, StageTag);
+            });
+        // Note: completion watcher handles are NOT stored on the client.
+        // They are unregistered implicitly when the owning list asset is
+        // unloaded, or explicitly when the component is destroyed.
+        // For precision control, store handles in a parallel TMap if needed.
+    }
+}
+```
 
 ---
 
 ## Stage Transition Logic (ResolveNextStage)
 
-When `CompletionRequirements` pass for the current stage and the stage is neither a completion nor failure terminal, `UQuestComponent` resolves the next stage by evaluating the `UStateMachineAsset` transition graph directly.
-
 ```cpp
 FGameplayTag UQuestComponent::ResolveNextStage(
-    const FQuestRuntime& Runtime,
-    const UQuestDefinition* Def) const
+    const FQuestRuntime& Runtime, const UQuestDefinition* Def) const
 {
-    FRequirementContext Ctx = BuildRequirementContext(Runtime, Def);
+    FRequirementContext Ctx = BuildRequirementContext();
 
-    // FindFirstPassingTransition evaluates UQuestTransitionRule instances
-    // against the FRequirementContext passed as ContextObject.
-    // The asset tries AnyState transitions first, then FromState transitions.
     return Def->StageGraph->FindFirstPassingTransition(
         Runtime.CurrentStageTag,
-        &Ctx); // passed as UObject* ContextObject
+        &Ctx); // UQuestTransitionRule casts ContextObject to FRequirementContext*
 }
 ```
-
-`UQuestTransitionRule::Evaluate` receives `&Ctx` as its `ContextObject` and casts it to `FRequirementContext*`. It then calls `Requirements->Evaluate(Ctx)` and returns the result. Designers author branching stage graphs by adding multiple `UQuestTransitionRule`-based transitions from the same source state, each with different requirement conditions. The first passing transition wins.
 
 ---
 
 ## Validation Flow (ServerRPC_RequestValidation)
 
-Used by the `ClientValidated` path when the client watcher detects completion requirements passing.
-
 ```
 ServerRPC_RequestValidation(QuestId, StageTag)
   1. Find FQuestRuntime -> not found: silent reject
-  2. Runtime.CurrentStageTag != StageTag -> ClientRPC_NotifyValidationRejected(StageMismatch)
+  2. Runtime.CurrentStageTag != StageTag
+     -> ClientRPC_NotifyValidationRejected(StageMismatch)
   3. UQuestRegistrySubsystem::GetOrLoadDefinitionAsync(QuestId, callback)
   IN CALLBACK:
   4. bEnabled check -> reject if false
   5. Find UQuestStageDefinition for StageTag
-  6. BuildRequirementContext() injecting tracker payload
-  7. CompletionRequirements->EvaluateAsync(Context, callback):
-     On Fail  -> ClientRPC_NotifyValidationRejected(ConditionFailed)
-     On Pass  ->
-       Check UQuestStateNode flags on current stage:
-         bIsCompletionState -> Internal_CompleteQuest
-         bIsFailureState    -> Internal_FailQuest
-       else:
-         ResolveNextStage() -> Internal_AdvanceStage(NextStageTag)
-         If no passing transition: log warning, no advance
+  6. BuildRequirementContext() — server-side, authoritative
+  7. Stage->CompletionRequirements->Evaluate(Ctx):
+     On Fail -> ClientRPC_NotifyValidationRejected(ConditionFailed)
+     On Pass ->
+       if bIsCompletionState -> Internal_CompleteQuest
+       if bIsFailureState    -> Internal_FailQuest
+       else ResolveNextStage -> Internal_AdvanceStage(NextStageTag)
 ```
 
 ---
@@ -304,134 +547,33 @@ ServerRPC_RequestValidation(QuestId, StageTag)
 ```
 Internal_CompleteQuest(Runtime, Def)
   1. Runtime.LastCompletedTimestamp = FDateTime::UtcNow().ToUnixTimestamp()
-  2. Unregister CompletionWatcherHandle for this quest
-  3. UQuestRegistrySubsystem::ReleaseReference(QuestId)
-  4. Switch on Lifecycle:
+  2. UQuestRegistrySubsystem::ReleaseReference(QuestId)
+  3. Switch on Lifecycle:
      SingleAttempt | RetryUntilComplete:
        Remove from ActiveQuests
        CompletedQuestTags.AddTag(Def->QuestCompletedTag)
+       Unregister UnlockWatcherHandle (quest permanently closed)
      RetryAndAssist | Evergreen:
        Remove from ActiveQuests
-       Re-register UnlockWatcher (cooldown requirement blocks re-accept until ready)
-  5. NotifyDirty(this)
-  6. Broadcast GMS: GameCoreEvent.Quest.Completed
-     (payload includes FirstTimeRewardTable or RepeatingRewardTable
-      based on whether this is first completion — tracked via CompletedQuestTags)
-  7. ClientRPC_NotifyQuestEvent(QuestId, Completed)
+       Re-register unlock watcher — cooldown requirement in UnlockRequirements
+       blocks re-accept until cooldown expires
+  4. NotifyDirty(this)
+  5. Broadcast GMS: GameCoreEvent.Quest.Completed
+  6. ClientRPC_NotifyQuestEvent(QuestId, Completed)
 
 Internal_FailQuest(Runtime, Def)
-  1. Unregister CompletionWatcherHandle
-  2. UQuestRegistrySubsystem::ReleaseReference(QuestId)
-  3. Switch on Lifecycle:
+  1. UQuestRegistrySubsystem::ReleaseReference(QuestId)
+  2. Switch on Lifecycle:
      SingleAttempt:
-       CompletedQuestTags.AddTag(Def->QuestCompletedTag) // permanently closed
+       CompletedQuestTags.AddTag(Def->QuestCompletedTag)
        Remove from ActiveQuests
+       Unregister UnlockWatcherHandle
      RetryUntilComplete | RetryAndAssist | Evergreen:
        Remove from ActiveQuests
-       Re-register UnlockWatcher
-  4. NotifyDirty(this)
-  5. Broadcast GMS: GameCoreEvent.Quest.Failed
-  6. ClientRPC_NotifyQuestEvent(QuestId, Failed)
-```
-
----
-
-## BeginPlay and Login Validation
-
-The ordering here is critical. Watcher registration must not happen until disabled quests are removed.
-
-```cpp
-void UQuestComponent::BeginPlay()
-{
-    Super::BeginPlay();
-
-    // Load config synchronously (forced load — small asset, always in memory).
-    if (!QuestConfig.IsNull())
-        LoadedConfig = QuestConfig.LoadSynchronous();
-
-    WatcherComponent =
-        GetOwner()->FindComponentByClass<URequirementWatcherComponent>();
-    checkf(WatcherComponent,
-        TEXT("UQuestComponent requires URequirementWatcherComponent on APlayerState"));
-
-    if (GetOwnerRole() == ROLE_Authority)
-    {
-        // Step 1: async-validate all active quests against bEnabled.
-        // Watcher registration is deferred until all validations complete.
-        // Uses a shared counter to know when all async loads are done.
-        ValidateActiveQuestsOnLogin();
-        // ValidateActiveQuestsOnLogin calls RegisterUnlockWatchers() and
-        // completion watcher registration as its final step after all
-        // definition loads resolve.
-    }
-    else if (IsOwner())
-    {
-        // Owning client: register ClientValidated completion watchers for UI.
-        RegisterClientValidatedWatchers();
-    }
-}
-```
-
-### ValidateActiveQuestsOnLogin — Ordered Async Pattern
-
-```cpp
-void UQuestComponent::ValidateActiveQuestsOnLogin()
-{
-    // Collect all QuestIds that need validation.
-    TArray<FGameplayTag> QuestIds;
-    for (const FQuestRuntime& R : ActiveQuests.Items)
-        QuestIds.Add(R.QuestId);
-
-    if (QuestIds.IsEmpty())
-    {
-        // No active quests — go straight to watcher registration.
-        RegisterUnlockWatchers();
-        return;
-    }
-
-    // Use a shared counter: when all loads complete, proceed to watcher registration.
-    TSharedRef<int32> Pending = MakeShared<int32>(QuestIds.Num());
-    TWeakObjectPtr<UQuestComponent> WeakThis = this;
-
-    auto OnAllLoaded = [WeakThis]()
-    {
-        if (UQuestComponent* QC = WeakThis.Get())
-            QC->RegisterUnlockWatchers();
-    };
-
-    UQuestRegistrySubsystem* Registry =
-        GetGameInstance()->GetSubsystem<UQuestRegistrySubsystem>();
-
-    for (const FGameplayTag& QuestId : QuestIds)
-    {
-        Registry->GetOrLoadDefinitionAsync(QuestId,
-            [this, QuestId, Pending, OnAllLoaded](const UQuestDefinition* Def)
-            {
-                if (Def && !Def->bEnabled)
-                {
-                    ActiveQuests.Items.RemoveAll(
-                        [&](const FQuestRuntime& R){ return R.QuestId == QuestId; });
-                    // No QuestCompletedTag — non-destructive removal.
-                    UE_LOG(LogQuest, Warning,
-                        TEXT("Removed disabled quest '%s' on login."),
-                        *QuestId.ToString());
-                }
-                else if (Def && Def->bEnabled)
-                {
-                    Internal_RegisterCompletionWatcher(
-                        *FindActiveQuest(QuestId), Def);
-                }
-
-                --(*Pending);
-                if (*Pending == 0)
-                {
-                    if (ActiveQuests.Items.Num() > 0)
-                        ActiveQuests.MarkArrayDirty();
-                    OnAllLoaded();
-                }
-            });
-    }
-}
+       Re-register unlock watcher
+  3. NotifyDirty(this)
+  4. Broadcast GMS: GameCoreEvent.Quest.Failed
+  5. ClientRPC_NotifyQuestEvent(QuestId, Failed)
 ```
 
 ---
@@ -439,64 +581,39 @@ void UQuestComponent::ValidateActiveQuestsOnLogin()
 ## Unlock Authority — Two Paths
 
 ```
-ServerAuthoritative quests:
-  Server watcher fires OnDirty (all-pass)
-    -> Server evaluates UnlockRequirements from authoritative context
+ServerAuthoritative quests  (Def->CheckAuthority == ServerAuthoritative):
+  Server unlock watcher fires (bPassed)
     -> Server fires ClientRPC_NotifyQuestEvent(BecameAvailable)
-    -> Client shows "Quest Available" UI
-    -> Player interacts with NPC / quest giver
+    -> Player interacts with quest giver
     -> Client fires ServerRPC_AcceptQuest
-    -> Server validates UnlockRequirements again before accepting
+    -> Server re-evaluates UnlockRequirements at step 6 before accepting
 
-ClientValidated quests:
-  Client watcher fires OnDirty (all-pass) [using replicated FQuestRuntime data]
-    -> Client shows "Quest Available" UI immediately (responsive)
-    -> Client fires ServerRPC_AcceptQuest
-    -> Server validates UnlockRequirements fully before accepting
-    -> If server rejects: ClientRPC_NotifyValidationRejected -> UI reverts
+ClientValidated quests  (Def->CheckAuthority == ClientValidated):
+  Client completion watcher fires (bPassed)
+    -> Client fires ServerRPC_RequestValidation
+    -> Server re-evaluates CompletionRequirements from authoritative context
+    -> If pass: advance/complete. If fail: ClientRPC_NotifyValidationRejected
 ```
 
-> The server **always** re-evaluates `UnlockRequirements` at `ServerRPC_AcceptQuest` step 6, regardless of authority mode. `CheckAuthority` controls when the client receives UI feedback, not whether the server validates.
+> The server **always** re-evaluates requirements before taking any gameplay action regardless of authority mode. Client results are UI hints only.
 
 ---
 
-## Watcher Registration and ContextBuilder
+## `UQuestConfigDataAsset`
+
+**File:** `Quest/Data/QuestConfigDataAsset.h`
 
 ```cpp
-void UQuestComponent::Internal_RegisterCompletionWatcher(
-    const FQuestRuntime& Runtime, const UQuestDefinition* Def)
+UCLASS(BlueprintType)
+class GAMECORE_API UQuestConfigDataAsset : public UDataAsset
 {
-    const UQuestStageDefinition* Stage = Def->FindStage(Runtime.CurrentStageTag);
-    if (!Stage || !Stage->CompletionRequirements) return;
-
-    FGameplayTag QuestId = Runtime.QuestId;
-    TWeakObjectPtr<UQuestComponent> WeakThis = this;
-
-    FRequirementSetHandle Handle = WatcherComponent->RegisterSet(
-        Stage->CompletionRequirements,
-        FOnRequirementSetDirty::CreateUObject(
-            this, &UQuestComponent::OnUnlockWatcherChanged),
-        // ContextBuilder: inject current tracker values as payload
-        [WeakThis, QuestId](FRequirementContext& Ctx)
-        {
-            if (UQuestComponent* QC = WeakThis.Get())
-            {
-                Ctx.QuestComponent = QC; // cached pointer for requirement use
-                if (const FQuestRuntime* QR = QC->FindActiveQuest(QuestId))
-                {
-                    FRequirementPayload Payload;
-                    for (const FQuestTrackerEntry& T : QR->Trackers)
-                        Payload.Counters.Add(T.TrackerKey, T.CurrentValue);
-                    Ctx.PersistedData.Add(QuestId, MoveTemp(Payload));
-                }
-            }
-        }
-    );
-    CompletionWatcherHandles.Add(QuestId, Handle);
-}
+    GENERATED_BODY()
+public:
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Quest",
+              meta=(ClampMin=1, ClampMax=200))
+    int32 MaxActiveQuests = 20;
+};
 ```
-
-> **Completion watcher purpose.** This watcher notifies external systems (achievements, analytics) via `RequirementEvent.Quest.TrackerUpdated`. It does NOT drive `Internal_CompleteQuest`. Completion is triggered only from `EvaluateCompletionRequirementsNow` called by `Server_IncrementTracker`. The `OnDirty` callback here should notify the UI or achievements, not attempt a stage advance.
 
 ---
 
@@ -504,7 +621,7 @@ void UQuestComponent::Internal_RegisterCompletionWatcher(
 
 **File:** `Quest/Components/SharedQuestComponent.h / .cpp`
 
-Inherits `UQuestComponent`. Adds group-aware accept flow and shared tracker routing. Uses `IGroupProvider` for all group data access. Falls back to base behavior when no `IGroupProvider` is present.
+Inherits `UQuestComponent`. Adds group-aware accept flow and shared tracker routing via `IGroupProvider`. Falls back to base behavior when no `IGroupProvider` is present.
 
 ```cpp
 UCLASS(ClassGroup=(GameCore), meta=(BlueprintSpawnableComponent))
@@ -512,7 +629,6 @@ class GAMECORE_API USharedQuestComponent : public UQuestComponent
 {
     GENERATED_BODY()
 public:
-    // Applied by USharedQuestCoordinator when this player leaves a group mid-quest.
     void Server_ApplyGroupSnapshot(const FQuestRuntime& SnapshotRuntime);
 
 protected:
@@ -530,40 +646,14 @@ private:
         return Cast<IGroupProvider>(GetOwner());
     }
 
-    // Locates the USharedQuestCoordinator via IGroupProvider::GetGroupActor().
-    // Returns null if not in a group or group actor has no coordinator.
     USharedQuestCoordinator* GetCoordinator() const
     {
         IGroupProvider* Provider = GetGroupProvider();
         if (!Provider) return nullptr;
         AActor* GroupActor = Provider->GetGroupActor();
-        if (!GroupActor) return nullptr;
-        return GroupActor->FindComponentByClass<USharedQuestCoordinator>();
+        return GroupActor
+            ? GroupActor->FindComponentByClass<USharedQuestCoordinator>()
+            : nullptr;
     }
-
-    TWeakObjectPtr<USharedQuestCoordinator> CachedCoordinator;
 };
 ```
-
-### Accept Flow (USharedQuestComponent override)
-
-```
-ServerRPC_AcceptQuest_Implementation(QuestId)
-  1. Load definition async (same as base)
-  2. Upcast Def to USharedQuestDefinition* (may be null — valid, treat as solo)
-  3. If SharedDef == null || AcceptanceMode == IndividualAccept:
-       -> Call base ServerRPC_AcceptQuest (solo path)
-  4. If AcceptanceMode == LeaderAccept:
-       Provider = GetGroupProvider()
-       If Provider == null -> call base (no group, treat as solo)
-       If !Provider->IsGroupLeader() -> ClientRPC_NotifyValidationRejected(NotGroupLeader)
-       Else:
-         Provider->GetGroupMembers(Members) // output param
-         Remove self from Members
-         Coordinator = GetCoordinator()
-         If Coordinator == null -> call base (no coordinator, treat as solo)
-         Coordinator->LeaderInitiateAccept(QuestId, SharedDef, Members)
-         Call base ServerRPC_AcceptQuest for self (leader enrolled as Primary)
-```
-
-> **Group size constraints** are expressed as `URequirement_GroupSize` in `UnlockRequirements`. Base `ServerRPC_AcceptQuest` evaluates these at step 6. `USharedQuestComponent` does not duplicate this check.
