@@ -1,173 +1,139 @@
-# URequirementWatcherManager
+# Requirement Watch Helper
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-`URequirementWatcherManager` is the event bus bridge for the Requirement System. It subscribes to `RequirementEvent.*` tags on the GameCore event bus, receives `FInstancedStruct` payloads, and routes them to all `URequirementList` instances that subscribed to those tags. It does not evaluate requirements — it only routes.
+The Requirement System's reactive evaluation path is built on top of `UGameCoreEventWatcher`. The requirement system does not own a watcher subsystem — it owns a **helper** (`URequirementWatchHelper`) that registers closures with `UGameCoreEventWatcher` on behalf of a consuming system.
 
-**File:** `Requirements/RequirementWatcher.h / .cpp`
+The helper is a convenience layer. Systems that want full control can register with `UGameCoreEventWatcher` directly and call `List->EvaluateFromEvent` in their own callback.
+
+**File:** `Requirements/RequirementWatchHelper.h / .cpp`
 
 ---
 
-# Class Definition
+# Why a Helper and Not a Subsystem
+
+`URequirementWatcherManager` was previously a `UWorldSubsystem` that duplicated event routing logic already owned by `UGameCoreEventWatcher`. It added no value beyond what the generic watcher provides. It was removed.
+
+The helper replaces it with a thin registration utility. It:
+1. Collects watched tags from the list's requirements via `GetWatchedEvents`.
+2. Builds a closure that wraps the event payload in `FRequirementContext`, calls `List->EvaluateFromEvent`, and calls a user-supplied `TFunction<void(bool)>` delegate with the pass/fail result.
+3. Registers that closure with `UGameCoreEventWatcher` for each watched tag.
+4. Returns a single `FEventWatchHandle` covering all tag registrations.
+
+The user-supplied delegate captures caller-private context — quest ID, component pointer, whatever the consuming system needs — without exposing it to the watcher or the requirement system.
+
+---
+
+# `URequirementWatchHelper`
 
 ```cpp
 UCLASS()
-class GAMECORE_API URequirementWatcherManager : public UWorldSubsystem
+class GAMECORE_API URequirementWatchHelper : public UObject
 {
     GENERATED_BODY()
 public:
 
-    virtual void Initialize(FSubsystemCollectionBase& Collection) override;
-    virtual void Deinitialize() override;
-
-    // ── List Registration (called by URequirementList) ──────────────────────
-
-    // Subscribes a list to a set of event tags.
-    // Called by URequirementList::Register().
-    // The list is stored as a weak pointer — no ownership transfer.
-    void RegisterList(URequirementList* List, const FGameplayTagContainer& WatchedTags);
-
-    // Removes all subscriptions for this list.
-    // Called by URequirementList::Unregister().
-    void UnregisterList(URequirementList* List);
-
-    // ── Event Broadcasting (called by game systems) ─────────────────────────
-
-    // Broadcasts an event to all lists watching EventTag.
-    // Payload is the FInstancedStruct from the event bus — passed through
-    // directly to URequirementList::NotifyEvent.
+    // Registers a requirement list for reactive evaluation.
     //
-    // Authority is enforced here: lists whose Authority does not match
-    // the current net role are silently skipped.
+    // When any of the list's watched event tags fires:
+    //   1. The event payload is wrapped in FRequirementContext.
+    //   2. List->EvaluateFromEvent(Context) is called.
+    //   3. If the pass/fail result changed since the last evaluation,
+    //      OnResult(bPassed) is called.
     //
-    // Coalescing: multiple BroadcastEvent calls with the same tag in the
-    // same frame are batched. Each list receives at most one NotifyEvent
-    // call per frame per tag, using the last payload received.
-    UFUNCTION(BlueprintCallable, Category = "Requirements")
-    void BroadcastEvent(FGameplayTag EventTag, const FInstancedStruct& Payload);
+    // OnResult captures caller context via closure — the helper never inspects it.
+    // Use TWeakObjectPtr for any UObject captured in OnResult.
+    //
+    // Authority is read from List->Authority. The helper skips evaluation
+    // silently if called on the wrong network side.
+    //
+    // Returns one FEventWatchHandle covering all tag subscriptions for this list.
+    // Pass to Unregister when reactive tracking is no longer needed.
+    static FEventWatchHandle RegisterList(
+        const UObject* Owner,
+        URequirementList* List,
+        TFunction<void(bool /*bPassed*/)> OnResult);
 
-private:
-    // Tag → registered lists.
-    TMap<FGameplayTag, TArray<TWeakObjectPtr<URequirementList>>> TagToLists;
-
-    // Coalescing: pending events accumulated this frame.
-    TMap<FGameplayTag, FInstancedStruct> PendingEvents;
-
-    // Frame flush handle.
-    FDelegateHandle PostWorldTickHandle;
-
-    // Event bus listener handle — stored to unsubscribe on Deinitialize.
-    FDelegateHandle EventBusHandle;
-
-    void OnEventBusMessage(FGameplayTag Tag, const FInstancedStruct& Payload);
-    void FlushPendingEvents();
-    bool IsAuthorityMatch(const URequirementList* List) const;
+    // Removes all tag subscriptions established by the given handle.
+    static void UnregisterList(
+        const UObject* Owner,
+        FEventWatchHandle Handle);
 };
 ```
 
 ---
 
-# Initialization — Event Bus Subscription
+# `RegisterList` — Implementation
 
 ```cpp
-void URequirementWatcherManager::Initialize(FSubsystemCollectionBase& Collection)
+FEventWatchHandle URequirementWatchHelper::RegisterList(
+    const UObject* Owner,
+    URequirementList* List,
+    TFunction<void(bool)> OnResult)
 {
-    Super::Initialize(Collection);
+    if (!List || !OnResult || !Owner) return FEventWatchHandle{};
 
-    // Subscribe to all RequirementEvent.* tags on the event bus.
-    // UGameCoreEventBus is the GameCore event subsystem.
-    UGameCoreEventBus* Bus = GetWorld()->GetSubsystem<UGameCoreEventBus>();
-    if (Bus)
-    {
-        EventBusHandle = Bus->Subscribe(
-            FGameplayTag::RequestGameplayTag("RequirementEvent"),
-            FGameCoreEventDelegate::CreateUObject(
-                this, &URequirementWatcherManager::OnEventBusMessage));
-    }
+    UGameCoreEventWatcher* Watcher = UGameCoreEventWatcher::Get(Owner);
+    if (!Watcher) return FEventWatchHandle{};
 
-    // Register per-frame flush.
-    PostWorldTickHandle = FWorldDelegates::OnWorldPostActorTick.AddUObject(
-        this, &URequirementWatcherManager::FlushPendingEvents_Wrapper);
-}
+    // Collect all watched tags from the list's requirements.
+    FGameplayTagContainer WatchedTags;
+    List->CollectWatchedEvents(WatchedTags);
+    if (WatchedTags.IsEmpty()) return FEventWatchHandle{};
 
-void URequirementWatcherManager::Deinitialize()
-{
-    if (UGameCoreEventBus* Bus = GetWorld()->GetSubsystem<UGameCoreEventBus>())
-        Bus->Unsubscribe(EventBusHandle);
+    // Shared state between the closures for this registration:
+    // tracks last known result so OnResult only fires on state change.
+    auto LastResult = MakeShared<TOptional<bool>>();
 
-    FWorldDelegates::OnWorldPostActorTick.Remove(PostWorldTickHandle);
-    Super::Deinitialize();
-}
-```
+    TWeakObjectPtr<URequirementList> WeakList = List;
+    ERequirementEvalAuthority Authority = List->Authority;
 
----
-
-# Event Flow
-
-```
-Game system changes state (e.g. player levels up)
-  │
-  └── Fires event on UGameCoreEventBus:
-        Tag     = "RequirementEvent.Leveling.LevelChanged"
-        Payload = FInstancedStruct containing FLevelChangedEvent
-
-URequirementWatcherManager::OnEventBusMessage(Tag, Payload)
-  │
-  └── Stores in PendingEvents[Tag] = Payload  (last-write-wins per tag per frame)
-
-[end of frame — OnWorldPostActorTick]
-URequirementWatcherManager::FlushPendingEvents()
-  │
-  └── For each (Tag, Payload) in PendingEvents:
-        Lists = TagToLists[Tag]
-        For each TWeakObjectPtr<URequirementList> WeakList in Lists:
-          if (!WeakList.IsValid()) → remove stale entry, continue
-          if (!IsAuthorityMatch(WeakList.Get())) → skip (wrong net side)
-          WeakList->NotifyEvent(Tag, Payload)
-            │
-            └── URequirementList evaluates all requirements via EvaluateFromEvent
-                If pass/fail state changed → OnResultChanged.Broadcast(bPassed)
-                Consuming system callback fires
-```
-
----
-
-# `RegisterList` / `UnregisterList`
-
-```cpp
-void URequirementWatcherManager::RegisterList(
-    URequirementList* List, const FGameplayTagContainer& WatchedTags)
-{
-    for (const FGameplayTag& Tag : WatchedTags)
-    {
-        TArray<TWeakObjectPtr<URequirementList>>& Entry = TagToLists.FindOrAdd(Tag);
-        // Avoid duplicate registration.
-        Entry.AddUnique(TWeakObjectPtr<URequirementList>(List));
-    }
-}
-
-void URequirementWatcherManager::UnregisterList(URequirementList* List)
-{
-    for (auto& Pair : TagToLists)
-    {
-        Pair.Value.RemoveAll([List](const TWeakObjectPtr<URequirementList>& W)
+    return Watcher->Register(Owner, WatchedTags,
+        [WeakList, OnResult, LastResult, Authority]
+        (FGameplayTag Tag, const FInstancedStruct& Payload)
         {
-            return !W.IsValid() || W.Get() == List;
+            URequirementList* L = WeakList.Get();
+            if (!L) return;
+
+            // Authority check.
+            if (!URequirementWatchHelper::PassesAuthority(L)) return;
+
+            // Wrap event payload as evaluation context.
+            FRequirementContext Ctx;
+            Ctx.Data = Payload;
+
+            FRequirementResult Result = L->EvaluateFromEvent(Ctx);
+
+            // Only fire OnResult if pass/fail state changed.
+            if (!LastResult->IsSet() || LastResult->GetValue() != Result.bPassed)
+            {
+                *LastResult = Result.bPassed;
+                OnResult(Result.bPassed);
+            }
         });
-    }
+}
+
+void URequirementWatchHelper::UnregisterList(
+    const UObject* Owner,
+    FEventWatchHandle Handle)
+{
+    if (UGameCoreEventWatcher* Watcher = UGameCoreEventWatcher::Get(Owner))
+        Watcher->Unregister(Handle);
 }
 ```
 
 ---
 
-# Authority Enforcement
+# Authority Check
 
 ```cpp
-bool URequirementWatcherManager::IsAuthorityMatch(const URequirementList* List) const
+// static
+bool URequirementWatchHelper::PassesAuthority(const URequirementList* List)
 {
-    if (!List) return false;
+    const UWorld* World = List->GetWorld();
+    if (!World) return false;
 
-    ENetMode NetMode = GetWorld()->GetNetMode();
+    ENetMode NetMode = World->GetNetMode();
     switch (List->Authority)
     {
     case ERequirementEvalAuthority::ServerOnly:
@@ -175,7 +141,7 @@ bool URequirementWatcherManager::IsAuthorityMatch(const URequirementList* List) 
     case ERequirementEvalAuthority::ClientOnly:
         return NetMode == NM_Client || NetMode == NM_Standalone;
     case ERequirementEvalAuthority::ClientValidated:
-        return true; // both sides evaluate; server re-validates via RPC
+        return true;
     }
     return false;
 }
@@ -183,66 +149,90 @@ bool URequirementWatcherManager::IsAuthorityMatch(const URequirementList* List) 
 
 ---
 
-# Coalescing Rationale
+# Usage — Quest Component Example
 
-Without coalescing, a burst of 20 `ItemAdded` events in one frame would call `NotifyEvent` 20 times on the same list. Most of those evaluations are redundant — only the final world state matters. Coalescing batches events per tag per frame, guaranteeing each list evaluates at most once per tag per frame regardless of event rate. Last-write-wins for the payload is correct because the requirement evaluates current state, not event history.
-
----
-
-# Event Tag Conventions
-
-All requirement invalidation tags live under `RequirementEvent.*`. Each module owns its sub-namespace.
-
-```
-RequirementEvent
-  ├── Leveling.LevelChanged
-  ├── Inventory.ItemAdded
-  ├── Inventory.ItemRemoved
-  ├── Quest.StageChanged
-  ├── Quest.Completed
-  ├── Combat.EnemyKilled
-  ├── Tag.TagAdded
-  └── Tag.TagRemoved
-```
-
-**Rules:**
-- Tags defined in `DefaultGameplayTags.ini` in their owning module — never in a central file.
-- Use specific leaf tags, not parent tags. `Inventory.ItemAdded` not `Inventory`.
-- Cache tag handles at module startup via `UGameplayTagsManager::AddNativeGameplayTag`.
-
----
-
-# Firing an Event — Integration Example
-
-Any system that changes state requirements may watch fires the event on the bus:
+This demonstrates the full pattern: the consuming system captures its own context in the `OnResult` closure. The helper and watcher see only `bool bPassed`.
 
 ```cpp
-// In ULevelingComponent, after a level-up:
-void ULevelingComponent::OnLevelUp(APlayerState* PS, int32 OldLevel, int32 NewLevel)
+// In UQuestComponent, tracking availability for a specific quest:
+void UQuestComponent::StartWatchingAvailability(URequirementList* List, FGameplayTag QuestId)
 {
-    // ... apply level-up effects ...
+    TWeakObjectPtr<UQuestComponent> WeakThis = this;
 
-    FLevelChangedEvent Payload;
-    Payload.PlayerState = PS;
-    Payload.OldLevel    = OldLevel;
-    Payload.NewLevel    = NewLevel;
+    FEventWatchHandle Handle = URequirementWatchHelper::RegisterList(
+        this,
+        List,
+        // OnResult closure — captures QuestId privately.
+        // The helper knows nothing about QuestId or UQuestComponent.
+        [WeakThis, QuestId](bool bPassed)
+        {
+            if (UQuestComponent* Self = WeakThis.Get())
+            {
+                if (bPassed)
+                    Self->OnQuestAvailable(QuestId);
+                else
+                    Self->OnQuestUnavailable(QuestId);
+            }
+        });
 
-    UGameCoreEventBus* Bus = GetWorld()->GetSubsystem<UGameCoreEventBus>();
-    if (Bus)
+    // Store handle keyed by QuestId for later unregistration.
+    ActiveWatchHandles.Add(QuestId, Handle);
+}
+
+void UQuestComponent::StopWatchingAvailability(FGameplayTag QuestId)
+{
+    if (FEventWatchHandle* Handle = ActiveWatchHandles.Find(QuestId))
     {
-        Bus->Broadcast(
-            FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged"),
-            FInstancedStruct::Make(Payload));
+        URequirementWatchHelper::UnregisterList(this, *Handle);
+        ActiveWatchHandles.Remove(QuestId);
     }
 }
 ```
 
-The watcher manager receives this automatically. No direct call to the manager is needed from the leveling system.
+---
+
+# Usage — Non-Requirement System Using UGameCoreEventWatcher Directly
+
+Systems that don't use requirements but still need closure-with-context event callbacks skip the helper entirely and use `UGameCoreEventWatcher` directly:
+
+```cpp
+// An objective tracker that needs to know which objective to update
+// when a combat event fires, without passing objective ID through the event bus.
+
+void UObjectiveTracker::BeginTracking(FGameplayTag ObjectiveId)
+{
+    TWeakObjectPtr<UObjectiveTracker> WeakThis = this;
+
+    FGameplayTag KillTag =
+        FGameplayTag::RequestGameplayTag("RequirementEvent.Combat.EnemyKilled");
+
+    WatchHandle = UGameCoreEventWatcher::Get(this)->Register(this, KillTag,
+        [WeakThis, ObjectiveId](FGameplayTag, const FInstancedStruct& Payload)
+        {
+            if (UObjectiveTracker* Self = WeakThis.Get())
+            {
+                const FEnemyKilledEvent* Evt = Payload.GetPtr<FEnemyKilledEvent>();
+                if (Evt) Self->OnEnemyKilled(ObjectiveId, *Evt);
+            }
+        });
+}
+
+void UObjectiveTracker::StopTracking()
+{
+    UGameCoreEventWatcher::Get(this)->Unregister(WatchHandle);
+}
+```
 
 ---
 
-# Known Limitations
+# Summary of Responsibilities
 
-- **Stale weak pointers.** `TagToLists` entries are cleaned up lazily during `FlushPendingEvents`. Lists that are garbage-collected between registration and the next flush are silently skipped and removed.
-- **Last-write-wins coalescing.** If two different payloads for the same tag arrive in the same frame (e.g. two enemies killed), only the last payload is delivered to lists. Requirements that need to process every individual event should not rely on the watcher — they should be evaluated directly by the owning system.
-- **No per-consumer routing.** All registered lists for a tag receive the same event payload. Requirements that need to filter by player identity must do so inside their `EvaluateFromEvent` implementation.
+| Concern | Owner |
+|---|---|
+| Broadcasting events | Owning system via `UGameCoreEventBus` |
+| Tag subscription lifecycle | `UGameCoreEventWatcher` |
+| Closure building and context capture | Caller (quest component, tracker, etc.) |
+| Requirement evaluation on event | `URequirementWatchHelper` closure |
+| Authority enforcement | `URequirementWatchHelper::PassesAuthority` |
+| Pass/fail change detection | `URequirementWatchHelper` shared state in closure |
+| Caller-private context (quest ID, etc.) | Captured in caller's `OnResult` lambda |
