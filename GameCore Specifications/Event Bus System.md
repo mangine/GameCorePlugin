@@ -2,7 +2,7 @@
 
 **Part of: GameCore Plugin** | **Status: Active Specification** | **UE Version: 5.7**
 
-The Event Bus System (`UGameCoreEventBus2`) is a `UWorldSubsystem` wrapper around Unreal's `UGameplayMessageSubsystem` (GMS). It provides a single, cached broadcast point for all cross-system events emitted by GameCore modules, using `FInstancedStruct` as the universal payload type to enable both strongly-typed and runtime-dynamic message dispatch.
+The Event Bus System (`UGameCoreEventBus`) is a `UWorldSubsystem` wrapper around Unreal's `UGameplayMessageSubsystem` (GMS). It provides a single, cached broadcast point for all cross-system events emitted by GameCore modules, using `FInstancedStruct` as the universal payload type to enable both strongly-typed and runtime-dynamic message dispatch.
 
 ---
 
@@ -10,7 +10,7 @@ The Event Bus System (`UGameCoreEventBus2`) is a `UWorldSubsystem` wrapper aroun
 
 Delegates are the right tool for intra-system wiring — they are synchronous, typed, and zero-overhead when no listeners are bound. However, they force every external consumer to take a direct reference to the component that owns the delegate, creating coupling that undermines GameCore's module-independence guarantee.
 
-`UGameCoreEventBus2` solves this by acting as a single, world-scoped broadcast bus. Any system can broadcast a typed message to a named channel. Any other system can listen to that channel with zero knowledge of the broadcaster.
+`UGameCoreEventBus` solves this by acting as a single, world-scoped broadcast bus. Any system can broadcast a typed message to a named channel. Any other system can listen to that channel with zero knowledge of the broadcaster.
 
 ---
 
@@ -18,11 +18,11 @@ Delegates are the right tool for intra-system wiring — they are synchronous, t
 
 - **Delegates stay for intra-system wiring.** A component may still fire its own delegate and call `Broadcast` in the same mutation — the delegate is for systems inside the same module; the bus is for everything else.
 - **One struct per event type.** Never share a payload struct between two unrelated events.
-- **Channel tags follow `GameCoreEvent.<System>.<Event>`.** Defined in `DefaultGameplayTags.ini` inside the owning module. Never in a central tags file.
+- **Channel tags follow `GameCoreEvent.<s>.<Event>`.** Defined in `DefaultGameplayTags.ini` inside the owning module. Never in a central tags file.
 - **Every channel must declare its scope.** The broadcaster decides scope — the bus enforces it. Document scope and origin in `GameCore Event Messages.md`. Default is `ServerOnly`.
-- **Never call `UGameplayMessageSubsystem` directly** from GameCore module code. Always go through `UGameCoreEventBus2`.
+- **Never call `UGameplayMessageSubsystem` directly** from GameCore module code. Always go through `UGameCoreEventBus`.
 - **`ClientOnly` requires prior replication.** A client-side broadcast is a notification layer only — the data it references must already exist on the client via `FFastArraySerializer` or a replicated property before the broadcast fires.
-- **Do not cache `UGameCoreEventBus2` as a member.** Subsystem lifetime is tied to the world; components may outlive a world transition. Use `UGameCoreEventBus2::Get(this)` inline at call sites.
+- **Do not cache `UGameCoreEventBus` as a member.** Subsystem lifetime is tied to the world; components may outlive a world transition. Use `UGameCoreEventBus::Get(this)` inline at call sites.
 
 ---
 
@@ -32,9 +32,9 @@ Delegates are the right tool for intra-system wiring — they are synchronous, t
 GameCore/
 └── Source/
     └── GameCore/
-        └── EventBus2/
-            ├── GameCoreEventBus2.h
-            └── GameCoreEventBus2.cpp
+        └── EventBus/
+            ├── GameCoreEventBus.h
+            └── GameCoreEventBus.cpp
 ```
 
 Message structs are owned by their originating systems, not by the bus itself.
@@ -64,7 +64,7 @@ PublicDependencyModuleNames.AddRange(new string[]
 FMyCustomMessage Msg;
 Msg.SomeField = 42;
 
-if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
 {
     Bus->Broadcast(
         MyTags::SomeChannel,
@@ -85,7 +85,7 @@ void UMySystem::BeginPlay()
 {
     Super::BeginPlay();
 
-    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
     {
         Handle = Bus->StartListening<FMyCustomMessage>(
             MyTags::SomeChannel,
@@ -99,7 +99,7 @@ void UMySystem::BeginPlay()
 
 void UMySystem::EndPlay(const EEndPlayReason::Type Reason)
 {
-    if (UGameCoreEventBus2* Bus = UGameCoreEventBus2::Get(this))
+    if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
         Bus->StopListening(Handle);
     Super::EndPlay(Reason);
 }
@@ -123,7 +123,7 @@ Handle = Bus->StartListening(
 
 ## Channel Tag Conventions
 
-All GameCore channels follow `GameCoreEvent.<System>.<Event>`. Defined per-module in `DefaultGameplayTags.ini`.
+All GameCore channels follow `GameCoreEvent.<s>.<Event>`. Defined per-module in `DefaultGameplayTags.ini`.
 
 Every channel entry in `GameCore Event Messages.md` must declare its **Scope** and **Origin machine**.
 
@@ -145,7 +145,7 @@ GameCoreEvent
 - **GMS is synchronous.** `BroadcastMessage` calls all listeners inline before returning. Heavy listener logic on a hot-path broadcast (e.g. `XPChanged`) should be deferred by the listener, not by the bus.
 - **`XPChanged` and `PointPoolChanged` can be high-frequency.** Batching must be applied at the call site — accumulate server-side, broadcast once per frame or threshold. The bus does not throttle.
 - **Scope is not a replication primitive.** The bus never sends data across the network. Scope only guards against broadcasting on the wrong machine.
-- **No cross-world channels.** Each `UGameCoreEventBus2` instance is world-scoped. Broadcasts do not cross world boundaries.
+- **No cross-world channels.** Each `UGameCoreEventBus` instance is world-scoped. Broadcasts do not cross world boundaries.
 
 ---
 
@@ -153,6 +153,6 @@ GameCoreEvent
 
 | Sub-Page | Covers |
 |---|---|
-| [UGameCoreEventBus2](Event%20Bus%20System%202/UGameCoreEventBus2.md) | Class definition, all methods, implementation notes |
-| [Scope Guard](Event%20Bus%20System%202/Scope%20Guard.md) | `EGameCoreEventScope` enum, evaluation rules |
-| [GameCore Event Messages](Event%20Bus%20System%202/GameCore%20Event%20Messages.md) | All message structs and channel tag definitions |
+| [UGameCoreEventBus](Event%20Bus%20System/UGameCoreEventBus.md) | Class definition, all methods, implementation notes |
+| [Scope Guard](Event%20Bus%20System/Scope%20Guard.md) | `EGameCoreEventScope` enum, evaluation rules |
+| [GameCore Event Messages](Event%20Bus%20System/GameCore%20Event%20Messages.md) | All message structs and channel tag definitions |

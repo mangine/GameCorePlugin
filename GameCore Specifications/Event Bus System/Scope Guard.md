@@ -1,8 +1,8 @@
 # Scope Guard
 
-**Sub-page of:** [Event Bus System](../Event%20Bus%20System%202.md)
+**Sub-page of:** [Event Bus System](../Event%20Bus%20System.md)
 
-`EGameCoreEventScope` is defined in `GameCoreEventBus2.h` and controls which machine a broadcast is permitted to fire on.
+`EGameCoreEventScope` is defined in `GameCoreEventBus.h` and controls which machine a broadcast is permitted to fire on.
 
 ---
 

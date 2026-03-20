@@ -1,13 +1,13 @@
-# UGameCoreEventBus2
+# UGameCoreEventBus
 
-**Sub-page of:** [Event Bus System](../Event%20Bus%20System%202.md)
+**Sub-page of:** [Event Bus System](../Event%20Bus%20System.md)
 
 ---
 
 ## Class Declaration
 
 ```cpp
-// GameCoreEventBus2.h
+// GameCoreEventBus.h
 #pragma once
 
 #include "CoreMinimal.h"
@@ -15,10 +15,10 @@
 #include "GameplayTagContainer.h"
 #include "GameplayMessageSubsystem.h"
 #include "StructUtils/InstancedStruct.h"
-#include "GameCoreEventBus2.generated.h"
+#include "GameCoreEventBus.generated.h"
 
 /**
- * UGameCoreEventBus2
+ * UGameCoreEventBus
  *
  * FInstancedStruct-based event bus. Single broadcast point for all cross-system
  * events emitted by GameCore modules.
@@ -32,7 +32,7 @@
  *   - StartListening     — raw FInstancedStruct; for callers that need runtime type inspection.
  */
 UCLASS()
-class GAMECORE_API UGameCoreEventBus2 : public UWorldSubsystem
+class GAMECORE_API UGameCoreEventBus : public UWorldSubsystem
 {
     GENERATED_BODY()
 
@@ -51,7 +51,7 @@ public:
 
     /** Returns the bus for the world that owns WorldContext. Never null if the world is valid. */
     UFUNCTION(BlueprintCallable, Category="GameCore|EventBus", meta=(WorldContext="WorldContext"))
-    static UGameCoreEventBus2* Get(const UObject* WorldContext);
+    static UGameCoreEventBus* Get(const UObject* WorldContext);
 
     // -------------------------------------------------------------------------
     // Broadcast — typed overload (internal systems only)
@@ -135,10 +135,10 @@ private:
 ## Template Implementations (must live in the header)
 
 ```cpp
-// GameCoreEventBus2.h — below the class declaration
+// GameCoreEventBus.h — below the class declaration
 
 template<typename T>
-void UGameCoreEventBus2::Broadcast(
+void UGameCoreEventBus::Broadcast(
     FGameplayTag Channel,
     const T& Message,
     EGameCoreEventScope Scope)
@@ -147,7 +147,7 @@ void UGameCoreEventBus2::Broadcast(
 }
 
 template<typename T>
-FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
+FGameplayMessageListenerHandle UGameCoreEventBus::StartListening(
     FGameplayTag Channel,
     UObject* Owner,
     TFunction<void(FGameplayTag, const T&)> Callback)
@@ -166,7 +166,7 @@ FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
             else
             {
                 ensureMsgf(false,
-                    TEXT("UGameCoreEventBus2::StartListening<T> — type mismatch on channel %s. "
+                    TEXT("UGameCoreEventBus::StartListening<T> — type mismatch on channel %s. "
                          "Expected %s, got %s."),
                     *InChannel.ToString(),
                     *T::StaticStruct()->GetName(),
@@ -184,7 +184,7 @@ FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
 ### Initialize / Deinitialize
 
 ```cpp
-void UGameCoreEventBus2::Initialize(FSubsystemCollectionBase& Collection)
+void UGameCoreEventBus::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
     Collection.InitializeDependency<UGameplayMessageSubsystem>();
@@ -192,7 +192,7 @@ void UGameCoreEventBus2::Initialize(FSubsystemCollectionBase& Collection)
     check(GMS);
 }
 
-void UGameCoreEventBus2::Deinitialize()
+void UGameCoreEventBus::Deinitialize()
 {
     GMS = nullptr;
     Super::Deinitialize();
@@ -202,13 +202,13 @@ void UGameCoreEventBus2::Deinitialize()
 ### Get
 
 ```cpp
-UGameCoreEventBus2* UGameCoreEventBus2::Get(const UObject* WorldContext)
+UGameCoreEventBus* UGameCoreEventBus::Get(const UObject* WorldContext)
 {
     if (!WorldContext) return nullptr;
     if (UWorld* World = GEngine->GetWorldFromContextObject(
             WorldContext, EGetWorldErrorMode::ReturnNull))
     {
-        return World->GetSubsystem<UGameCoreEventBus2>();
+        return World->GetSubsystem<UGameCoreEventBus>();
     }
     return nullptr;
 }
@@ -219,7 +219,7 @@ UGameCoreEventBus2* UGameCoreEventBus2::Get(const UObject* WorldContext)
 ### Broadcast (raw overload)
 
 ```cpp
-void UGameCoreEventBus2::Broadcast(
+void UGameCoreEventBus::Broadcast(
     FGameplayTag Channel,
     FInstancedStruct Message,
     EGameCoreEventScope Scope)
@@ -227,10 +227,10 @@ void UGameCoreEventBus2::Broadcast(
     if (!PassesScopeGuard(Scope)) return;
 
     if (!ensureMsgf(Channel.IsValid(),
-        TEXT("UGameCoreEventBus2::Broadcast — invalid channel tag"))) return;
+        TEXT("UGameCoreEventBus::Broadcast — invalid channel tag"))) return;
 
     if (!ensureMsgf(Message.IsValid(),
-        TEXT("UGameCoreEventBus2::Broadcast — empty FInstancedStruct on channel %s"),
+        TEXT("UGameCoreEventBus::Broadcast — empty FInstancedStruct on channel %s"),
         *Channel.ToString())) return;
 
     GMS->BroadcastMessage<FInstancedStruct>(Channel, Message);
@@ -240,7 +240,7 @@ void UGameCoreEventBus2::Broadcast(
 ### StartListening (raw overload)
 
 ```cpp
-FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
+FGameplayMessageListenerHandle UGameCoreEventBus::StartListening(
     FGameplayTag Channel,
     UObject* Owner,
     TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback)
@@ -259,7 +259,7 @@ FGameplayMessageListenerHandle UGameCoreEventBus2::StartListening(
 ### StopListening
 
 ```cpp
-void UGameCoreEventBus2::StopListening(FGameplayMessageListenerHandle& Handle)
+void UGameCoreEventBus::StopListening(FGameplayMessageListenerHandle& Handle)
 {
     if (GMS && Handle.IsValid())
     {
@@ -272,7 +272,7 @@ void UGameCoreEventBus2::StopListening(FGameplayMessageListenerHandle& Handle)
 ### PassesScopeGuard
 
 ```cpp
-bool UGameCoreEventBus2::PassesScopeGuard(EGameCoreEventScope Scope) const
+bool UGameCoreEventBus::PassesScopeGuard(EGameCoreEventScope Scope) const
 {
     const UWorld* World = GetWorld();
     if (!World) return false;

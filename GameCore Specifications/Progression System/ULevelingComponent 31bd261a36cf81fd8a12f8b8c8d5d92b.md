@@ -4,7 +4,7 @@
 
 `ULevelingComponent` is a replicated `UActorComponent` that manages one or more progression tracks on an Actor. Each track is identified by a `FGameplayTag` and has its own level, XP, and definition asset. The component is the single source of truth for progression state.
 
-It fires **intra-system delegates** for consumers within the Progression module (e.g. `UProgressionSubsystem` for audit), and broadcasts to **`UGameCoreEventSubsystem`** for all external integrations. External systems — watcher adapters, quest systems, UI — must listen via GMS and must not bind directly to these delegates.
+It fires **intra-system delegates** for consumers within the Progression module (e.g. `UProgressionSubsystem` for audit), and broadcasts to the **Event Bus** (`UGameCoreEventBus`) for all external integrations. External systems — watcher adapters, quest systems, UI — must listen via GMS and must not bind directly to these delegates.
 
 All mutations are **server-only**. The client receives delta-replicated state via FastArray.
 
@@ -29,7 +29,7 @@ GameCore/Source/GameCore/Progression/
 - `ULevelProgressionDefinition` — data asset defining each progression.
 - `UXPReductionPolicy` — sampled by `ApplyXP` to compute final XP from war XP.
 - `IPersistableComponent` — implemented for binary save/load via the Serialization System.
-- `UGameCoreEventSubsystem` — broadcast target for cross-system events.
+- `UGameCoreEventBus` — broadcast target for cross-system events.
 
 ---
 
@@ -140,11 +140,8 @@ void ULevelingComponent::ApplyXP(FGameplayTag ProgressionTag, int32 WarXP, int32
     // 1. Intra-system delegate (UProgressionSubsystem audit binding).
     OnXPChanged.Broadcast(ProgressionTag, NewXP, FinalXP);
 
-    // 2. GMS — all external consumers listen here.
-    //    Instigator (the player) is not known at this level — it is carried in the
-    //    message by the subsystem before calling ApplyXP, or listeners derive it
-    //    from the Subject's owner chain if needed.
-    if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    // 2. Event Bus — all external consumers listen here.
+    if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
     {
         FProgressionXPChangedMessage Msg;
         Msg.Instigator     = nullptr;           // Populated by UProgressionSubsystem before broadcast.
@@ -152,7 +149,8 @@ void ULevelingComponent::ApplyXP(FGameplayTag ProgressionTag, int32 WarXP, int32
         Msg.ProgressionTag = ProgressionTag;
         Msg.NewXP          = NewXP;
         Msg.Delta          = FinalXP;
-        Bus->Broadcast(GameCoreEventTags::Progression_XPChanged, Msg);
+        Bus->Broadcast(GameCoreEventTags::Progression_XPChanged, Msg,
+            EGameCoreEventScope::ServerOnly);
     }
 }
 ```
@@ -171,8 +169,8 @@ void ULevelingComponent::ProcessLevelUp(FProgressionLevelData& Data, ULevelProgr
     // 1. Intra-system — UProgressionSubsystem binds for audit only.
     OnLevelUp.Broadcast(Data.ProgressionTag, Data.Level);
 
-    // 2. GMS — quest system, achievement system, watcher adapter, UI all listen here.
-    if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    // 2. Event Bus — quest system, achievement system, watcher adapter, UI all listen here.
+    if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
     {
         FProgressionLevelUpMessage Msg;
         Msg.Instigator     = nullptr;           // Populated by UProgressionSubsystem.
@@ -180,7 +178,8 @@ void ULevelingComponent::ProcessLevelUp(FProgressionLevelData& Data, ULevelProgr
         Msg.ProgressionTag = Data.ProgressionTag;
         Msg.OldLevel       = OldLevel;
         Msg.NewLevel       = Data.Level;
-        Bus->Broadcast(GameCoreEventTags::Progression_LevelUp, Msg);
+        Bus->Broadcast(GameCoreEventTags::Progression_LevelUp, Msg,
+            EGameCoreEventScope::ServerOnly);
     }
 }
 ```
@@ -189,56 +188,7 @@ void ULevelingComponent::ProcessLevelUp(FProgressionLevelData& Data, ULevelProgr
 
 ## GMS Message Structs
 
-```cpp
-USTRUCT(BlueprintType)
-struct FProgressionXPChangedMessage
-{
-    GENERATED_BODY()
-
-    // The player who triggered the grant (for UI, watcher evaluation, analytics).
-    // May be nullptr for server-initiated grants with no player instigator.
-    UPROPERTY()
-    TObjectPtr<APlayerState> Instigator;
-
-    // The Actor whose ULevelingComponent was mutated.
-    // May be the player's pawn, an NPC, a ship crew member, etc.
-    UPROPERTY()
-    TObjectPtr<AActor> Subject;
-
-    UPROPERTY()
-    FGameplayTag ProgressionTag;
-
-    UPROPERTY()
-    int32 NewXP = 0;
-
-    UPROPERTY()
-    int32 Delta = 0;
-};
-
-USTRUCT(BlueprintType)
-struct FProgressionLevelUpMessage
-{
-    GENERATED_BODY()
-
-    // The player who triggered the grant.
-    // May be nullptr for server-initiated grants with no player instigator.
-    UPROPERTY()
-    TObjectPtr<APlayerState> Instigator;
-
-    // The Actor that leveled up.
-    UPROPERTY()
-    TObjectPtr<AActor> Subject;
-
-    UPROPERTY()
-    FGameplayTag ProgressionTag;
-
-    UPROPERTY()
-    int32 OldLevel = 0;
-
-    UPROPERTY()
-    int32 NewLevel = 0;
-};
-```
+See [GameCore Event Messages](../Event%20Bus%20System/GameCore%20Event%20Messages.md) for the canonical struct definitions. The structs are owned by the originating system but their canonical documentation lives in the Event Bus sub-pages.
 
 ---
 
@@ -248,9 +198,9 @@ struct FProgressionLevelUpMessage
 | --- | --- | --- |
 | `ProgressionData` | `FFastArraySerializer` | Delta-compressed per-element |
 | `Definitions` | Not replicated | Server-side only |
-| Level-up (external) | `GameCoreEvent.Progression.LevelUp` via GMS | Server broadcasts |
+| Level-up (external) | `GameCoreEvent.Progression.LevelUp` via Event Bus | Server broadcasts |
 | Level-up (internal) | `OnLevelUp` delegate | `UProgressionSubsystem` only |
-| XP change (external) | `GameCoreEvent.Progression.XPChanged` via GMS | Server broadcasts |
+| XP change (external) | `GameCoreEvent.Progression.XPChanged` via Event Bus | Server broadcasts |
 | XP change (internal) | `OnXPChanged` delegate | `UProgressionSubsystem` only |
 
 ---

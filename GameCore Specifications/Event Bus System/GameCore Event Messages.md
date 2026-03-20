@@ -1,8 +1,8 @@
 # GameCore Event Messages
 
-**Sub-page of:** [Event Bus System](../Event%20Bus%20System%202.md)
+**Sub-page of:** [Event Bus System](../Event%20Bus%20System.md)
 
-All message structs broadcast through `UGameCoreEventBus2` are plain `USTRUCT`s — no UObject overhead, stack-allocated, wrapped into `FInstancedStruct` at the broadcast site. Message structs are defined alongside the system that owns them, not in a central file.
+All message structs broadcast through `UGameCoreEventBus` are plain `USTRUCT`s — no UObject overhead, stack-allocated, wrapped into `FInstancedStruct` at the broadcast site. Message structs are defined alongside the system that owns them, not in a central file.
 
 Every channel entry below declares its **Scope** (`EGameCoreEventScope`) and **Origin machine**. These are mandatory fields for all channels.
 
@@ -54,7 +54,12 @@ struct GAMECORE_API FProgressionLevelUpMessage
 {
     GENERATED_BODY()
 
-    UPROPERTY() TObjectPtr<APlayerState> PlayerState = nullptr;
+    // The player who triggered the grant. May be nullptr for server-initiated grants.
+    UPROPERTY() TObjectPtr<APlayerState> Instigator = nullptr;
+
+    // The Actor that leveled up (pawn, NPC, crew member, ship, etc.).
+    UPROPERTY() TObjectPtr<AActor> Subject = nullptr;
+
     UPROPERTY() FGameplayTag ProgressionTag;
     UPROPERTY() int32 OldLevel = 0;
     UPROPERTY() int32 NewLevel = 0;
@@ -80,7 +85,12 @@ struct GAMECORE_API FProgressionXPChangedMessage
 {
     GENERATED_BODY()
 
-    UPROPERTY() TObjectPtr<APlayerState> PlayerState = nullptr;
+    // The player who triggered the grant. May be nullptr for server-initiated grants.
+    UPROPERTY() TObjectPtr<APlayerState> Instigator = nullptr;
+
+    // The Actor whose ULevelingComponent was mutated.
+    UPROPERTY() TObjectPtr<AActor> Subject = nullptr;
+
     UPROPERTY() FGameplayTag ProgressionTag;
     UPROPERTY() int32 NewXP = 0;
     UPROPERTY() int32 Delta = 0;   // Positive = gain, negative = penalty
@@ -106,7 +116,9 @@ struct GAMECORE_API FProgressionPointPoolChangedMessage
 {
     GENERATED_BODY()
 
-    UPROPERTY() TObjectPtr<APlayerState> PlayerState = nullptr;
+    // The Actor that owns the pool (may be a player pawn, NPC, ship, etc.).
+    UPROPERTY() TObjectPtr<AActor> Subject = nullptr;
+
     UPROPERTY() FGameplayTag PoolTag;
     UPROPERTY() int32 NewSpendable = 0;
     UPROPERTY() int32 Delta        = 0;   // Positive = added, negative = consumed
@@ -179,7 +191,7 @@ struct GAMECORE_API FStateMachineTransitionBlockedMessage
 ## Authoring Rules for New Messages
 
 1. One struct per event. No shared payloads across unrelated events.
-2. First field is always the originating context (`PlayerState` or `OwnerActor`) — listeners always need to know *who*.
+2. First field is always the originating context (`Instigator`/`Subject` or `OwnerActor`) — listeners always need to know *who*.
 3. Use `TWeakObjectPtr` for component and actor references — listeners may outlive the broadcaster.
 4. Use `TObjectPtr` for data assets — they are never destroyed while the world is live.
 5. Add the channel tag to `DefaultGameplayTags.ini` and the `GameCoreEventTags` namespace in the same commit as the struct.

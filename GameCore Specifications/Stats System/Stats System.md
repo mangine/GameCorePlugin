@@ -44,15 +44,21 @@ All stat mutation happens server-side only. The client never writes stats.
 ```
 GameCore Plugin
 ├── UStatComponent           (UActorComponent on APlayerState — auto-registers EventBus2 listeners)
-├── UStatDefinition          (UDataAsset — one per tracked stat)
+├── UStatDefinition          (UDataAsset — one per tracked stat; carries AffectedAchievements soft refs)
 ├── UStatIncrementRule       (abstract UObject, EditInlineNew)
 │   └── UConstantIncrementRule   (GameCore built-in — fixed amount, ignores payload)
-└── FStatChangedEvent        (EventBus2 payload — broadcast on every stat change)
+├── FStatChangedEvent        (EventBus2 payload — broadcast on every stat change)
+│
+└── Achievement System/      (sub-system — evaluates achievements driven by stat thresholds)
+    ├── UAchievementDefinition   (UDataAsset — stat thresholds + optional URequirementList)
+    ├── UAchievementComponent    (UActorComponent on APlayerState, IPersistableComponent)
+    └── FAchievementUnlockedEvent (EventBus2 payload — broadcast on grant)
 
 Game Module
 ├── UDamageIncrementRule     (extracts float from FDamageDealtMessage via GetPtr<T>)
 ├── UStatDefinition assets   (content — one DataAsset per stat)
-└── (no wiring subsystem needed for event-driven stats)
+├── UAchievementDefinition assets (content — one DataAsset per achievement)
+└── (no wiring subsystem needed for event-driven stats or threshold achievements)
 ```
 
 ---
@@ -63,6 +69,7 @@ Game Module
 - [UStatIncrementRule](./UStatIncrementRule.md)
 - [UStatComponent](./UStatComponent.md)
 - [FStatChangedEvent & Integration](./Integration.md)
+- [Achievement System](./Achievement%20System/Achievement%20System.md)
 
 ---
 
@@ -92,15 +99,14 @@ No game-module subscription code needed.
 
 On the `UStatDefinition`, set `TrackingRequirements` to a `URequirementSet` asset. The stat will not increment until requirements are met.
 
-### 4. React to a stat change (Achievement System)
+### 4. React to a stat change (external system)
 
 ```cpp
 StatHandle = Bus->StartListening<FStatChangedEvent>(
-    TAG_Event_StatChanged,
-    this,
+    TAG_GameCoreEvent_Stat_Changed, this,
     [this](FGameplayTag, const FStatChangedEvent& Event)
     {
-        EvaluateAchievements(Event.PlayerId, Event.StatTag, Event.NewValue);
+        // e.g. leaderboard update
     });
 ```
 
@@ -110,3 +116,7 @@ StatHandle = Bus->StartListening<FStatChangedEvent>(
 // Server only.
 Stats->AddToStat(TAG_Stat_QuestsCompleted, 1.f);
 ```
+
+### 6. Add an achievement driven by a stat
+
+See the [Achievement System quick-start](./Achievement%20System/Achievement%20System.md#quick-start-guide).

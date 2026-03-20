@@ -320,8 +320,8 @@ void UStateMachineComponent::EnterState(const FGameplayTag& NewStateTag)
     // 1. Delegate — direct Blueprint bindings and intra-actor wiring.
     OnStateChanged.Broadcast(this, PreviousState, NewStateTag);
 
-    // 2. GMS — all decoupled external systems listen here.
-    if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    // 2. Event Bus — all decoupled external systems listen here.
+    if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
     {
         FStateMachineStateChangedMessage Msg;
         Msg.Component         = this;
@@ -329,7 +329,8 @@ void UStateMachineComponent::EnterState(const FGameplayTag& NewStateTag)
         Msg.PreviousState     = PreviousState;
         Msg.NewState          = NewStateTag;
         Msg.StateMachineAsset = StateMachineAsset;
-        Bus->Broadcast(GameCoreEventTags::StateMachine_StateChanged, Msg);
+        Bus->Broadcast(GameCoreEventTags::StateMachine_StateChanged, Msg,
+            EGameCoreEventScope::Both);
     }
 
     // 3. Persistence dirty mark — only on server, only when opted in.
@@ -375,14 +376,15 @@ void UStateMachineComponent::RequestTransition(const FGameplayTag& TargetStateTa
         // Fire blocked events here — never inside IsTransitionPermitted.
         OnTransitionBlocked.Broadcast(this, TargetStateTag);
 
-        if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+        if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
         {
             FStateMachineTransitionBlockedMessage Msg;
             Msg.Component          = this;
             Msg.OwnerActor         = GetOwner();
             Msg.BlockedTargetState = TargetStateTag;
             Msg.CurrentState       = Runtime.CurrentStateTag;
-            Bus->Broadcast(GameCoreEventTags::StateMachine_TransitionBlocked, Msg);
+            Bus->Broadcast(GameCoreEventTags::StateMachine_TransitionBlocked, Msg,
+                EGameCoreEventScope::Both);
         }
         return;
     }

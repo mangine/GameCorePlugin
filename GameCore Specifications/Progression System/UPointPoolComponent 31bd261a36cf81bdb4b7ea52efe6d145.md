@@ -6,7 +6,7 @@
 
 All mutations are **server-only**. The client receives delta-replicated pool state.
 
-Mutations fire an **intra-system delegate** and broadcast to **`UGameCoreEventSubsystem`** for external consumers. External systems must listen via GMS and must not bind directly to `OnPoolChanged`.
+Mutations fire an **intra-system delegate** and broadcast to the **Event Bus** (`UGameCoreEventBus`) for external consumers. External systems must listen via GMS and must not bind directly to `OnPoolChanged`.
 
 ## Plugin Module
 
@@ -22,7 +22,7 @@ GameCore/Source/GameCore/Progression/
 ## Dependencies
 
 - `IPersistableComponent` — binary save/load via the Serialization System.
-- `UGameCoreEventSubsystem` — broadcast target for pool change events.
+- `UGameCoreEventBus` — broadcast target for pool change events.
 
 ---
 
@@ -82,7 +82,7 @@ private:
     FPointPoolData* FindPool(FGameplayTag Tag);
     const FPointPoolData* FindPool(FGameplayTag Tag) const;
 
-    // Called after every mutation. Fires delegate + GMS broadcast.
+    // Called after every mutation. Fires delegate + Event Bus broadcast.
     void NotifyPoolChanged(FGameplayTag PoolTag, int32 NewSpendable, int32 Delta);
 };
 ```
@@ -97,15 +97,16 @@ void UPointPoolComponent::NotifyPoolChanged(FGameplayTag PoolTag, int32 NewSpend
     // 1. Intra-system delegate.
     OnPoolChanged.Broadcast(PoolTag, NewSpendable, Delta);
 
-    // 2. GMS for all external consumers.
-    if (UGameCoreEventSubsystem* Bus = GetWorld()->GetSubsystem<UGameCoreEventSubsystem>())
+    // 2. Event Bus — all external consumers listen here.
+    if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
     {
         FProgressionPointPoolChangedMessage Msg;
-        Msg.PlayerState  = GetOwner<APlayerState>();
+        Msg.Subject      = GetOwner();
         Msg.PoolTag      = PoolTag;
         Msg.NewSpendable = NewSpendable;
         Msg.Delta        = Delta;
-        Bus->Broadcast(GameCoreEventTags::Progression_PointPoolChanged, Msg);
+        Bus->Broadcast(GameCoreEventTags::Progression_PointPoolChanged, Msg,
+            EGameCoreEventScope::ServerOnly);
     }
 }
 ```
@@ -131,7 +132,7 @@ enum class EPointAddResult : uint8
 | Data | Replication | Notes |
 | --- | --- | --- |
 | `PoolData` | `FFastArraySerializer` | Delta-compressed per-pool entry |
-| Pool change (external) | `GameCoreEvent.Progression.PointPoolChanged` via GMS | Server broadcasts |
+| Pool change (external) | `GameCoreEvent.Progression.PointPoolChanged` via Event Bus | Server broadcasts |
 | Pool change (internal) | `OnPoolChanged` delegate | Intra-system only |
 
 ---
