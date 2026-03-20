@@ -4,7 +4,7 @@
 
 `UGameCoreEventWatcher` is a generic `UWorldSubsystem` that bridges the event bus to registered callbacks. Any system can register a delegate against one or more `FGameplayTag` channels. When a matching event arrives on the bus, the registered callback is called immediately with the raw `FInstancedStruct` payload.
 
-This subsystem owns no domain knowledge. It does not know about requirements, quests, or any other system. It is a routing layer — subscribe, receive, call back.
+This subsystem owns no domain knowledge. It does not know about requirements, quests, or any other system. It is a routing layer — subscribe, receive, enforce scope, call back.
 
 **File:** `EventBus/GameCoreEventWatcher.h / .cpp`
 
@@ -12,11 +12,12 @@ This subsystem owns no domain knowledge. It does not know about requirements, qu
 
 # Design Principles
 
-- **Raw callbacks only.** Every registered callback receives `FInstancedStruct` directly. Domain-specific behaviour (requirement evaluation, filtering, context injection) is the caller's responsibility — implemented in a closure at registration time.
-- **No coalescing.** Events are delivered immediately and synchronously as they arrive on the bus. Each registration receives one call per broadcast. If a system needs its own coalescing, it owns that logic.
-- **Lazy bus subscription.** The watcher subscribes to a given tag on `UGameCoreEventBus` the first time any caller registers for it, and unsubscribes when the last registration for that tag is removed. No standing subscription to a parent tag.
-- **Handle-based lifetime.** Every registration returns an `FEventWatchHandle`. The caller stores the handle and calls `Unregister(Handle)` at teardown. The watcher never assumes lifetime.
-- **Closure carries caller context.** The caller captures any private state (quest ID, component pointer, etc.) in the lambda at registration time. The watcher stores `TFunction<void(FGameplayTag, const FInstancedStruct&)>` and knows nothing about the captured data.
+- **Raw callbacks only.** Every registered callback receives `FInstancedStruct` directly. Domain-specific behaviour is the caller's responsibility — implemented in a closure at registration time.
+- **Scope enforcement at delivery.** Registrations declare `EGameCoreEventScope`. The watcher checks net role before invoking the callback. A `ServerOnly` registration never fires on a client, even if the event was broadcast with `Both` scope.
+- **No coalescing.** Events are delivered immediately and synchronously. Each registration receives one call per broadcast. Systems that need coalescing own that logic.
+- **Lazy bus subscription.** The watcher subscribes to a tag on `UGameCoreEventBus` the first time any caller registers for it, and unsubscribes when the last registration for that tag is removed.
+- **Handle-based lifetime.** Every registration returns an `FEventWatchHandle`. The caller stores the handle and calls `Unregister(Handle)` at teardown.
+- **Closure carries caller context.** The caller captures any private state in the lambda. The watcher stores `TFunction<void(FGameplayTag, const FInstancedStruct&)>` and knows nothing about captured data.
 
 ---
 
@@ -50,33 +51,42 @@ public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
 
-    // Static accessor — consistent with UGameCoreEventBus::Get.
     static UGameCoreEventWatcher* Get(const UObject* WorldContext);
 
     // ── Registration ─────────────────────────────────────────────────────
 
     // Register a callback for one or more event tags.
-    // The callback fires immediately (synchronously) when a matching event
-    // arrives on the bus, once per broadcast, with the raw payload.
     //
-    // Owner is used for safety logging only — the watcher does not manage
-    // the owner's lifetime. Use TWeakObjectPtr captures inside the callback
-    // if the owner may be destroyed before Unregister is called.
+    // Scope controls which network side this registration is active on.
+    // The callback is silently skipped if the current net role does not match:
+    //   ServerOnly  — only fires on server (NM_DedicatedServer, NM_ListenServer)
+    //   ClientOnly  — only fires on client (NM_Client) and standalone
+    //   Both        — fires on all sides
     //
-    // Returns an FEventWatchHandle. Store it and pass to Unregister at teardown.
+    // Owner is used for debug logging only. Use TWeakObjectPtr captures in the
+    // callback for lifetime safety — the watcher does not manage owner lifetime.
+    //
+    // Returns FEventWatchHandle. Store it and pass to Unregister at teardown.
     FEventWatchHandle Register(
         const UObject* Owner,
         const FGameplayTagContainer& Tags,
+        EGameCoreEventScope Scope,
         TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback);
 
     // Convenience overload for a single tag.
     FEventWatchHandle Register(
         const UObject* Owner,
         FGameplayTag Tag,
+        EGameCoreEventScope Scope,
         TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback);
 
-    // Removes the registration associated with Handle.
-    // Unsubscribes from the bus if this was the last registration for a given tag.
+    // Scope defaults to Both for callers that do not need enforcement.
+    FEventWatchHandle Register(
+        const UObject* Owner,
+        FGameplayTag Tag,
+        TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback);
+
+    // Removes the registration. Unsubscribes from bus if last for that tag.
     // Safe to call with an invalid handle.
     void Unregister(FEventWatchHandle Handle);
 
@@ -86,26 +96,22 @@ private:
     {
         FEventWatchHandle Handle;
         FGameplayTagContainer Tags;
+        EGameCoreEventScope Scope = EGameCoreEventScope::Both;
         TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback;
 #if !UE_BUILD_SHIPPING
-        FString OwnerDebugName; // logged if callback fires after owner is gone
+        FString OwnerDebugName;
 #endif
     };
 
-    // All registered entries, keyed by handle ID.
     TMap<uint32, FWatchEntry> Entries;
-
-    // Tag → set of handle IDs watching it. Built/updated at Register time.
     TMap<FGameplayTag, TSet<uint32>> TagToHandles;
-
-    // One bus listener handle per actively-subscribed tag.
     TMap<FGameplayTag, FGameplayMessageListenerHandle> BusHandles;
-
     uint32 NextHandleId = 1;
 
     void SubscribeTagIfNeeded(FGameplayTag Tag);
     void UnsubscribeTagIfEmpty(FGameplayTag Tag);
     void OnBusEvent(FGameplayTag Tag, const FInstancedStruct& Payload);
+    bool PassesScopeCheck(EGameCoreEventScope Scope) const;
 };
 ```
 
@@ -119,6 +125,7 @@ private:
 FEventWatchHandle UGameCoreEventWatcher::Register(
     const UObject* Owner,
     const FGameplayTagContainer& Tags,
+    EGameCoreEventScope Scope,
     TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback)
 {
     if (!Callback || Tags.IsEmpty()) return FEventWatchHandle{};
@@ -128,6 +135,7 @@ FEventWatchHandle UGameCoreEventWatcher::Register(
     FWatchEntry Entry;
     Entry.Handle   = Handle;
     Entry.Tags     = Tags;
+    Entry.Scope    = Scope;
     Entry.Callback = MoveTemp(Callback);
 #if !UE_BUILD_SHIPPING
     Entry.OwnerDebugName = Owner ? Owner->GetName() : TEXT("(null)");
@@ -144,14 +152,21 @@ FEventWatchHandle UGameCoreEventWatcher::Register(
     return Handle;
 }
 
+// Single-tag overloads:
 FEventWatchHandle UGameCoreEventWatcher::Register(
-    const UObject* Owner,
-    FGameplayTag Tag,
+    const UObject* Owner, FGameplayTag Tag, EGameCoreEventScope Scope,
     TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback)
 {
     FGameplayTagContainer Tags;
     Tags.AddTag(Tag);
-    return Register(Owner, Tags, MoveTemp(Callback));
+    return Register(Owner, Tags, Scope, MoveTemp(Callback));
+}
+
+FEventWatchHandle UGameCoreEventWatcher::Register(
+    const UObject* Owner, FGameplayTag Tag,
+    TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback)
+{
+    return Register(Owner, Tag, EGameCoreEventScope::Both, MoveTemp(Callback));
 }
 ```
 
@@ -182,6 +197,46 @@ void UGameCoreEventWatcher::Unregister(FEventWatchHandle Handle)
 }
 ```
 
+## Scope enforcement in `OnBusEvent`
+
+```cpp
+void UGameCoreEventWatcher::OnBusEvent(
+    FGameplayTag Tag, const FInstancedStruct& Payload)
+{
+    const TSet<uint32>* HandleIds = TagToHandles.Find(Tag);
+    if (!HandleIds) return;
+
+    // Copy IDs — callbacks may call Register/Unregister mid-dispatch.
+    TArray<uint32> IdsCopy = HandleIds->Array();
+
+    for (uint32 Id : IdsCopy)
+    {
+        FWatchEntry* Entry = Entries.Find(Id);
+        if (!Entry || !Entry->Callback) continue;
+
+        // Enforce scope: skip callback if net role does not match.
+        if (!PassesScopeCheck(Entry->Scope)) continue;
+
+        Entry->Callback(Tag, Payload);
+    }
+}
+
+bool UGameCoreEventWatcher::PassesScopeCheck(EGameCoreEventScope Scope) const
+{
+    const UWorld* World = GetWorld();
+    if (!World) return false;
+
+    switch (Scope)
+    {
+    case EGameCoreEventScope::ServerOnly: return World->GetNetMode() != NM_Client;
+    case EGameCoreEventScope::ClientOnly: return World->GetNetMode() == NM_Client
+                                              || World->GetNetMode() == NM_Standalone;
+    case EGameCoreEventScope::Both:       return true;
+    }
+    return false;
+}
+```
+
 ## Lazy bus subscription
 
 ```cpp
@@ -206,47 +261,22 @@ void UGameCoreEventWatcher::UnsubscribeTagIfEmpty(FGameplayTag Tag)
 {
     if (FGameplayMessageListenerHandle* BusHandle = BusHandles.Find(Tag))
     {
-        UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this);
-        if (Bus) Bus->StopListening(*BusHandle);
+        if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
+            Bus->StopListening(*BusHandle);
         BusHandles.Remove(Tag);
     }
 }
 ```
-
-## Event dispatch
-
-```cpp
-void UGameCoreEventWatcher::OnBusEvent(
-    FGameplayTag Tag, const FInstancedStruct& Payload)
-{
-    const TSet<uint32>* HandleIds = TagToHandles.Find(Tag);
-    if (!HandleIds) return;
-
-    // Copy handle IDs — callbacks may call Unregister, modifying TagToHandles.
-    TArray<uint32> IdsCopy = HandleIds->Array();
-
-    for (uint32 Id : IdsCopy)
-    {
-        FWatchEntry* Entry = Entries.Find(Id);
-        if (Entry && Entry->Callback)
-            Entry->Callback(Tag, Payload);
-    }
-}
-```
-
-**Re-entrancy note.** `OnBusEvent` copies handle IDs before iterating so that a callback which calls `Unregister` or `Register` mid-dispatch does not corrupt the active iterator. New registrations during dispatch take effect on the next event; unregistrations during dispatch are safe.
 
 ## `Deinitialize`
 
 ```cpp
 void UGameCoreEventWatcher::Deinitialize()
 {
-    UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this);
-    if (Bus)
-    {
+    if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
         for (auto& Pair : BusHandles)
             Bus->StopListening(Pair.Value);
-    }
+
     BusHandles.Empty();
     TagToHandles.Empty();
     Entries.Empty();
@@ -258,49 +288,57 @@ void UGameCoreEventWatcher::Deinitialize()
 
 # Usage
 
-## Basic registration
+## With scope (typical)
 
 ```cpp
-// At setup — capture caller context in the closure.
-FGameplayTag LevelTag =
-    FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged");
-
-TWeakObjectPtr<UMySystem> WeakThis = this;
-FMyPrivateData CapturedData = MyData;
-
-WatchHandle = Watcher->Register(this, LevelTag,
-    [WeakThis, CapturedData](FGameplayTag Tag, const FInstancedStruct& Payload)
+WatchHandle = UGameCoreEventWatcher::Get(this)->Register(
+    this,
+    FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged"),
+    EGameCoreEventScope::ServerOnly,
+    [WeakThis](FGameplayTag Tag, const FInstancedStruct& Payload)
     {
         if (UMySystem* Self = WeakThis.Get())
-            Self->OnLevelEvent(CapturedData, Payload);
+            Self->OnLevelEvent(Payload);
     });
-
-// At teardown.
-Watcher->Unregister(WatchHandle);
 ```
 
-## Multiple tags in one registration
+## Without scope (fires on all sides)
+
+```cpp
+WatchHandle = UGameCoreEventWatcher::Get(this)->Register(
+    this,
+    FGameplayTag::RequestGameplayTag("GameCoreEvent.UI.ScreenOpened"),
+    [WeakThis](FGameplayTag, const FInstancedStruct& Payload)
+    {
+        if (UMySystem* Self = WeakThis.Get())
+            Self->OnScreenOpened(Payload);
+    });
+```
+
+## Multiple tags, one handle
 
 ```cpp
 FGameplayTagContainer Tags;
 Tags.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Inventory.ItemAdded"));
 Tags.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Inventory.ItemRemoved"));
 
-WatchHandle = Watcher->Register(this, Tags,
+WatchHandle = UGameCoreEventWatcher::Get(this)->Register(
+    this, Tags, EGameCoreEventScope::ServerOnly,
     [WeakThis](FGameplayTag Tag, const FInstancedStruct& Payload)
     {
         if (UMySystem* Self = WeakThis.Get())
             Self->OnInventoryEvent(Tag, Payload);
     });
-```
 
-One handle covers all tags. `Unregister(Handle)` removes the callback from all of them.
+// One Unregister removes all tag subscriptions.
+UGameCoreEventWatcher::Get(this)->Unregister(WatchHandle);
+```
 
 ---
 
 # Known Limitations
 
-- **No parent tag subscription.** Inherits the GMS exact-match constraint. Register leaf tags explicitly.
-- **No built-in coalescing.** Each broadcast triggers immediate dispatch. Systems that need coalescing own that logic themselves.
-- **Callback fires synchronously.** GMS is synchronous. Heavy work in a callback blocks the broadcast. Defer expensive logic via a timer or game thread task.
-- **Re-entrancy copies IDs.** Safe but means a `Register` call inside a callback does not receive the current event — it takes effect from the next broadcast.
+- **No parent tag subscription.** Exact tag matching only. Register leaf tags explicitly.
+- **No built-in coalescing.** Immediate dispatch per broadcast. Systems that need batching own that logic.
+- **Callbacks fire synchronously.** Heavy work in a callback blocks the broadcast caller. Defer via timer or game thread task.
+- **Re-entrancy copies IDs.** Safe, but a `Register` inside a callback takes effect from the next broadcast only.
