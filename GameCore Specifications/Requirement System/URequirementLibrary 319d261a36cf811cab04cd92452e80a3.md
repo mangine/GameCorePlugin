@@ -2,39 +2,9 @@
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-`URequirementLibrary` is an **internal helper** for `URequirementSet` subclasses. It handles synchronous and asynchronous evaluation, short-circuit logic, and composite tree traversal.
-
-> **Consuming systems must not call this library directly.** Always call `Set->Evaluate(Context)` or `Set->EvaluateAsync(Context, OnComplete)` on the `URequirementSet` asset. `URequirementLibrary` is not a public API — it is an implementation detail of `URequirementList` and other set types. The only exception is `ValidateRequirements`, which remains a development/editor utility callable by any system at setup time.
-> 
+`URequirementLibrary` is an internal helper for `URequirementList`. It handles evaluation loop logic, operator short-circuiting, and development-time validation. Consuming systems never call this library directly — always call `List->Evaluate(Context)`.
 
 **File:** `Requirements/RequirementLibrary.h / .cpp`
-
----
-
-# Supporting Types
-
-```cpp
-// Delegate fired when all async requirements in an EvaluateAllAsync call have resolved.
-// The combined FRequirementResult reflects the pass/fail of the entire set.
-DECLARE_DELEGATE_OneParam(FOnRequirementsEvaluated, FRequirementResult);
-
-// Controls how EvaluateAllAsync handles a failed async result while other ops are pending.
-UENUM(BlueprintType)
-enum class EEvaluateAsyncMode : uint8
-{
-    // Wait for ALL operations to complete before firing the delegate.
-    // The combined result is failed if any single requirement failed.
-    // Preferred when consuming systems need to know the complete failure set
-    // before deciding how to proceed.
-    WaitAll  UMETA(DisplayName = "Wait All"),
-
-    // Fire the delegate immediately on the first failure.
-    // Outstanding async operations are cancelled (their OnComplete is still called
-    // internally to avoid dangling callbacks, but their results are discarded).
-    // Use when the first failure is enough to reject the action — no need to wait.
-    FailFast UMETA(DisplayName = "Fail Fast"),
-};
-```
 
 ---
 
@@ -45,138 +15,145 @@ UCLASS()
 class GAMECORE_API URequirementLibrary : public UBlueprintFunctionLibrary
 {
     GENERATED_BODY()
-
 public:
-    // ── Synchronous API ───────────────────────────────────────────────────────
 
-    // Evaluates every requirement in the array synchronously.
-    // Short-circuits on the first failure — requirements after the first failure
-    // are not evaluated. Array order is evaluation order.
-    //
-    // Returns a combined FRequirementResult:
-    //   bPassed = true only if ALL requirements pass.
-    //   FailureReason = the first failing requirement's FailureReason.
-    //
-    // Safe to call on an empty array — returns Pass immediately.
-    // Must not be called on an array that contains async requirements — async
-    // requirements call Evaluate() which returns Fail by default, masking the
-    // real result. Use EvaluateAllAsync instead.
-    UFUNCTION(BlueprintCallable, Category = "Requirements")
+    // ── Evaluation ────────────────────────────────────────────────────────────
+
+    // Evaluates all requirements using Evaluate(). Respects Operator short-circuit.
+    // Returns combined FRequirementResult.
+    // AND: first failure wins. OR: first pass wins.
+    // Safe on empty arrays — returns Pass immediately.
     static FRequirementResult EvaluateAll(
-        const TArray<URequirement*>& Requirements,
+        const TArray<TObjectPtr<URequirement>>& Requirements,
+        ERequirementListOperator Operator,
         const FRequirementContext& Context);
 
-    // Convenience wrapper around EvaluateAll. Returns bool only — FailureReason is
-    // discarded. Use when the calling system does not need to surface a failure reason.
-    UFUNCTION(BlueprintCallable, Category = "Requirements")
-    static bool MeetsAll(
-        const TArray<URequirement*>& Requirements,
+    // Evaluates all requirements using EvaluateFromEvent(). Same short-circuit rules.
+    // Called by URequirementList::NotifyEvent.
+    static FRequirementResult EvaluateAllFromEvent(
+        const TArray<TObjectPtr<URequirement>>& Requirements,
+        ERequirementListOperator Operator,
         const FRequirementContext& Context);
 
-    // ── Asynchronous API ──────────────────────────────────────────────────────
+    // ── Validation (dev builds only) ─────────────────────────────────────────
 
-    // Evaluates a mixed sync+async requirement array.
-    // Sync requirements are evaluated immediately. Async requirements are dispatched
-    // in parallel where possible. OnComplete fires on the game thread once all
-    // operations have resolved.
+    // Validates a requirement array at setup time (BeginPlay or Register).
+    // Returns false and logs errors if any violations are found.
     //
-    // Safe to call on a fully-sync array — OnComplete fires on the next frame.
-    // Safe to call on an empty array — OnComplete fires on the next frame with Pass.
-    // Must not be called from inside Evaluate or EvaluateAsync.
+    // Checks:
+    //   - No null entries.
+    //   - NOT composites have exactly one child.
+    //   - No null children at any composite nesting depth.
+    //   - If ListAuthority is ClientOnly or ClientValidated: no requirement
+    //     returns ServerOnly data (would silently fail on client).
     //
-    // OWNERSHIP: The caller owns the FRequirementContext and must ensure it remains
-    // valid until OnComplete fires. Use a TSharedPtr or ensure the context outlives
-    // the async operation if there is any risk of it being destroyed first.
-    static void EvaluateAllAsync(
-        const TArray<URequirement*>& Requirements,
-        const FRequirementContext& Context,
-        FOnRequirementsEvaluated OnComplete,
-        EEvaluateAsyncMode Mode = EEvaluateAsyncMode::WaitAll);
-
-    // ── Validation (Development Builds) ───────────────────────────────────────
-
-    // Validates a requirement array at setup time (typically BeginPlay).
-    // Logs errors for each violation found and returns false if any are detected.
-    //
-    // Checks performed:
-    //   - No null entries in the array.
-    //   - For any URequirement_Composite child: NOT composites have exactly one child,
-    //     no null children at any nesting level.
-    //   - If bRequireSync == true: no async requirements anywhere in the array or
-    //     any nested composite tree. Use bRequireSync = true for interaction entries
-    //     and any system that cannot tolerate async evaluation on its hot path.
-    //   - If ListAuthority is ClientOnly or ClientValidated: no requirement in the
-    //     array (including nested composite children) may return ServerOnly from
-    //     GetDataAuthority(). A ServerOnly requirement in a client-evaluated list
-    //     cannot be evaluated on the client and would silently optimistic-pass,
-    //     producing a misleading result. This is always a design error.
-    //
-    // Only compiled in development builds (WITH_EDITOR || !UE_BUILD_SHIPPING).
-    // In shipping builds this function is a no-op returning true.
+    // No-op and returns true in shipping builds.
     static bool ValidateRequirements(
-        const TArray<URequirement*>& Requirements,
-        bool bRequireSync = false,
+        const TArray<TObjectPtr<URequirement>>& Requirements,
         ERequirementEvalAuthority ListAuthority = ERequirementEvalAuthority::ServerOnly);
 };
 ```
 
 ---
 
-# Evaluation Order and Short-Circuit Behaviour
-
-`EvaluateAll` processes the array left-to-right and stops at the first failure. This has two implications:
-
-**Performance.** Cheap, fast checks should come first in the array. Expensive checks (component lookups, container iterations) should come last. Async checks must come last and should be avoided on hot-path evaluation sites.
-
-**FailureReason shown to the player.** The first failing requirement's reason is what surfaces in UI. If the most player-relevant failure is not the cheapest check, you may want to reorder deliberately — or accept that a technical gate (tag check) precedes a friendlier reason (level requirement).
-
-**OR and NOT logic.** The flat array is always AND — every element must pass. When a specific entry needs OR or NOT logic, add a `URequirement_Composite` as one element of the array with the appropriate operator. The composite handles its children internally; `EvaluateAll` treats it as a single opaque requirement.
+# `EvaluateAll` — Implementation
 
 ```cpp
-// Example: flat AND array where one slot needs OR logic.
-// Array:
-//   [0] URequirement_MinLevel      (MinLevel = 10)        ← cheap, first
-//   [1] URequirement_Composite     (OR)                   ← complex, last
-//         ├── URequirement_QuestCompleted (TreasureHunt)
-//         └── URequirement_HasTag        (Perk.TreasureHunter)
-```
-
----
-
-# Using EvaluateAllAsync
-
-```cpp
-// Construct context server-side from the RPC connection.
-FRequirementContext Ctx;
-Ctx.PlayerState = GetPlayerState();
-Ctx.World       = GetWorld();
-Ctx.Instigator  = GetPawn();
-
-// FailFast: reject as soon as any requirement fails.
-URequirementLibrary::EvaluateAllAsync(
-    Definition->EntryRequirements,
-    Ctx,
-    FOnRequirementsEvaluated::CreateUObject(this, &UMySystem::OnRequirementsResolved),
-    EEvaluateAsyncMode::FailFast);
-
-// The system must not proceed until OnRequirementsResolved fires.
-void UMySystem::OnRequirementsResolved(FRequirementResult Result)
+FRequirementResult URequirementLibrary::EvaluateAll(
+    const TArray<TObjectPtr<URequirement>>& Requirements,
+    ERequirementListOperator Operator,
+    const FRequirementContext& Context)
 {
-    if (!Result.bPassed)
+    if (Requirements.IsEmpty())
+        return FRequirementResult::Pass();
+
+    if (Operator == ERequirementListOperator::AND)
     {
-        // Send Result.FailureReason to client via targeted RPC.
-        return;
+        for (const TObjectPtr<URequirement>& Req : Requirements)
+        {
+            if (!Req) continue;
+            FRequirementResult R = Req->Evaluate(Context);
+            if (!R.bPassed) return R; // short-circuit
+        }
+        return FRequirementResult::Pass();
     }
-    // Proceed with the gated action.
+    else // OR
+    {
+        FRequirementResult LastFailure = FRequirementResult::Fail();
+        for (const TObjectPtr<URequirement>& Req : Requirements)
+        {
+            if (!Req) continue;
+            FRequirementResult R = Req->Evaluate(Context);
+            if (R.bPassed) return R; // short-circuit
+            LastFailure = R;
+        }
+        return LastFailure;
+    }
+}
+
+// EvaluateAllFromEvent mirrors EvaluateAll but calls EvaluateFromEvent.
+FRequirementResult URequirementLibrary::EvaluateAllFromEvent(
+    const TArray<TObjectPtr<URequirement>>& Requirements,
+    ERequirementListOperator Operator,
+    const FRequirementContext& Context)
+{
+    if (Requirements.IsEmpty())
+        return FRequirementResult::Pass();
+
+    if (Operator == ERequirementListOperator::AND)
+    {
+        for (const TObjectPtr<URequirement>& Req : Requirements)
+        {
+            if (!Req) continue;
+            FRequirementResult R = Req->EvaluateFromEvent(Context);
+            if (!R.bPassed) return R;
+        }
+        return FRequirementResult::Pass();
+    }
+    else
+    {
+        FRequirementResult LastFailure = FRequirementResult::Fail();
+        for (const TObjectPtr<URequirement>& Req : Requirements)
+        {
+            if (!Req) continue;
+            FRequirementResult R = Req->EvaluateFromEvent(Context);
+            if (R.bPassed) return R;
+            LastFailure = R;
+        }
+        return LastFailure;
+    }
 }
 ```
 
 ---
 
-# Known Limitations
+# Evaluation Order and Short-Circuit
 
-**`EvaluateAllAsync` has no cancellation token.** If the consuming system is destroyed before `OnComplete` fires, the delegate fires on a stale object. Use `MakeGuardedCallback` in your `EvaluateAsync` implementation, or bind via `CreateUObject` at the `EvaluateAllAsync` call site which automatically becomes a no-op if the object is GC'd.
+- Array order is evaluation order. **Place cheap checks first.**
+- The first failure reason (AND) or last failure reason (OR) surfaces to the consuming system.
+- If the most player-relevant failure is not the cheapest check, reorder deliberately.
 
-**`EvaluateAllAsync` has no global timeout.** Each async requirement is responsible for its own timeout via `MakeGuardedCallback`. If an async requirement does not use `MakeGuardedCallback` and stalls indefinitely, `OnComplete` never fires.
+---
 
-**`EvaluateAll` silently degrades on async requirements.** Calling `EvaluateAll` on an array containing async requirements calls their `Evaluate()` override, which returns `Fail` by default. This looks like a failed requirement but is actually a missing async evaluation. `ValidateRequirements` with `bRequireSync = true` catches this at setup time in development builds.
+# `ValidateRequirements` — Checks Performed
+
+| Check | Severity | When caught |
+|---|---|---|
+| Null entry in Requirements array | Error | Always |
+| NOT composite with zero or >1 children | Error | Always |
+| Null child inside any composite | Error | Always |
+| Requirements needing server data in a ClientOnly/ClientValidated list | Warning | Dev builds only |
+
+Call at `BeginPlay` or `Register()` time. In shipping builds this is a no-op returning `true`.
+
+```cpp
+// Example usage in a consuming system:
+void UMySystem::BeginPlay()
+{
+    Super::BeginPlay();
+    // Validate in dev builds to catch authoring errors early.
+    URequirementLibrary::ValidateRequirements(
+        MyRequirementList->Requirements,
+        MyRequirementList->Authority);
+}
+```

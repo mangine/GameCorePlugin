@@ -2,107 +2,103 @@
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-This document records the requirements, feature evolution, and key architectural decisions made for the Requirement System. It exists so future contributors understand not just *what* the system does but *why* specific choices were made and what alternatives were considered.
+Full history of requirements, design evolution, and the rationale behind every significant decision. Read this before proposing changes to the system.
 
 ---
 
-# System Requirements
+# System Requirements (Non-Negotiable)
 
-The following were the non-negotiable requirements that drove the initial design:
-
-1. **Reusable across all systems.** The same mechanism must serve quests, interactions, abilities, dialogue, crafting, and any future system without modification.
-2. **Designer-owned.** Prerequisites must be configurable in the Unreal Details panel without C++ changes per feature.
-3. **Server-authoritative.** Any gameplay-gating check must be evaluated server-side. Client evaluation is permitted only for display.
-4. **Stateless definitions.** A requirement definition shared across 1,000 concurrent players must carry no per-player state.
-5. **Decoupled at the base layer.** The `Requirements/` module must compile with zero dependencies on other GameCore modules.
-6. **Boolean completeness.** Any logical combination of conditions (AND, OR, NOT, nested) must be expressible without writing custom C++.
-7. **Reactive, not polling.** For systems that watch requirement availability over time, the cost must be O(sets watching event) per state change — never O(all requirements × all players).
+1. Usable on Data Assets and non-actor contexts — no owning actor or component required.
+2. `URequirement` instances carry zero per-player or per-evaluation state.
+3. No persistence, no cache in the requirement system itself.
+4. `Requirements/` module compiles with zero outgoing module dependencies.
+5. Any AND/OR/NOT combination expressible without custom C++ evaluation logic.
+6. Two evaluation paths: imperative (caller builds context) and reactive (event bus feeds context).
+7. Server-authoritative for gameplay gates.
 
 ---
 
 # Evolution History
 
-## Phase 1 — Gate Check
+## v1 — Gate Check (initial)
 
-The system began as a simple gate: `URequirement::Evaluate(Context) → bool`. A consuming system held an array of `URequirement*` and called `EvaluateAll`. Results were not stored — every call re-evaluated from scratch. This was sufficient for one-shot interaction gates ("can the player interact with this chest?").
+Started as `URequirement::Evaluate(Context) → bool`. Flat array of requirements evaluated with `EvaluateAll`. No failure reason, no OR/NOT logic, no async, no reactive evaluation.
 
-**Limitations identified:**
-- No way to express OR or NOT logic in the array without writing bespoke C++.
-- No way to reactively watch a gate — every system polled on a timer or re-checked on every relevant event.
-- `bool` return meant no player-facing failure reason.
+## v1.1 — FRequirementResult, Sets, Composite
 
-## Phase 2 — Requirement Sets + `FRequirementResult`
+`FRequirementResult` added for failure reasons. `URequirementList` introduced as a `UPrimaryDataAsset` with AND/OR operator. `URequirement_Composite` added for NOT and nested logic. `ERequirementEvalAuthority` placed on the asset.
 
-`URequirementList` was introduced as a `UPrimaryDataAsset` grouping requirements with an AND/OR operator and an authority declaration. `URequirement_Composite` was added to express NOT and nested boolean trees. `FRequirementResult` replaced `bool` to carry a `FailureReason`.
+`URequirementSet` abstract base briefly specced as a shared base for future list types. Removed before implementation — YAGNI. `URequirementList` inherits `UPrimaryDataAsset` directly.
 
-`URequirementSet` (an abstract base) was briefly specced as a base for multiple set types. It was removed before implementation — a second set type never materialised, and adding an abstract base for one concrete class was premature abstraction. `URequirementList` directly inherits `UPrimaryDataAsset`.
+## v1.2 — Watcher System
 
-**Decision: authority lives on the asset, not at the call site.**
-Authority (`ServerOnly`, `ClientOnly`, `ClientValidated`) is a property of the `URequirementList` asset set by the designer. Consuming systems never pass or override authority. If two systems need different authority for logically identical conditions, they reference two separate assets. This was chosen over a call-site parameter to prevent authority bypass bugs — a programmer cannot accidentally evaluate a `ServerOnly` list on the client by forgetting to pass the right enum.
+`URequirementWatcherComponent` on `APlayerState` and `URequirementWatcherManager` (WorldSubsystem). Requirements declared invalidation tags via `GetWatchedEvents`. Manager routed events to components; components maintained per-player set registrations and a coalescing flush timer. `FRequirementSetRuntime` held per-player cache per list.
 
-## Phase 3 — Watcher System
+## v1.3 — Persisted Data / Payload
 
-The quest system required reactive tracking: "notify me when the player first becomes eligible for this quest." Polling was ruled out immediately given expected player counts (1,000+) and quest counts (500+).
+Attempt to handle tracker data (kill counts, delivery counts) inside the requirement system. `FRequirementPayload` (keyed counters/floats) injected into `FRequirementContext::PersistedData`. `URequirement_Persisted` sealed `Evaluate` and routed to `EvaluateWithPayload`. `TObjectPtr<UQuestComponent>` briefly added to `FRequirementContext` as a fast-path cache — removed immediately as it violated the zero-dependency rule.
 
-The watcher system inverts control: requirements declare which `RequirementEvent.*` GameplayTags invalidate them. When a tag fires, only sets watching that tag are dirtied. A coalescing timer batches rapid state changes into one evaluation per set.
+## v2 — Current (Refactor)
 
-**Decision: tags over delegates for invalidation events.**
-Each requirement declares its invalidation events as `FGameplayTag` values, not as bound delegates. Tags decouple modules — `URequirement_MinLevel` does not import the Leveling module. The leveling system fires `RequirementEvent.Leveling.LevelChanged` and the watcher routes it, with no shared type between them.
-
-**Decision: coalescing timer, not immediate re-evaluation.**
-When 20 item pickups happen in one frame, each fires `RequirementEvent.Inventory.ItemAdded`. Without coalescing, each event triggers a full requirement evaluation for every watching set. The timer deduplicates these into one flush per set, bounded by `FlushDelaySeconds`. Worst-case latency is the flush delay — intentional and tunable per system.
-
-## Phase 4 — Persisted Data / Payload Injection
-
-The quest tracker system needed requirements to evaluate against runtime counter data (kill counts, delivery counts) that is not derivable from world state. The counter values are owned by `UQuestComponent` and change frequently.
-
-**Problem:** `URequirement` is stateless. It cannot cache anything. But the data it needs lives in a system (`UQuestComponent`) it must not import.
-
-**Rejected approach: component pointer in context.**
-Adding `TObjectPtr<UQuestComponent> QuestComponent` to `FRequirementContext` was implemented briefly but removed. It created a compile-time dependency from `Requirements/` → Quest module, violating the zero-dependency rule. It also established a precedent — the next system (Reputation, Inventory) would add its own pointer, turning `FRequirementContext` into a grab-bag.
-
-**Chosen approach: payload injection via `PersistedData`.**
-`FRequirementContext::PersistedData` is a `TMap<FGameplayTag, FRequirementPayload>`. The owning system constructs an `FRequirementPayload` with the relevant counters and floats, inserts it under a domain tag (e.g. the QuestId), and passes the context to `Evaluate`. The requirement looks up its domain tag, retrieves the payload, and reads the counter. Zero coupling in either direction.
-
-See [Supporting Types — Why PersistedData is a TMap](Supporting%20Types.md#why-persisteddata-is-tmapfgameplaytag-frequirementpayload-and-not-just-frequirementpayload) for the full explanation.
-
-`URequirement_Persisted` was added as an abstract base to seal the payload lookup pattern — subclasses implement `EvaluateWithPayload(Context, Payload)` and cannot accidentally bypass the domain tag lookup.
+Full redesign. All persistence and caching removed from the requirement system. `FRequirementContext` simplified to carry a single `FInstancedStruct Data`. Two evaluate paths (`Evaluate` / `EvaluateFromEvent`). `URequirementList` owns its reactive registration and `OnResultChanged` delegate directly. `URequirementWatcherManager` refactored to be a pure event bus bridge with no per-player state. All v1.x types that no longer exist are listed below.
 
 ---
 
-# Key Architectural Decisions
+# Key Decisions
 
-## `URequirement` is a `UObject`, not a struct or interface
+## Requirements are not trackers
 
-Making requirements `UObject` subclasses enables the Unreal Details panel class picker with `EditInlineNew`, which is the primary authoring mechanism. An interface approach would require concrete implementations elsewhere, losing the inline authoring. A struct approach would lose polymorphism entirely. The `UObject` overhead is acceptable — requirement assets are loaded once and shared.
+"Kill 10 wolves" is a goal with accumulating state. That belongs in a goal/objective system that owns counters, persistence, and progress. Requirements only answer true/false questions about current state. Conflating the two (v1.3 attempt) produced `FRequirementPayload`, `URequirement_Persisted`, and payload injection complexity that violated the statelessness contract and created coupling between `Requirements/` and the quest module.
 
-## Async evaluation is opt-in, not the default
+## No persistence, no cache in the requirement system
 
-Most requirements read replicated in-memory data — level, inventory, tags. Forcing async evaluation for these would add unnecessary complexity (callbacks, error handling, timeouts) to the common case. `IsAsync()` is opt-in. The library (`EvaluateAllAsync`) handles the mixed sync+async case transparently.
+Both require an owner. Requirements are used on Data Assets and non-actor contexts that have no persistent storage. Requirement evaluation (a component lookup and integer comparison) is cheap. Systems that need to avoid repeated evaluation cache the `FRequirementResult` themselves with one local bool. This is the right layer for that decision.
 
-## `MakeGuardedCallback` is a protected helper, not a public API
+## `FInstancedStruct` as the universal context carrier
 
-Async requirement implementors have three systematic failure modes: no timeout, firing the callback twice, and capturing `this` raw. `MakeGuardedCallback` eliminates all three in one call. It is protected on `URequirement` so it is available to all implementors without being callable from outside.
+The old `FRequirementContext` had typed fields (`PlayerState`, `World`, `Instigator`, `PersistedData`). Every new requirement type that needed different data created pressure to add more fields, violating the zero-dependency rule (the `QuestComponent` field incident). `FInstancedStruct` carries any struct type without `Requirements/` importing it. The requirement subclass declares what it expects and casts. This is also the event bus mechanism, so event payloads pass through without translation.
 
-## `URequirementLibrary` is internal, not a public API
+## `FRequirementContext` as the named wrapper
 
-Consuming systems call `List->Evaluate(Context)`. They do not call `URequirementLibrary::EvaluateAll` directly. This ensures that the OR/AND operator on the list is always respected and authority validation always runs. `URequirementLibrary` is an implementation detail of `URequirementList` — if the evaluation internals change, consuming systems are unaffected.
+`FInstancedStruct` alone is opaque at call sites. `FRequirementContext` is a named struct that makes intent clear — it is the evaluation input — while containing only `FInstancedStruct Data`. Adding typed fields directly to `FRequirementContext` is prohibited. All domain data lives inside `Data`.
 
-## `bIsMonotonic` is a property, not a class hierarchy
+## Two evaluate paths, not one
 
-A monotonic requirement (one that can only ever go from Fail to Pass) could have been modelled as a separate subclass. Instead it is a `bool UPROPERTY` on `URequirement`. This keeps the class hierarchy flat — authors set it in the Details panel on any requirement instance without creating a new subclass.
+`Evaluate(FRequirementContext)` for imperative snapshot checks. `EvaluateFromEvent(FRequirementContext)` for reactive event-driven checks. The default implementation of `EvaluateFromEvent` delegates to `Evaluate`, so requirements that behave identically in both cases implement only `Evaluate`. Requirements that need event-specific behaviour (checking delta values, validating event source) override `EvaluateFromEvent` separately.
 
-## `EvaluateSetInternal` should evaluate through `List->Evaluate`, not the flat array
+## `URequirementList` owns its reactive registration
 
-The watcher's `EvaluateSetInternal` iterates the flat requirement array directly, bypassing the `URequirementList` operator (AND vs OR). This is a known spec gap — the correct implementation calls `Runtime.Asset->Evaluate(Ctx)` and reconciles the per-requirement monotonic cache separately. The flat iteration was an early shortcut that was never fixed. **This must be corrected before production.** The per-requirement cache optimisation (skipping monotonic CachedTrue entries) should be implemented by `URequirementList::Evaluate` checking the cache before dispatching to each requirement, not by the watcher iterating the array itself.
+In v1.x the consuming system created `FRequirementSetRuntime`, managed its lifecycle, and held the handle. This exposed internal requirement system types to consuming systems and required them to manage registration lifecycle. In v2 the list is the registration unit — it calls `Register(World)` / `Unregister(World)` itself. The consuming system only binds `OnResultChanged` and calls `Register`. No internal types leak.
 
-## `URequirementSet` abstract base was removed
+## No per-player routing in the watcher
 
-Briefly specced as a shared base for `URequirementList` and a potential future `URequirementTree` type. Removed before implementation — YAGNI. If a second set type is ever needed, introduce the base at that time with full knowledge of what both types share.
+In v1.x the watcher manager routed events to per-player `URequirementWatcherComponent` instances. In v2 there is no per-player component. Requirements that need to filter by player identity do so inside `EvaluateFromEvent` by inspecting the event payload (e.g. checking `Payload.PlayerState == ExpectedPlayer`). This keeps the manager stateless with respect to players.
 
-## No central requirement registry
+## Coalescing is last-write-wins per tag per frame
 
-Requirement types are discovered via Unreal's reflection system when their owning module loads. There is no `RegisterRequirementType()` call, no factory, and no central list. This keeps each module fully self-contained and eliminates a potential load-order dependency.
+Multiple events with the same tag in one frame (20 item pickups) produce one evaluation per list per frame. The last payload wins. This is correct because requirements evaluate current state — intermediate states are irrelevant. Requirements that need to process every individual event (e.g. counting discrete occurrences) should not use the watcher; the owning system should call `Evaluate` directly.
+
+## Authority lives on the asset
+
+Call sites never pass or override authority. The watcher manager enforces it. If two systems need different authority for logically identical conditions, they reference two separate assets. This prevents authority bypass bugs at the programmer level.
+
+---
+
+# Removed Types (v1.x → v2)
+
+| Removed | Reason |
+|---|---|
+| `FRequirementContext` typed fields (`PlayerState`, `World`, `Instigator`) | Replaced by `FInstancedStruct Data` |
+| `FRequirementPayload` | Tracker data does not belong in requirements |
+| `FRequirementSetRuntime` | List owns its own registration state |
+| `FRequirementSetHandle` | No longer needed — list is the registration unit |
+| `URequirementWatcherComponent` | No per-player component; manager is stateless re: players |
+| `URequirement_Persisted` | Persistence belongs in goal/tracker systems |
+| `ERequirementDataAuthority` | Removed with `URequirement_Persisted` |
+| `ERequirementCacheState` | No cache in the system |
+| `URequirementSet` abstract base | Was premature abstraction; never had >1 concrete type |
+| `EEvaluateAsyncMode` | Async evaluation removed; all evaluation is synchronous |
+| `MakeGuardedCallback` | With async removed, no longer needed |
 
 ---
 
@@ -110,7 +106,6 @@ Requirement types are discovered via Unreal's reflection system when their ownin
 
 | Issue | Severity | Notes |
 |---|---|---|
-| `EvaluateSetInternal` bypasses `URequirementList` operator | High | Must call `List->Evaluate` instead of iterating flat array. Monotonic cache must move into `URequirementList::Evaluate`. |
-| Async requirements silently evaluate as Fail in watcher flush | High | Watcher flush calls `Evaluate()` (sync). Async requirements return `Fail` by default. `RegisterSet` should reject sets with async requirements, or the flush must route async requirements through `EvaluateAsync`. |
-| `URequirement_Persisted` has no standalone sub-page | Low | Interim definition in Quest System's `GameCore Changes.md`. Promoted to `URequirement — Base Class` sub-page is the target. |
-| `URequirementLibrary` doc still says `URequirementSet` in opening line | Low | Stale copy from before `URequirementSet` was removed. |
+| Last-write-wins coalescing drops intermediate event payloads | Medium | Acceptable for state-query requirements. Systems needing per-event processing must call `Evaluate` directly. |
+| No per-consumer `OnResultChanged` scoping | Low | Multiple bindings on the same list share pass/fail state. Acceptable since they observe the same gate. |
+| Initial evaluation with empty context | Low | `Register()` calls `Evaluate` with an empty context to establish baseline. Event-only requirements return Fail as baseline, which is correct. |

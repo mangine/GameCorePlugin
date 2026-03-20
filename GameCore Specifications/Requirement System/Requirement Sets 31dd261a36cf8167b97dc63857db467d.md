@@ -1,218 +1,176 @@
-# Requirement Sets
+# URequirementList
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-`URequirementList` is the sole concrete requirement set class. It is a `UPrimaryDataAsset` that owns an array of requirements and evaluates them as a unit using a configurable operator (AND or OR). Consuming systems hold a `TObjectPtr<URequirementList>` asset reference. Because it is a Data Asset, a single asset can be referenced by any number of consuming systems with zero duplication — the canonical pattern for shared prerequisites such as ore nodes, crafting recipes, and quest gates.
-
-`URequirementSet` has been removed. `URequirementList` directly inherits `UPrimaryDataAsset` and owns the full evaluation interface. There is no abstract base — if a second set type is ever needed, introduce a shared base at that time.
+`URequirementList` is the primary authoring unit of the Requirement System. It is a `UPrimaryDataAsset` grouping a set of `URequirement` instances under a configurable AND/OR operator with an authority declaration. Consuming systems hold a `TObjectPtr<URequirementList>`, call `Evaluate` imperatively, or register for reactive evaluation via the watcher manager.
 
 **File:** `Requirements/RequirementList.h / .cpp`
 
 ---
 
-# `URequirementList`
+# Class Definition
 
 ```cpp
-// Concrete requirement set asset. Create one asset per unique requirement configuration.
-// Multiple systems (ore nodes, recipes, interactions) may reference the same asset.
-//
-// Operator controls top-level evaluation:
-//   AND — all requirements must pass (default, most common).
-//   OR  — any single requirement passing is sufficient.
-//
-// Any boolean expression is achievable by nesting URequirement_Composite children
-// within the Requirements array. For example, (A AND B) OR (C AND D):
-//   Operator = OR
-//   Requirements[0] = URequirement_Composite(AND) { A, B }
-//   Requirements[1] = URequirement_Composite(AND) { C, D }
+// Delegate fired when the overall pass/fail state of this list changes
+// after a watcher-triggered evaluation.
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnRequirementResultChanged, bool /*bPassed*/);
+
 UCLASS(BlueprintType, DisplayName = "Requirement List")
 class GAMECORE_API URequirementList : public UPrimaryDataAsset
 {
     GENERATED_BODY()
 public:
+
+    // ── Authoring ─────────────────────────────────────────────────────────────
+
     // Top-level evaluation operator.
     // AND: all requirements must pass. Short-circuits on first failure.
     // OR:  any requirement passing is sufficient. Short-circuits on first pass.
-    // Array order is evaluation order — place cheap checks first.
+    // Ordering matters: place cheap checks first.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Requirements")
     ERequirementListOperator Operator = ERequirementListOperator::AND;
 
-    // The requirements evaluated by this list.
-    // URequirement_Composite is a valid element — use it for nested AND/OR/NOT logic.
+    // Requirements evaluated by this list.
+    // URequirement_Composite is valid here for nested AND/OR/NOT logic.
     UPROPERTY(EditDefaultsOnly, Instanced, BlueprintReadOnly, Category = "Requirements")
     TArray<TObjectPtr<URequirement>> Requirements;
 
-    // Network authority for this asset. Declared once by the designer.
-    // Consuming systems do not pass or override authority at call sites.
-    // If two systems need different authority for the same conditions, use two assets.
-    // Defined in RequirementList.h alongside URequirementList.
+    // Network authority. Set once by the designer.
+    // The watcher manager enforces this — lists are silently skipped
+    // on the wrong network side.
     UPROPERTY(EditDefaultsOnly, Category = "Network")
     ERequirementEvalAuthority Authority = ERequirementEvalAuthority::ServerOnly;
 
-    // ── Evaluation — primary public API ──────────────────────────────────────
-    // Consuming systems call these directly. Never call URequirementLibrary externally.
+    // ── Imperative Evaluation ─────────────────────────────────────────────────
 
+    // Evaluate all requirements synchronously against the provided context.
+    // Returns combined FRequirementResult respecting Operator.
+    // Always callable — does not require prior Register().
     UFUNCTION(BlueprintCallable, Category = "Requirements")
     FRequirementResult Evaluate(const FRequirementContext& Context) const;
 
-    bool IsAsync() const;
+    // ── Reactive Evaluation ───────────────────────────────────────────────────
 
-    void EvaluateAsync(const FRequirementContext& Context,
-                       TFunction<void(FRequirementResult)> OnComplete) const;
+    // Fired after a watcher-triggered evaluation when the overall pass/fail
+    // state changes. Bind before calling Register().
+    // MulticastDelegate — multiple systems may bind to the same list.
+    FOnRequirementResultChanged OnResultChanged;
 
-    // Called by URequirementWatcherComponent at RegisterSet time.
-    void CollectWatchedEvents(FGameplayTagContainer& OutEvents) const;
+    // Registers this list with the watcher manager in the given world.
+    // Collects all GetWatchedEvents tags from every requirement and subscribes.
+    // Performs an initial evaluation immediately to establish baseline state.
+    // Safe to call multiple times — subsequent calls are no-ops if already registered.
+    UFUNCTION(BlueprintCallable, Category = "Requirements")
+    void Register(UWorld* World);
 
-    // Returns all requirements flat (for cache array sizing in the Watcher System).
+    // Unregisters from the watcher manager. Clears event subscriptions.
+    // Does not unbind OnResultChanged delegates — caller is responsible.
+    UFUNCTION(BlueprintCallable, Category = "Requirements")
+    void Unregister(UWorld* World);
+
+    // ── Internal (called by URequirementWatcherManager) ────────────────────────
+
+    // Called by the watcher manager when a subscribed event tag fires.
+    // Wraps the event payload in FRequirementContext and calls EvaluateFromEvent
+    // on all requirements. Fires OnResultChanged if pass/fail state changed.
+    void NotifyEvent(FGameplayTag EventTag, const FInstancedStruct& EventPayload);
+
+    // Returns all watched tags collected from Requirements (including composite children).
+    // Called once at Register() time.
+    void CollectWatchedEvents(FGameplayTagContainer& OutTags) const;
+
+    // Returns flat list of all requirements (composite children included).
+    // Used by ValidateRequirements.
     TArray<URequirement*> GetAllRequirements() const;
+
+private:
+    // Tracks last known pass/fail so NotifyEvent only fires OnResultChanged
+    // when the result actually changes.
+    bool bLastResult = false;
+    bool bHasEvaluatedOnce = false;
 };
 ```
 
-> **Authoring rule.** One `URequirement` subclass per behaviour — vary configuration via properties, not subclasses. Never create a separate Blueprint subclass of a requirement just to hardcode a different item tag or level threshold. Those are properties on the requirement instance inside the asset.
-> 
-
-`Evaluate` and `EvaluateAsync` use `URequirementLibrary` internally as a helper. `URequirementLibrary` is not a public API for consuming systems — always call `List->Evaluate(Context)`.
-
 ---
 
-# `ERequirementListOperator`
-
-Defined in `RequirementList.h`.
+# `Evaluate` — Implementation
 
 ```cpp
-UENUM(BlueprintType)
-enum class ERequirementListOperator : uint8
+FRequirementResult URequirementList::Evaluate(const FRequirementContext& Context) const
 {
-    // All requirements must pass. Short-circuits on first failure.
-    // Use for prerequisite gates: level AND tool equipped AND quest complete.
-    AND UMETA(DisplayName = "All Must Pass (AND)"),
-
-    // Any single requirement passing is sufficient. Short-circuits on first pass.
-    // Use for alternative unlock paths: guild member OR reputation threshold.
-    OR  UMETA(DisplayName = "Any Must Pass (OR)"),
-};
+    return URequirementLibrary::EvaluateAll(Requirements, Operator, Context);
+}
 ```
+
+Simple delegation to the library. The library handles operator logic and short-circuiting.
 
 ---
 
-# `ERequirementEvalAuthority`
-
-Defined in `RequirementList.h` alongside `URequirementList`. Authority is declared on the asset by the designer — not passed by call sites. `RegisterSet` reads `List->Authority` directly. If two systems need different authority for the same logical conditions, they reference two separate assets.
-
-> **Design rule.** Never add an authority override parameter to `RegisterSet`. If you feel the need to override, create a second asset.
-> 
+# `NotifyEvent` — Implementation
 
 ```cpp
-UENUM(BlueprintType)
-enum class ERequirementEvalAuthority : uint8
+void URequirementList::NotifyEvent(FGameplayTag EventTag,
+                                   const FInstancedStruct& EventPayload)
 {
-    // Server evaluates only. Client never receives result until server decides.
-    // Use for all gameplay-gating checks (loot, quest progression, ability use).
-    ServerOnly UMETA(DisplayName = "Server Only"),
+    // Wrap event payload in FRequirementContext.
+    FRequirementContext Ctx;
+    Ctx.Data = EventPayload;
 
-    // Client evaluates only. Server never checks.
-    // Use for purely cosmetic or UI-gating checks (show tooltip, grey-out button).
-    // All requirements in a ClientOnly list must return ClientOnly or Both from
-    // GetDataAuthority(). A ServerOnly requirement here cannot be evaluated on the
-    // client — ValidateRequirements treats this as a design error at BeginPlay.
-    ClientOnly UMETA(DisplayName = "Client Only"),
+    // Evaluate using EvaluateFromEvent path.
+    FRequirementResult Result =
+        URequirementLibrary::EvaluateAllFromEvent(Requirements, Operator, Ctx);
 
-    // Client evaluates for responsiveness. On all-pass, client fires a Server RPC.
-    // Server re-evaluates fully from its own context — never trusts the client result.
-    // Use for player-facing unlocks where immediate UI feedback matters (quest available).
-    //
-    // IMPORTANT: All requirements in a ClientValidated list must return ClientOnly or
-    // Both from GetDataAuthority(). A ServerOnly requirement cannot be evaluated on
-    // the client — it would silently optimistic-pass, fire the RPC, and be rejected
-    // by the server with no predictable client-side signal. If any requirement needs
-    // server-only data, use a ServerOnly list instead.
-    // ValidateRequirements enforces this constraint at BeginPlay in development builds.
-    ClientValidated UMETA(DisplayName = "Client Validated"),
-};
+    // Fire delegate only if result changed.
+    if (!bHasEvaluatedOnce || Result.bPassed != bLastResult)
+    {
+        bLastResult = Result.bPassed;
+        bHasEvaluatedOnce = true;
+        OnResultChanged.Broadcast(Result.bPassed);
+    }
+}
 ```
 
-**Security note on `ClientValidated`.** The server RPC must trigger a full server-side re-evaluation using a server-constructed `FRequirementContext`. The client result is a hint only — it cannot bypass the server check.
+**Note on `bLastResult` and `bHasEvaluatedOnce`:** These are the only mutable fields on the list. They exist to prevent consuming systems from reacting to no-op events (same result as before). They are intentionally not per-consumer — if multiple systems bind `OnResultChanged`, they all share the same pass/fail tracking. This is correct because the list represents one logical gate; multiple observers of the same gate should agree on its state.
 
 ---
 
-# `FRequirementSetRuntime` — Per-Player Cache
-
-The Watcher System maintains one `FRequirementSetRuntime` per registered list per player. This struct holds the per-player evaluation cache — it is never part of the shared `URequirementList` asset.
+# `Register` / `Unregister` — Implementation
 
 ```cpp
-// Uniquely identifies a registered requirement list within a player's watcher component.
-// Issued by URequirementWatcherComponent::RegisterSet.
-struct FRequirementSetHandle
+void URequirementList::Register(UWorld* World)
 {
-    uint32 Id = 0;
-    bool IsValid() const { return Id != 0; }
-};
+    URequirementWatcherManager* Mgr =
+        World->GetSubsystem<URequirementWatcherManager>();
+    if (!Mgr) return;
 
-// Per-player runtime state for one registered URequirementList.
-// Lives in URequirementWatcherComponent. Never replicated.
-USTRUCT()
-struct FRequirementSetRuntime
+    FGameplayTagContainer WatchedTags;
+    CollectWatchedEvents(WatchedTags);
+    Mgr->RegisterList(this, WatchedTags);
+
+    // Initial evaluation — establish baseline so OnResultChanged
+    // fires correctly on the first real event.
+    // Uses an empty context since we have no event payload yet.
+    // Requirements that cannot evaluate without event data will return Fail,
+    // which is the correct baseline for event-only requirements.
+    FRequirementContext EmptyCtx;
+    FRequirementResult Initial = Evaluate(EmptyCtx);
+    bLastResult = Initial.bPassed;
+    bHasEvaluatedOnce = true;
+}
+
+void URequirementList::Unregister(UWorld* World)
 {
-    GENERATED_BODY()
-
-    // The shared list asset. Not per-player — many players may reference the same asset.
-    UPROPERTY()
-    TObjectPtr<URequirementList> Asset;
-
-    // Parallel to Asset->GetAllRequirements().
-    // Indexed by requirement position in the flat list.
-    // CachedTrue entries for monotonic requirements are never re-evaluated.
-    TArray<ERequirementCacheState> CachedResults;
-
-    // Authority read from Asset->Authority at registration time.
-    ERequirementEvalAuthority Authority = ERequirementEvalAuthority::ServerOnly;
-
-    // Unique handle for this registration.
-    FRequirementSetHandle Handle;
-};
-
-// Three-state cache entry.
-UENUM()
-enum class ERequirementCacheState : uint8
-{
-    Uncached,     // Not yet evaluated.
-    CachedFalse,  // Last result was Fail. Will be re-evaluated on next dirty flush.
-    CachedTrue,   // Last result was Pass. If bIsMonotonic, this is permanent.
-};
+    URequirementWatcherManager* Mgr =
+        World->GetSubsystem<URequirementWatcherManager>();
+    if (Mgr) Mgr->UnregisterList(this);
+}
 ```
-
-**Memory note.** Cache arrays are sized to `GetAllRequirements().Num()` at registration time. With average 5 requirements per set and a reasonable number of active sets per player, total memory per player is in the low kilobytes — negligible.
 
 ---
 
-# Consuming Systems — Integration Pattern
+# Authoring Rules
 
-```cpp
-// In a Data Asset (e.g. UOreNodeDefinition, UQuestDefinition):
-// No Instanced specifier — URequirementList is a UPrimaryDataAsset referenced by pointer.
-UPROPERTY(EditDefaultsOnly, Category = "Requirements")
-TObjectPtr<URequirementList> Requirements;
-
-// One-shot server-side check (e.g. confirming a mine action RPC):
-FRequirementContext Ctx;
-Ctx.PlayerState = PS;
-Ctx.World       = GetWorld();
-Ctx.Instigator  = GetPawn();
-FRequirementResult Result = OreNodeDef->Requirements->Evaluate(Ctx);
-
-// Watched registration — authority is read from List->Authority, no parameter needed:
-URequirementWatcherComponent* Watcher = PS->GetComponentByClass<URequirementWatcherComponent>();
-FRequirementSetHandle Handle = Watcher->RegisterSet(
-    QuestDef->Requirements,
-    FOnRequirementSetDirty::CreateUObject(this, &UQuestComponent::OnRequirementsDirty)
-);
-```
-
-Store the `FRequirementSetHandle`. Call `Watcher->UnregisterSet(Handle)` when the system no longer needs to track this list to prevent leaking subscriptions.
-
----
-
-# Known Limitations
-
-- **`CollectWatchedEvents` on deep expression trees has upfront cost.** Called once at `RegisterSet` time — not per-frame. Acceptable for sets with up to ~50 nodes; pathological trees with hundreds of nested composites should be restructured.
-- **Unregistering sets is the caller's responsibility.** The watcher component does not track set lifetime. Leaking registrations wastes subscription slots and keeps stale cache entries alive.
+- One `URequirement` subclass per behaviour. Vary configuration via properties, not subclasses.
+- Use `URequirement_Composite` children for OR/NOT logic within a list that has a top-level AND operator.
+- If two systems need different authority for the same conditions, use two separate assets.
+- Never add an authority override parameter to `Register()` or `Evaluate()`. Authority is a designer decision encoded in the asset.

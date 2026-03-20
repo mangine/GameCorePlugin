@@ -1,72 +1,176 @@
 # Requirement System
 
-**Part of: GameCore Plugin** | **Status: Active Specification** | **UE Version: 5.7**
+**Part of: GameCore Plugin** | **Status: Active Specification — v2** | **UE Version: 5.7**
 
-The Requirement System is a data-driven, polymorphic condition evaluation layer. It provides a single, reusable mechanism for expressing and evaluating prerequisites — usable by any system (quests, interactions, abilities, dialogue, crafting) without coupling those systems together. Requirements are configured directly in Data Assets using instanced UObjects with designer-friendly properties. Evaluation is synchronous by default; an async path exists for conditions that depend on data not resident in memory.
-
----
-
-# System Modules
-
-| Module | Classes | Role |
-|---|---|---|
-| **Core Evaluation** | `URequirement`, `URequirement_Composite`, `URequirementLibrary` | Abstract base, boolean logic tree, evaluation entry point |
-| **Payload Base** | `URequirement_Persisted` | Abstract base for requirements reading runtime counter/float data via context payload |
-| **Requirement Sets** | `URequirementList` | Data Asset grouping requirements with AND/OR operator and authority declaration |
-| **Watcher System** | `URequirementWatcherComponent`, `URequirementWatcherManager` | Event-driven per-player dirty tracking. Eliminates polling. |
-| **Supporting Types** | `FRequirementContext`, `FRequirementPayload`, `FRequirementResult`, `FRequirementSetRuntime`, enums | Evaluation inputs, outputs, payload injection, per-player runtime cache |
+The Requirement System is a stateless, data-driven condition evaluation layer. Any system — quests, interactions, abilities, crafting, dialogue — can express and evaluate prerequisites without coupling to other systems. Requirements are authored as Data Assets in the Unreal Details panel and evaluated on demand or reactively via the event bus.
 
 ---
 
-# Core Design Principles
+# System Requirements
 
-- **Requirements are definitions, not instances.** `URequirement` objects are authored in Data Assets and loaded once. They carry no per-player state. The same object is evaluated against many players using only `FRequirementContext`.
-- **Synchronous by default, async by exception.** `Evaluate` must return immediately for the vast majority of requirements. `EvaluateAsync` exists only when data is genuinely not resident in memory.
-- **Authority lives on the server.** Systems that gate gameplay actions must evaluate server-side. Client evaluation is permitted only for display and UI gating.
-- **No cross-system imports at the base layer.** `Requirements/` has zero outgoing module dependencies. `FRequirementContext` never includes a typed pointer to any class outside `Requirements/`, `Engine`, or `GameplayTags`.
-- **Events are GameplayTags, not enums.** Each module registers its own invalidation tags under `RequirementEvent.*`. Zero coupling between modules.
-- **Composites replace hardcoded logic.** AND/OR/NOT expressions use `URequirement_Composite` trees — not bespoke C++ evaluators.
-- **Watcher is push-invalidated, pull-evaluated.** Requirements never poll. Relevant events dirty sets; evaluation runs on the next throttled flush.
-- **Payload injection for runtime data.** Requirements that need runtime counters or floats read them from `FRequirementContext::PersistedData`, injected by the owning system before `Evaluate` is called. Never via a component pointer in the context.
+These are the non-negotiable constraints that drove every design decision:
 
----
-
-# How the Pieces Connect
-
-**Authoring.** A designer creates a `URequirementList` Data Asset, sets the `Operator`, adds `URequirement` instances via the Details panel class picker, and configures their properties. Consuming assets hold `TObjectPtr<URequirementList>`. Complex expressions use nested `URequirement_Composite` elements.
-
-**Evaluation (on-demand).** Consuming system constructs `FRequirementContext` and calls `List->Evaluate(Context)` or `List->EvaluateAsync(Context, OnComplete)`. `URequirementLibrary` is an internal helper of `URequirementList` — never called directly.
-
-**Evaluation with payload.** Owning system builds `FRequirementPayload`, inserts it into `FRequirementContext::PersistedData` under a domain tag, then calls `Evaluate`. `URequirement_Persisted` subclasses look up their domain tag and read counters/floats from the payload.
-
-**Evaluation (watched).** Owning system registers a `URequirementList` handle with `URequirementWatcherComponent`. Requirements declare invalidation tags via `GetWatchedEvents`. When a `RequirementEvent.*` tag fires, only watching sets are dirtied. A coalescing timer flushes dirty sets in batches. Owning system receives `FOnRequirementSetDirty`.
-
-**Network.** Each `URequirementList` asset carries `ERequirementEvalAuthority` (`ServerOnly` / `ClientOnly` / `ClientValidated`). `ClientValidated` sets are evaluated on the client for responsiveness; the server always re-evaluates fully from its own context before acting.
+1. **Usable anywhere.** Requirements must work on actors, subsystems, Data Assets, and non-actor contexts equally. No owning actor or component is required to use the system.
+2. **Stateless definitions.** A `URequirement` instance authored in a Data Asset carries no per-player, per-evaluation, or per-frame state. The same object is evaluated against many different contexts.
+3. **No persistence in the requirement system.** Tracking accumulation (kill counts, delivery counts) is the responsibility of the system that owns that data — not requirements. Requirements only test conditions that are true or false right now.
+4. **No caching in the requirement system.** No cache means no storage, no lifecycle, no owner. Evaluation is cheap enough that caching is not worth the complexity.
+5. **Zero dependencies at the base layer.** `Requirements/` compiles with no imports from other GameCore modules.
+6. **Boolean completeness.** Any AND/OR/NOT combination is expressible without writing custom C++ evaluation logic.
+7. **Two evaluation paths.** Imperative: caller builds a context struct and calls `Evaluate` directly. Reactive: the watcher manager feeds event payloads to subscribed requirement lists automatically.
+8. **Server-authoritative.** Gameplay-gating evaluations happen server-side. Client evaluation is for display only.
 
 ---
 
-# File and Folder Structure
+# Key Design Decisions
+
+**Requirements are not trackers.** "Kill 10 wolves" is a goal with state that accumulates over time. That belongs in a goal/objective system. "Has killed at least 10 wolves" is a requirement — a true/false question answered from current world state or an event payload. If a system needs to track progress, it tracks it externally and exposes a fact that requirements can test.
+
+**No persistence, no cache.** Both require an owner. Requirements are used on Data Assets and non-actor contexts that have no persistent storage. The evaluation cost of a requirement (a component lookup and comparison) is far lower than the complexity cost of managing a cache. Systems that genuinely need to avoid re-evaluating can cache the `FRequirementResult` themselves with one local bool.
+
+**`FRequirementContext` replaces all previous context types.** The old `FRequirementContext` (with typed fields), `FRequirementPayload`, and `FRequirementSetRuntime` are removed. The new `FRequirementContext` carries a single `FInstancedStruct Data` field — the caller puts whatever struct the requirement expects into it. Requirements cast it to their expected type. This is the same mechanism the event bus uses, so watcher-delivered event payloads can be passed directly.
+
+**Two evaluate signatures, not one.** `Evaluate(FRequirementContext)` is for imperative checks — the caller builds context explicitly. `EvaluateFromEvent(FRequirementContext)` is for reactive checks — the watcher manager wraps the event payload and calls this. Requirements may implement one or both. The distinction allows requirements to behave differently on a snapshot query vs a live event (e.g. validate the event source, check delta values).
+
+**`URequirementList` subscribes to the watcher, not the other way around.** A list registers its watched event tags with `URequirementWatcherManager`. When a matching event arrives, the manager calls `NotifyEvent` on the list. The list evaluates itself and fires its `OnResultChanged` delegate if the pass/fail result changed. The consuming system never touches the evaluation loop — it only binds to the delegate.
+
+**Authority lives on the asset.** `ERequirementEvalAuthority` is a property of `URequirementList`, set by the designer. Call sites never pass or override it. The watcher manager enforces it — a `ServerOnly` list never evaluates on the client.
+
+**`URequirementSet` abstract base was removed.** It was premature abstraction for one concrete type. Reintroduce only if a second list type materialises.
+
+**`URequirement_Persisted`, `FRequirementPayload`, `FRequirementSetRuntime`, `FRequirementSetHandle`, `URequirementWatcherComponent`, `ERequirementDataAuthority`** — all removed. Their responsibilities either belong in consuming systems or were unnecessary complexity.
+
+---
+
+# Architecture Overview
 
 ```
-GameCore/
-└── Source/GameCore/
-    ├── Requirements/                               ← Core. Zero outgoing module dependencies.
-    │   ├── Requirement.h / .cpp                    ← URequirement, URequirement_Persisted
-    │   ├── RequirementContext.h                    ← FRequirementContext, FRequirementResult
-    │   ├── RequirementPayload.h                    ← FRequirementPayload
-    │   ├── RequirementComposite.h / .cpp           ← URequirement_Composite
-    │   ├── RequirementLibrary.h / .cpp             ← URequirementLibrary
-    │   ├── RequirementSet.h / .cpp                 ← URequirementList, enums, FRequirementSetRuntime
-    │   └── RequirementWatcher.h / .cpp             ← URequirementWatcherComponent, URequirementWatcherManager
-    │
-    ├── Quest/Requirements/
-    │   ├── Requirement_QuestCompleted.h / .cpp
-    │   ├── Requirement_QuestCooldown.h / .cpp
-    │   └── Requirement_ActiveQuestCount.h
-    ├── Tags/Requirements/
-    │   └── RequirementHasTag.h / .cpp
-    └── Leveling/Requirements/
-        └── RequirementMinLevel.h / .cpp
+┌─────────────────────────────────────────────────────────┐
+│                   Consuming System                       │
+│  (QuestComponent, InteractionComponent, AbilitySystem)   │
+│                                                          │
+│  ┌──────────────────┐    binds delegate                 │
+│  │ URequirementList │◄────────────────────────────────  │
+│  │  (Data Asset)    │    OnResultChanged(bool bPassed)  │
+└──┴────────┬─────────┴──────────────────────────────────-┘
+            │ subscribes watched tags at Register()
+            ▼
+┌───────────────────────────────┐
+│  URequirementWatcherManager   │  UWorldSubsystem
+│  TMap<FGameplayTag,           │
+│    TArray<WeakPtr<List>>>     │◄── event bus delivers FInstancedStruct
+└───────────────────────────────┘
+            │ NotifyEvent(tag, FRequirementContext)
+            ▼
+┌─────────────────────────────────┐
+│       URequirementList          │
+│  Operator (AND/OR)              │
+│  Authority                      │
+│  TArray<URequirement*>          │
+│                                 │
+│  EvaluateAll(Context)           │
+│    → URequirementLibrary        │
+│  fires OnResultChanged if       │
+│  pass/fail state changed        │
+└─────────────────────────────────┘
+            │ Evaluate(FRequirementContext)
+            ▼
+┌───────────────────────────────────┐
+│         URequirement              │
+│  (stateless, authored in asset)   │
+│  Evaluate(FRequirementContext)    │
+│  EvaluateFromEvent(FRequirementContext) │
+│  GetWatchedEvents()               │
+└───────────────────────────────────┘
+```
+
+---
+
+# Module Map
+
+| Class / Type | File | Role |
+|---|---|---|
+| `URequirement` | `Requirements/Requirement.h/.cpp` | Abstract base. Stateless evaluation contract. |
+| `URequirement_Composite` | `Requirements/RequirementComposite.h/.cpp` | AND/OR/NOT boolean tree. |
+| `URequirementList` | `Requirements/RequirementList.h/.cpp` | Asset grouping requirements. Operator, authority, delegate. |
+| `URequirementWatcherManager` | `Requirements/RequirementWatcher.h/.cpp` | WorldSubsystem. Event bus bridge. Routes events to lists. |
+| `URequirementLibrary` | `Requirements/RequirementLibrary.h/.cpp` | Internal helper. EvaluateAll, ValidateRequirements. |
+| `FRequirementContext` | `Requirements/RequirementContext.h` | Evaluation input. Wraps `FInstancedStruct`. |
+| `FRequirementResult` | `Requirements/RequirementContext.h` | Evaluation output. Pass/fail + reason. |
+| `ERequirementEvalAuthority` | `Requirements/RequirementList.h` | ServerOnly / ClientOnly / ClientValidated. |
+| `ERequirementListOperator` | `Requirements/RequirementList.h` | AND / OR. |
+
+---
+
+# File Structure
+
+```
+GameCore/Source/GameCore/
+├── Requirements/                        ← zero outgoing module dependencies
+│   ├── Requirement.h / .cpp
+│   ├── RequirementComposite.h / .cpp
+│   ├── RequirementContext.h
+│   ├── RequirementList.h / .cpp
+│   ├── RequirementLibrary.h / .cpp
+│   └── RequirementWatcher.h / .cpp
+│
+├── Quest/Requirements/
+│   ├── Requirement_QuestCompleted.h/.cpp
+│   └── Requirement_ActiveQuestCount.h/.cpp
+├── Tags/Requirements/
+│   └── Requirement_HasTag.h/.cpp
+└── Leveling/Requirements/
+    └── Requirement_MinLevel.h/.cpp
+```
+
+---
+
+# Quick Usage Guide
+
+## Imperative one-shot check
+
+```cpp
+// Build a context containing whatever data the requirements need.
+FMyLevelContext LevelCtx;
+LevelCtx.PlayerState = GetPlayerState();
+
+FRequirementContext Ctx;
+Ctx.Data.InitializeAs<FMyLevelContext>(LevelCtx);
+
+FRequirementResult Result = MyList->Evaluate(Ctx);
+if (!Result.bPassed)
+    ShowFailureReason(Result.FailureReason);
+```
+
+## Reactive watched evaluation
+
+```cpp
+// At setup — bind and register.
+MyList->OnResultChanged.BindUObject(this, &UMySystem::OnRequirementsChanged);
+MyList->Register(GetWorld()); // subscribes to watcher manager
+
+// Callback fires when pass/fail state changes.
+void UMySystem::OnRequirementsChanged(bool bPassed)
+{
+    bRequirementsMet = bPassed;
+}
+
+// At teardown.
+MyList->Unregister(GetWorld());
+MyList->OnResultChanged.Unbind();
+```
+
+## Firing an event that requirements watch
+
+```cpp
+// Any system fires this when relevant state changes.
+FPlayerLevelChangedEvent Payload;
+Payload.NewLevel = 15;
+
+URequirementWatcherManager* Mgr =
+    GetWorld()->GetSubsystem<URequirementWatcherManager>();
+Mgr->BroadcastEvent(
+    FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged"),
+    FInstancedStruct::Make(Payload));
 ```
 
 ---
@@ -75,36 +179,22 @@ GameCore/
 
 | Concern | Approach |
 |---|---|
-| Authority | Server evaluates before any gated action. |
-| Client display | Client may call `Evaluate` locally for UI using replicated data. Non-authoritative. |
-| `ClientValidated` sets | Client evaluates for responsiveness; on all-pass, fires Server RPC. Server re-evaluates fully. |
-| `ClientOnly` sets | Server never evaluates. Pure UI/cosmetic gating. |
-| Context construction | Server derives `FRequirementContext` from RPC connection. Never trusts client-provided subject references. |
-| Payload authority | `PersistedData` is built from replicated runtime data — available on both sides. Requirements reading it declare `GetDataAuthority() == Both`. |
-| Failure feedback | Consuming system sends a targeted ClientRPC with the `FText` failure reason. |
-
----
-
-# Known Limitations
-
-- **`EvaluateSetInternal` bypasses `URequirementList` operator.** The watcher flush iterates the flat requirement array directly, ignoring the list's AND/OR operator. Must call `List->Evaluate(Context)` instead. See Design Decisions for full context.
-- **Async requirements silently fail in watcher flush.** Flush calls `Evaluate()` (sync). Async requirements return `Fail` by default. `RegisterSet` should reject sets containing async requirements, or the flush must route them through `EvaluateAsync`.
-- **Async timeout is implementor's responsibility.** No global timeout. Each async requirement guards via `MakeGuardedCallback`.
-- **`EvaluateAllAsync` has no cancellation token.** Guard via `TWeakObjectPtr` capture in lambdas.
-- **Blueprint subclassing unvalidated at edit time.** Move Blueprint requirements to C++ before shipping.
-- **Watcher flush delay adds latency.** Tunable per system via `FlushDelaySeconds`. Intentional.
+| Authority enforcement | `URequirementWatcherManager` skips evaluation for lists whose authority doesn't match the current net role. |
+| Imperative server checks | Always build context server-side from the RPC connection. Never trust client-provided data. |
+| `ClientValidated` | Client evaluates for responsiveness. On pass, fires Server RPC. Server re-evaluates from scratch. |
+| `ClientOnly` | Purely cosmetic / UI. Server never evaluates. |
+| Failure feedback | Consuming system sends a targeted ClientRPC with `FRequirementResult.FailureReason`. |
 
 ---
 
 # Sub-Pages
 
-| Sub-Page | Covers |
+| Page | Covers |
 |---|---|
-| [Supporting Types](Requirement%20System/Supporting%20Types.md) | `FRequirementContext`, `FRequirementResult`, `FRequirementPayload`, `FRequirementSetHandle`, `FRequirementSetRuntime`, all enums. Includes deep explanation of `PersistedData` map design. |
-| [Design Decisions](Requirement%20System/Design%20Decisions.md) | System requirements, evolution history (gate check → sets → payload), key architectural decisions with rationale, open issues. |
-| [Usage Guide](Requirement%20System/Usage%20Guide.md) | Three usage patterns: one-shot imperative, reactive watched, payload-injected. Full code examples. Common mistakes. Subclass checklist. |
-| [`URequirement` — Base Class](Requirement%20System/URequirement%20%E2%80%94%20Base%20Class%20319d261a36cf815f988bc5cacacd5ad0.md) | Full class definition, `URequirement_Persisted`, sync/async implementation examples, async flow diagram, statelessness contract. |
-| [`URequirement_Composite`](Requirement%20System/URequirement_Composite%20319d261a36cf81bf84aadce23da6e5a0.md) | `ERequirementOperator`, AND/OR/NOT evaluation logic, async propagation, authoring patterns. |
-| [`URequirementLibrary`](Requirement%20System/URequirementLibrary%20319d261a36cf811cab04cd92452e80a3.md) | `EvaluateAll`, `MeetsAll`, `EvaluateAllAsync`, `ValidateRequirements`, `EEvaluateAsyncMode`. |
-| [Requirement Sets](Requirement%20System/Requirement%20Sets%2031dd261a36cf8167b97dc63857db467d.md) | `URequirementList`, `ERequirementEvalAuthority`, `ERequirementListOperator`, consuming system integration pattern. |
-| [Watcher System](Requirement%20System/Watcher%20System%2031dd261a36cf81dab4b9e7ce3e690bde.md) | `URequirementWatcherComponent`, `URequirementWatcherManager`, event tags, dirty coalescing, `ContextBuilder`, authority and network behaviour. |
+| [Supporting Types](Requirement%20System/Supporting%20Types.md) | `FRequirementContext`, `FRequirementResult`, all enums |
+| [URequirement — Base Class](Requirement%20System/URequirement%20%E2%80%94%20Base%20Class%20319d261a36cf815f988bc5cacacd5ad0.md) | Full class, both evaluate paths, implement guide, examples |
+| [URequirement_Composite](Requirement%20System/URequirement_Composite%20319d261a36cf81bf84aadce23da6e5a0.md) | AND/OR/NOT logic, async, authoring patterns |
+| [URequirementList](Requirement%20System/Requirement%20Sets%2031dd261a36cf8167b97dc63857db467d.md) | Asset definition, operator, authority, delegate, register/unregister |
+| [URequirementWatcherManager](Requirement%20System/Watcher%20System%2031dd261a36cf81dab4b9e7ce3e690bde.md) | Event bus bridge, routing, authority enforcement, coalescing |
+| [URequirementLibrary](Requirement%20System/URequirementLibrary%20319d261a36cf811cab04cd92452e80a3.md) | EvaluateAll, ValidateRequirements |
+| [Design Decisions](Requirement%20System/Design%20Decisions.md) | Full history, rejected approaches, rationale |
