@@ -146,6 +146,7 @@ GameCoreEvent
 - **`XPChanged` and `PointPoolChanged` can be high-frequency.** Batching must be applied at the call site — accumulate server-side, broadcast once per frame or threshold. The bus does not throttle.
 - **Scope is not a replication primitive.** The bus never sends data across the network. Scope only guards against broadcasting on the wrong machine.
 - **No cross-world channels.** Each `UGameCoreEventBus` instance is world-scoped. Broadcasts do not cross world boundaries.
+- **No parent tag subscription.** `UGameplayMessageSubsystem` performs exact tag matching only. Subscribing to `GameCoreEvent.Combat` will **not** receive events broadcast on `GameCoreEvent.Combat.EnemyKilled` or any other child tag. Listeners must subscribe to each specific leaf tag individually. If wildcard subscription over a namespace is needed in the future, a `StartListeningToTagHierarchy` method could be added to `UGameCoreEventBus` — it would call `UGameplayTagsManager::Get().RequestGameplayTagChildren()` at subscribe time and register one GMS listener per leaf tag, all routing to the same callback.
 
 ---
 
