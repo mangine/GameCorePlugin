@@ -18,7 +18,7 @@
 
 - **Never call `UGameplayMessageSubsystem` directly.** Always go through `UGameCoreEventBus`.
 - **Never cache `UGameCoreEventBus` or `UGameCoreEventWatcher` as member fields.** Call `::Get(this)` inline.
-- **Always store listener handles** and call `StopListening` / `Unregister` in `EndPlay` or equivalent teardown.
+- **Always store listener handles** and call `StopListening` / `Unregister` in `EndPlay` or equivalent teardown. No automatic cleanup is provided.
 - **Always declare `Scope` explicitly.** The default is `ServerOnly` — this is intentional and conservative.
 - **Channel tags follow `GameCoreEvent.<Module>.<Event>`.** Define in `DefaultGameplayTags.ini` of the owning module.
 - **One struct per channel.** Never share a payload struct across unrelated events.
@@ -75,7 +75,6 @@ if (UGameCoreEventBus* Bus = UGameCoreEventBus::Get(this))
 {
     LevelUpHandle = Bus->StartListening<FProgressionLevelUpMessage>(
         GameCoreEventTags::Progression_LevelUp,
-        this,
         [this](FGameplayTag, const FProgressionLevelUpMessage& Msg)
         {
             OnLevelUp(Msg.Subject, Msg.NewLevel);
@@ -96,7 +95,6 @@ Use when the message type is only known at runtime or multiple struct types may 
 ```cpp
 Handle = Bus->StartListening(
     MyTags::SomeChannel,
-    this,
     [](FGameplayTag, const FInstancedStruct& Payload)
     {
         if (const FTypeA* A = Payload.GetPtr<FTypeA>()) { /* ... */ }
@@ -108,7 +106,7 @@ Handle = Bus->StartListening(
 
 ## Listening via `UGameCoreEventWatcher` (single tag)
 
-Best for systems that need closure context (e.g. `this` is not a `UObject`).
+Best for systems that need closure context (e.g. `this` is not the right capture, or the listener is not a `UObject`).
 
 ```cpp
 // .h
@@ -190,7 +188,7 @@ struct GAMECORE_API FMyEventMessage
 {
     GENERATED_BODY()
 
-    // Always include subject/instigator context first.
+    // Always use TWeakObjectPtr for actor and component references.
     UPROPERTY() TWeakObjectPtr<AActor> Subject;
     UPROPERTY() int32 Value = 0;
 };

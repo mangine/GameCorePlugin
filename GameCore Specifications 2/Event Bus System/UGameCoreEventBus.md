@@ -22,7 +22,7 @@ enum class EGameCoreEventScope : uint8
     /** Fires only with authority (server / standalone). Default. */
     ServerOnly,
 
-    /** Fires only on the owning client.
+    /** Fires only on the owning client or in standalone.
      *  Data must already exist on the client via replication before this broadcast fires. */
     ClientOnly,
 
@@ -35,12 +35,12 @@ enum class EGameCoreEventScope : uint8
 ### Scope Evaluation
 
 ```
-ServerOnly → NM_Client?       → DROP
-ClientOnly → not NM_Client?   → DROP  (NM_Standalone counts as server for ServerOnly; passes ClientOnly)
-Both       →                  → always PASS
+ServerOnly → NM_Client?                         → DROP
+ClientOnly → not (NM_Client or NM_Standalone)?  → DROP
+Both       →                                    → always PASS
 ```
 
-> `NM_Standalone` passes `ServerOnly`. It passes `ClientOnly` too — standalone runs both roles. `ClientOnly` is intended for dedicated-server scenarios where data is replicated to a specific client.
+`NM_Standalone` passes both `ServerOnly` and `ClientOnly` — standalone runs both roles.
 
 ---
 
@@ -74,6 +74,10 @@ Both       →                  → always PASS
  * TAG MATCHING IS EXACT. GMS does not support parent tag subscription.
  * Subscribing to GameCoreEvent.Combat will NOT receive events on
  * GameCoreEvent.Combat.EnemyKilled. Always subscribe to the specific leaf tag.
+ *
+ * HANDLE LIFETIME: StartListening callers are fully responsible for storing
+ * the returned handle and calling StopListening in EndPlay. No automatic
+ * cleanup is provided — leaked handles keep a dangling lambda alive in GMS.
  */
 UCLASS()
 class GAMECORE_API UGameCoreEventBus : public UWorldSubsystem
@@ -135,12 +139,14 @@ public:
      *
      * IMPORTANT: Tag matching is exact — child tags are NOT received.
      *
+     * Caller is fully responsible for handle lifetime. Store the handle and
+     * call StopListening in EndPlay — no automatic cleanup is provided.
+     *
      * @return Handle. Store it and pass to StopListening in EndPlay.
      */
     template<typename T>
     FGameplayMessageListenerHandle StartListening(
         FGameplayTag Channel,
-        UObject* Owner,
         TFunction<void(FGameplayTag, const T&)> Callback);
 
     // -------------------------------------------------------------------------
@@ -152,11 +158,13 @@ public:
      *
      * IMPORTANT: Tag matching is exact — child tags are NOT received.
      *
+     * Caller is fully responsible for handle lifetime. Store the handle and
+     * call StopListening in EndPlay — no automatic cleanup is provided.
+     *
      * @return Handle. Store it and pass to StopListening in EndPlay.
      */
     FGameplayMessageListenerHandle StartListening(
         FGameplayTag Channel,
-        UObject* Owner,
         TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback);
 
     /**
@@ -191,7 +199,6 @@ void UGameCoreEventBus::Broadcast(
 template<typename T>
 FGameplayMessageListenerHandle UGameCoreEventBus::StartListening(
     FGameplayTag Channel,
-    UObject* Owner,
     TFunction<void(FGameplayTag, const T&)> Callback)
 {
     if (!GMS || !Channel.IsValid() || !Callback) return FGameplayMessageListenerHandle{};
@@ -284,7 +291,6 @@ void UGameCoreEventBus::Broadcast(
 ```cpp
 FGameplayMessageListenerHandle UGameCoreEventBus::StartListening(
     FGameplayTag Channel,
-    UObject* Owner,
     TFunction<void(FGameplayTag, const FInstancedStruct&)> Callback)
 {
     if (!GMS || !Channel.IsValid() || !Callback) return FGameplayMessageListenerHandle{};
@@ -330,8 +336,6 @@ bool UGameCoreEventBus::PassesScopeGuard(EGameCoreEventScope Scope) const
 }
 ```
 
-> **Note:** The original spec had `ClientOnly` mapping to `NM_Client` only. This has been corrected to also pass `NM_Standalone`, consistent with `UGameCoreEventWatcher::PassesScopeCheck` and with the intent that standalone acts as both roles.
-
 ---
 
 ## Important Notes
@@ -339,5 +343,5 @@ bool UGameCoreEventBus::PassesScopeGuard(EGameCoreEventScope Scope) const
 - **`T` must be a `USTRUCT`** for both `Broadcast<T>` and `StartListening<T>`.
 - **Both templates live in the header** — template instantiation happens at the call site.
 - **GMS is synchronous.** All listeners fire inline during `Broadcast`. Heavy work must be deferred by the listener (timer, game thread task).
-- **Always store the handle and call `StopListening` in `EndPlay`.** Leaked handles keep a dangling lambda alive inside GMS indefinitely.
+- **Always store the handle and call `StopListening` in `EndPlay`.** Leaked handles keep a dangling lambda alive inside GMS indefinitely. The bus provides no automatic cleanup.
 - **Tag matching is exact.** This is a GMS constraint, not a bus design gap.
