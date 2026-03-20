@@ -4,13 +4,9 @@
 
 This page lists the additions made to the GameCore plugin to support the Quest System. All additions are generic improvements with no quest-specific knowledge — they are useful to any system.
 
-Each item links to where it is fully specified within the GameCore specifications.
-
 ---
 
-## Changes Made
-
-### `IGroupProvider` + `UGroupProviderDelegates`
+## `IGroupProvider` + `UGroupProviderDelegates`
 
 **Location:** [`GameCore Specifications/GameCore Core/GroupProvider.md`](../GameCore%20Core/GroupProvider.md)
 
@@ -18,25 +14,23 @@ A generic interface for reading group membership data. Implemented on `APlayerSt
 
 ---
 
-### `FRequirementPayload` + `FRequirementContext` additions
+## `FRequirementPayload` + `FRequirementContext::PersistedData`
 
-**Location:** [`GameCore Specifications/Requirement System`](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
+**Location:** [Requirement System — Supporting Types](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-`FRequirementPayload` is a new USTRUCT carrying keyed counters and floats injected into `FRequirementContext::PersistedData` before evaluation. `FRequirementContext` gains two new fields: `PersistedData` (the payload map) and `QuestComponent` (cached pointer for quest requirement fast-path). Full spec in the Requirement System overview.
-
----
-
-### `URequirement_Persisted` (abstract base class)
-
-> **Status: Not yet specified in the Requirement System spec files.**
->
-> `URequirement_Persisted` is an abstract `URequirement` subclass that seals `Evaluate()` and routes evaluation through `EvaluateWithPayload(Context, Payload)` after performing the `PersistedData` key lookup. It lives in `GameCore/Source/GameCore/Requirements/RequirementPersisted.h`.
->
-> The class definition exists in [`GameCore Specifications/Quest System/GameCore Changes (legacy).md`] as an interim reference. It must be moved into the Requirement System sub-page (`URequirement — Base Class`) when that file is updated.
+`FRequirementPayload` carries keyed counters and floats injected into `FRequirementContext::PersistedData` before evaluation. `PersistedData` is a `TMap<FGameplayTag, FRequirementPayload>` — domain-namespaced to prevent key collisions between independent systems injecting into the same context. Full specification and design rationale in the Requirement System sub-pages.
 
 ---
 
-### `UQuestTransitionRule` + `UQuestStateNode`
+## `URequirement_Persisted`
+
+**Location:** [Requirement System — `URequirement` Base Class](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
+
+Abstract `URequirement` subclass that seals `Evaluate()` and routes to `EvaluateWithPayload(Context, Payload)` after performing the `PersistedData` domain key lookup. Lives in `GameCore/Requirements/Requirement.h`. Fully specified in the Requirement System spec — no longer an interim reference.
+
+---
+
+## `UQuestTransitionRule` + `UQuestStateNode`
 
 **Location:** [`GameCore Specifications/State Machine System`](../State%20Machine%20System%20318d261a36cf81859d55c7ad0bc3533a.md) — see **Extension Pattern** section.
 
@@ -48,7 +42,7 @@ A generic interface for reading group membership data. Implemented on `APlayerSt
 
 ## RequirementEvent Tags Added by the Quest Module
 
-These tags are defined in the Quest module's `DefaultGameplayTags.ini`, not in GameCore. They are listed here for cross-reference.
+Defined in the Quest module's `DefaultGameplayTags.ini`, not in GameCore. Listed here for cross-reference.
 
 ```ini
 +GameplayTagList=(Tag="RequirementEvent.Quest.TrackerUpdated")
