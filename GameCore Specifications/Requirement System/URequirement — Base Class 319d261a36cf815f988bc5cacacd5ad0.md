@@ -2,7 +2,7 @@
 
 **Sub-page of:** [Requirement System](../Requirement%20System%20318d261a36cf8170a13ff15cbade3f20.md)
 
-`URequirement` is the abstract base class for all evaluatable conditions in the Requirement System. It defines the synchronous and asynchronous evaluation contracts that every concrete requirement type implements. It is never instantiated directly — only its subclasses appear in class pickers and Data Assets.
+`URequirement` is the abstract base class for all evaluatable conditions in the Requirement System. It defines the synchronous and asynchronous evaluation contracts, the watcher invalidation contract, and the monotonic cache hint. It is never instantiated directly — only its subclasses appear in class pickers and Data Assets.
 
 **File:** `Requirements/Requirement.h / .cpp`
 
@@ -12,116 +12,112 @@
 
 ```cpp
 // Abstract: cannot be instantiated directly. Only subclasses appear in class pickers.
-// EditInlineNew: instances can be created and owned inline inside UPROPERTY arrays and
-//               single pointers marked Instanced. This is what makes the Details panel
-//               class picker work for TArray<TObjectPtr<URequirement>>.
-// CollapseCategories: flattens the subclass's UPROPERTY categories one level in the
-//                     Details panel, keeping the authoring UI compact.
-UCLASS(Abstract, EditInlineNew, CollapseCategories)
+// EditInlineNew: enables class picker and inline creation in Details panel.
+// CollapseCategories: flattens subclass property categories one level in Details panel.
+UCLASS(Abstract, EditInlineNew, CollapseCategories, BlueprintType, Blueprintable)
 class GAMECORE_API URequirement : public UObject
 {
     GENERATED_BODY()
 
 public:
-    // ── Data Authority ─────────────────────────────────────────────────────
+    // ── Watcher / Cache Hint ──────────────────────────────────────────────────
 
-    // Declares where this requirement's data lives at runtime.
-    // Used by ValidateRequirements to detect invalid list/requirement authority
-    // combinations at BeginPlay in development builds.
+    // When true: this requirement can only ever go from Fail to Pass — never back.
+    // The watcher permanently caches the Pass result after the first successful
+    // evaluation, skipping all future re-evaluations for that requirement.
     //
-    //   ClientOnly  — reads only locally available data (replicated PlayerState,
-    //                 local component state, UI state). Safe in ClientOnly and
-    //                 ClientValidated lists.
-    //   ServerOnly  — reads data that only exists on the server (non-replicated
-    //                 subsystems, authoritative DB queries). Must only appear in
-    //                 ServerOnly lists. In ClientValidated or ClientOnly lists this
-    //                 requirement would optimistically pass on the client, which is
-    //                 a design error — ValidateRequirements will log an error.
-    //   Both        — has a meaningful, correct evaluation on both sides. The
-    //                 implementor is responsible for returning appropriate results
-    //                 from Evaluate() depending on whether called on server or client.
+    // Common monotonic requirements: MinLevel, QuestCompleted, AchievementUnlocked.
+    // Non-monotonic: item possession, tag presence, cooldowns, time windows.
     //
-    // Default: Both. This is the safe default — it forces authors of ServerOnly
-    // requirements to opt-in explicitly rather than silently misfiring.
+    // Set in CDO constructor or via the Details panel. Default: false.
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Requirement")
+    bool bIsMonotonic = false;
+
+    // Declares which GameplayTag events invalidate this requirement's cached result.
+    // Called once at RegisterSet time — never per-frame.
+    //
+    // Return empty if this requirement is always evaluated on-demand only
+    // (i.e. never registered with the Watcher System).
+    //
+    // Tags must be in the RequirementEvent.* namespace. Each module defines its own
+    // sub-namespace in DefaultGameplayTags.ini — never in a central file.
+    //
+    // Cache FGameplayTag handles via UGameplayTagsManager::AddNativeGameplayTag
+    // at module startup — do not use RequestGameplayTag on a hot path.
+    UFUNCTION(BlueprintNativeEvent, Category = "Requirement")
+    void GetWatchedEvents(FGameplayTagContainer& OutEvents) const;
+    virtual void GetWatchedEvents_Implementation(FGameplayTagContainer& OutEvents) const {}
+
+    // ── Data Authority ────────────────────────────────────────────────────────
+
+    // Declares where this requirement reads its data from at runtime.
+    // Used by ValidateRequirements to detect invalid authority combinations.
+    //
+    //   ClientOnly  — reads only replicated data available locally.
+    //                 Safe in ServerOnly, ClientOnly, and ClientValidated lists.
+    //   ServerOnly  — reads non-replicated server-only data.
+    //                 Must only appear in ServerOnly lists.
+    //   Both        — meaningful and correct on both sides.
+    //                 Safe in any list authority.
+    //
+    // Default: Both. Safe default — forces authors of ServerOnly requirements
+    // to opt in explicitly rather than silently misfiring on clients.
     virtual ERequirementDataAuthority GetDataAuthority() const
     {
         return ERequirementDataAuthority::Both;
     }
 
-    // ── Synchronous Evaluation ──────────────────────────────────────────────────
+    // ── Synchronous Evaluation ────────────────────────────────────────────────
 
     // Evaluate this condition synchronously against the provided context.
-    // Must return immediately. Must be const and stateless — no mutation of the
-    // URequirement instance is permitted.
+    // Must return immediately. Must be const — no mutation of the URequirement instance.
     //
-    // Default implementation returns Fail. This is intentional:
-    //   - Pure virtual would force async-only subclasses to provide a dead sync body.
-    //   - Defaulting to Fail means an incomplete override is a safe, visible failure
-    //     rather than a silent pass.
-    //
-    // Override in every sync subclass. If your subclass is async-only, keep this
-    // default or override it to return a pending/checking result for client display.
+    // Default implementation returns Fail. Intentional:
+    //   - Async-only subclasses can keep this default without a dead body.
+    //   - An incomplete override is a visible failure, not a silent pass.
     virtual FRequirementResult Evaluate(const FRequirementContext& Context) const;
 
-    // ── Async Evaluation ─────────────────────────────────────────────────────
+    // ── Async Evaluation ──────────────────────────────────────────────────────
 
     // Returns true if this requirement needs async evaluation.
-    // Default: false. Override to return true alongside EvaluateAsync when the
-    // condition depends on data that is not resident in memory at evaluation time.
-    //
-    // URequirementLibrary::EvaluateAllAsync calls this to decide whether to dispatch
-    // EvaluateAsync or call Evaluate directly.
-    //
-    // Never return true from IsAsync() without also overriding EvaluateAsync.
+    // Never return true without also overriding EvaluateAsync.
     virtual bool IsAsync() const { return false; }
 
     // Async evaluation entry point. Called by URequirementLibrary::EvaluateAllAsync
     // only when IsAsync() returns true.
     //
-    // CONTRACT — implementors must follow these rules exactly:
+    // CONTRACT:
     //   1. OnComplete must be called EXACTLY ONCE.
     //   2. OnComplete must be called on the GAME THREAD.
-    //   3. OnComplete must be called within a reasonable timeout.
-    //      If the backend does not respond, fire OnComplete with Fail.
-    //   4. Never capture FRequirementContext by reference in a lambda.
-    //      The context is a stack variable at the call site — it may be
-    //      destroyed before the callback fires. Capture specific values only.
+    //   3. OnComplete must fire within a bounded timeout — use MakeGuardedCallback.
+    //   4. Never capture FRequirementContext by reference. It is a stack variable.
     //
-    // Prefer MakeGuardedCallback() to wrap OnComplete — it enforces rules 1 and 3
-    // automatically and is null-safe if this object is GC'd before the callback fires.
-    //
-    // Default implementation: calls Evaluate() synchronously and fires OnComplete
-    // immediately. Subclasses with IsAsync() == true must override this.
+    // Default: calls Evaluate() synchronously and fires OnComplete immediately.
+    // Subclasses with IsAsync() == true must override this.
     virtual void EvaluateAsync(
         const FRequirementContext& Context,
         TFunction<void(FRequirementResult)> OnComplete) const;
 
-    // ── Editor ────────────────────────────────────────────────────────────
+    // ── Editor ────────────────────────────────────────────────────────────────
 
 #if WITH_EDITOR
-    // Human-readable description of this requirement instance, used by editor tooling
-    // and the URequirement_Composite Details panel tooltip.
-    // Examples: "MinLevel >= 20", "Has Tag: Status.QuestReady", "Quest Completed: TreasureHunt"
-    // Default: returns the class DisplayName. Override in every concrete subclass
-    // to include the configured property values.
+    // Human-readable description of this requirement instance.
+    // Include configured property values: "MinLevel >= 20", "Has Tag: Status.QuestReady".
+    // Default: returns the class DisplayName.
     virtual FString GetDescription() const;
 #endif
 
 protected:
-    // ── Async Helper ──────────────────────────────────────────────────────
+    // ── Async Safety Helper ───────────────────────────────────────────────────
 
-    // Wraps OnComplete with three safety guarantees:
-    //   1. Once-only: subsequent calls after the first are silent no-ops.
-    //   2. Timeout: if TimeoutSeconds elapse with no result, fires Fail(TimeoutReason)
-    //      automatically on the game thread.
+    // Wraps OnComplete with three guarantees:
+    //   1. Once-only: subsequent calls after the first are no-ops.
+    //   2. Timeout: fires Fail(TimeoutReason) after TimeoutSeconds if no result arrives.
     //   3. Null-safe: if this URequirement is GC'd before the callback fires,
     //      the timer is cancelled and OnComplete is never called.
     //
-    // Always use this in EvaluateAsync implementations — do not manage these
-    // guarantees manually.
-    //
-    // TimeoutSeconds default (5.0f) is appropriate for backend round-trips. Reduce
-    // for requirements with tighter latency budgets (e.g. local cache queries).
+    // Always call this before any early-return path in EvaluateAsync.
+    // The timeout clock starts at the call to MakeGuardedCallback.
     TFunction<void(FRequirementResult)> MakeGuardedCallback(
         TFunction<void(FRequirementResult)> OnComplete,
         float TimeoutSeconds = 5.0f,
@@ -131,118 +127,108 @@ protected:
 
 ---
 
-# `ERequirementDataAuthority`
+# `URequirement_Persisted` — Payload-Reading Base Class
 
-Defined in `Requirements/Requirement.h` alongside `URequirement`.
+**File:** `Requirements/RequirementPersisted.h / .cpp`
+
+An abstract intermediate class for any requirement that reads from `FRequirementContext::PersistedData`. Seals `Evaluate()` as `final` so subclasses cannot bypass the domain-key lookup. Subclasses implement `EvaluateWithPayload(Context, Payload)` instead.
 
 ```cpp
-UENUM()
-enum class ERequirementDataAuthority : uint8
+UCLASS(Abstract)
+class GAMECORE_API URequirement_Persisted : public URequirement
 {
-    // Reads only locally available data: replicated PlayerState fields,
-    // replicated components, local UI state.
-    // Safe in ServerOnly, ClientOnly, and ClientValidated lists.
-    ClientOnly,
+    GENERATED_BODY()
 
-    // Reads data that only exists on the server: non-replicated subsystems,
-    // authoritative DB state, server-only component fields.
-    // Must only appear in ServerOnly lists.
-    // In ClientValidated or ClientOnly lists this requirement cannot be evaluated
-    // on the client — ValidateRequirements treats this as a design error.
-    ServerOnly,
+public:
+    // Domain tag used to look up FRequirementPayload in FRequirementContext::PersistedData.
+    // Must match the key the owning system injects before calling Evaluate.
+    // For quest requirements: this is the QuestId tag.
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Requirement",
+        meta = (Categories = "Quest.Id"))
+    FGameplayTag PayloadKey;
 
-    // Has a correct, meaningful evaluation on both server and client.
-    // The implementor handles any difference in available data inside Evaluate().
-    // Safe in any list authority.
-    Both,
+    // Sealed. Subclasses must not override this — override EvaluateWithPayload instead.
+    // Performs the PersistedData lookup and delegates to EvaluateWithPayload.
+    virtual FRequirementResult Evaluate(const FRequirementContext& Context) const final override;
+
+    // Override this in subclasses. Called after the domain payload has been found.
+    // Payload is the FRequirementPayload stored under PayloadKey in Context.PersistedData.
+    virtual FRequirementResult EvaluateWithPayload(
+        const FRequirementContext& Context,
+        const FRequirementPayload& Payload) const PURE_VIRTUAL(
+            URequirement_Persisted::EvaluateWithPayload, return FRequirementResult::Fail(););
+
+    // Data is built from replicated runtime state — available on both sides.
+    virtual ERequirementDataAuthority GetDataAuthority() const override
+    {
+        return ERequirementDataAuthority::Both;
+    }
 };
 ```
 
----
-
-# Watcher System Integration
-
-## `bIsMonotonic`
-
-Mark a requirement monotonic when the condition can only ever go from `false` to `true` and never revert. The watcher permanently caches the `Pass` result after the first successful evaluation, skipping all future re-evaluations for that requirement in that set.
-
-Common monotonic requirements: `URequirement_MinLevel`, `URequirement_QuestCompleted`, achievement checks.
-
-Do **not** mark monotonic: item possession, tag presence, time-of-day windows, cooldowns — anything the player can lose or that changes over time.
-
-## `GetWatchedEvents`
-
-Each module defines its invalidation event tags in `DefaultGameplayTags.ini` under the `RequirementEvent` namespace:
-
-```
-; In Leveling module's DefaultGameplayTags.ini
-+GameplayTagList=(Tag="RequirementEvent.Leveling.LevelChanged", DevComment="Player level changed")
-
-; In Inventory module's DefaultGameplayTags.ini  
-+GameplayTagList=(Tag="RequirementEvent.Inventory.ItemAdded", DevComment="Item added to inventory")
-+GameplayTagList=(Tag="RequirementEvent.Inventory.ItemRemoved", DevComment="Item removed from inventory")
-```
-
-Then the requirement declares which tags invalidate it:
+## Implementation
 
 ```cpp
-void URequirement_MinLevel::GetWatchedEvents_Implementation(FGameplayTagContainer& OutEvents) const
+FRequirementResult URequirement_Persisted::Evaluate(const FRequirementContext& Context) const
 {
-    OutEvents.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged"));
-}
-
-void URequirement_HasItem::GetWatchedEvents_Implementation(FGameplayTagContainer& OutEvents) const
-{
-    OutEvents.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Inventory.ItemAdded"));
-    OutEvents.AddTag(FGameplayTag::RequestGameplayTag("RequirementEvent.Inventory.ItemRemoved"));
+    const FRequirementPayload* Payload = Context.PersistedData.Find(PayloadKey);
+    if (!Payload)
+    {
+        // Payload was not injected. This is an authoring error — the owning system
+        // forgot to build the context. Fail loudly in non-shipping builds.
+        ensureMsgf(false,
+            TEXT("URequirement_Persisted: PayloadKey '%s' not found in PersistedData."
+                 " Did the owning system inject its payload before calling Evaluate?"),
+            *PayloadKey.ToString());
+        return FRequirementResult::Fail(
+            LOCTEXT("PayloadMissing", "Required progress data is unavailable."));
+    }
+    return EvaluateWithPayload(Context, *Payload);
 }
 ```
-
-The watcher subscribes to exactly these tags — no more. Precision subscriptions keep per-event cost O(watching sets), not O(all sets).
 
 ---
 
 # Implementing a Sync Requirement
 
-The minimal pattern for a synchronous requirement subclass:
-
 ```cpp
-// UCLASS specifiers required on every concrete subclass:
-//   EditInlineNew  — inherited from URequirement, but must be re-declared
-//                    if you add any specifiers to the UCLASS macro.
-//   DisplayName    — shown in the class picker. Always provide a human-readable name.
 UCLASS(DisplayName = "Minimum Player Level")
 class URequirement_MinLevel : public URequirement
 {
     GENERATED_BODY()
-
 public:
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Requirement",
-        meta = (ClampMin = "1"))
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Requirement", meta = (ClampMin = "1"))
     int32 MinLevel = 1;
 
-    // This data is replicated to the client — safe in any list authority.
     virtual ERequirementDataAuthority GetDataAuthority() const override
     {
+        // Level is replicated to the client — safe everywhere.
         return ERequirementDataAuthority::Both;
     }
 
     virtual FRequirementResult Evaluate(const FRequirementContext& Context) const override
     {
-        // Retrieve data from context fields or subsystem lookup.
-        // Never from a stored instance variable — URequirement is stateless.
-        if (!Context.PlayerState) return FRequirementResult::Fail();
+        if (!Context.PlayerState)
+            return FRequirementResult::Fail();
 
-        ULevelingComponent* Leveling = Context.PlayerState->FindComponentByClass<ULevelingComponent>();
-        if (!Leveling) return FRequirementResult::Fail();
+        ULevelingComponent* Leveling =
+            Context.PlayerState->FindComponentByClass<ULevelingComponent>();
+        if (!Leveling)
+            return FRequirementResult::Fail();
 
         if (Leveling->GetCurrentLevel() < MinLevel)
         {
-            return FRequirementResult::Fail(FText::Format(
-                LOCTEXT("MinLevel_Failed", "Requires level {0}"),
-                FText::AsNumber(MinLevel)));
+            return FRequirementResult::Fail(
+                FText::Format(LOCTEXT("MinLevel_Fail", "Requires level {0}"),
+                    FText::AsNumber(MinLevel)));
         }
         return FRequirementResult::Pass();
+    }
+
+    virtual void GetWatchedEvents_Implementation(FGameplayTagContainer& OutEvents) const override
+    {
+        OutEvents.AddTag(
+            FGameplayTag::RequestGameplayTag("RequirementEvent.Leveling.LevelChanged"));
     }
 
 #if WITH_EDITOR
@@ -258,20 +244,15 @@ public:
 
 # Implementing an Async Requirement
 
-Async requirements must use `MakeGuardedCallback` to wrap the `OnComplete` delegate. This eliminates the three most common async implementor mistakes: forgetting a timeout, accidentally calling `OnComplete` twice, and capturing a raw `this` pointer in a lambda.
-
 ```cpp
 UCLASS(DisplayName = "Backend Entitlement")
 class URequirement_BackendEntitlement : public URequirement
 {
     GENERATED_BODY()
-
 public:
     UPROPERTY(EditDefaultsOnly, Category = "Requirement")
     FName EntitlementId;
 
-    // Reads authoritative entitlement data — server-only.
-    // Must not appear in ClientOnly or ClientValidated lists.
     virtual ERequirementDataAuthority GetDataAuthority() const override
     {
         return ERequirementDataAuthority::ServerOnly;
@@ -283,17 +264,19 @@ public:
         const FRequirementContext& Context,
         TFunction<void(FRequirementResult)> OnComplete) const override
     {
-        // Wrap immediately — timeout and once-only guarantee are now handled.
+        // Wrap immediately — timeout and once-only guarantee active from this point.
         auto SafeCallback = MakeGuardedCallback(MoveTemp(OnComplete), 5.0f);
 
-        // Capture only what the lambda needs. Never capture Context by reference.
+        // Capture only specific values — never capture Context by reference.
         FName CapturedId = EntitlementId;
         APlayerState* PS = Context.PlayerState;
 
-        UEntitlementSubsystem* Subsystem = Context.World->GetSubsystem<UEntitlementSubsystem>();
+        UEntitlementSubsystem* Subsystem =
+            Context.World->GetSubsystem<UEntitlementSubsystem>();
         if (!Subsystem)
         {
-            SafeCallback(FRequirementResult::Fail(LOCTEXT("NoSubsystem", "Entitlement service unavailable.")));
+            SafeCallback(FRequirementResult::Fail(
+                LOCTEXT("NoSubsystem", "Entitlement service unavailable.")));
             return;
         }
 
@@ -314,54 +297,59 @@ public:
 };
 ```
 
-Key points:
-- Call `MakeGuardedCallback` **before** any early-return paths so the timeout starts immediately.
-- Capture specific values from `Context`, never the context struct itself by reference.
-- `GetDataAuthority()` returns `ServerOnly` — `ValidateRequirements` will catch this at BeginPlay if someone places it in a `ClientValidated` list.
+**Key points:**
+- Call `MakeGuardedCallback` **before** any early-return path so the timeout starts immediately.
+- Capture specific values from `Context` — never the struct itself by reference.
+- Async requirements must not appear in watcher-registered sets (flush calls sync `Evaluate` only).
+
+---
+
+# Async Evaluation Flow
+
+```
+URequirementLibrary::EvaluateAllAsync(Requirements, Context, OnComplete)
+  │
+  ├── For each sync requirement (IsAsync() == false):
+  │     Call Evaluate() immediately
+  │     On Fail + FailFast mode: fire OnComplete(Fail), discard remaining ops
+  │
+  ├── For each async requirement (IsAsync() == true):
+  │     Call EvaluateAsync(Context, WrappedCallback)
+  │       → Implementor calls MakeGuardedCallback internally
+  │       → Backend query dispatched
+  │       → Callback fires on game thread (guaranteed by contract)
+  │
+  └── When all results received:
+        Combine results per Operator (AND: all pass / OR: any pass)
+        Fire OnComplete(CombinedResult) on game thread
+```
 
 ---
 
 # UCLASS Specifiers Reference
 
 | Specifier | Set on base | Required on subclass | Effect |
-| --- | --- | --- | --- |
-| `Abstract` | Yes | No (do not inherit) | Prevents direct instantiation of `URequirement` |
-| `EditInlineNew` | Yes | Inherited | Enables class picker and inline creation in Details panel |
-| `CollapseCategories` | Yes | Inherited | Flattens property categories one level in Details panel |
-| `DisplayName` | No | **Yes** | Sets the name shown in the class picker |
+|---|---|---|---|
+| `Abstract` | Yes | **Never** — prevents instantiation | Blocks direct `URequirement` creation |
+| `EditInlineNew` | Yes | Inherited | Enables class picker in Details panel |
+| `CollapseCategories` | Yes | Inherited | Flattens property categories |
+| `DisplayName` | No | **Required** | Sets name shown in class picker |
+| `Blueprintable` | Yes (on base) | Inherited | Allows Blueprint subclassing |
 
-> **Do not re-declare `Abstract` on subclasses.** It prevents the subclass from being instantiated. Only the base class carries this specifier.
-> 
+> **Do not re-declare `Abstract` on subclasses.** It prevents the subclass from being instantiated.
 
 ---
 
 # Statelessness Contract
 
-`URequirement` instances are authored in Data Assets and shared across many evaluation calls. They must never carry per-evaluation or per-player state. The following are prohibited as instance variables:
+`URequirement` instances are authored in Data Assets and shared across concurrent evaluations for many players. The following are **prohibited** as instance variables:
 
-- `TObjectPtr` or raw pointers to runtime actors, components, or UObjects (use `Context` fields instead)
+- Pointers to runtime actors, components, or UObjects
 - Cached results from previous evaluations
-- Frame counters, timestamps, or accumulated values
+- Frame counters, timestamps, or accumulated per-player values
 
-Allowed as instance (configuration) variables:
+**Allowed** as instance (configuration) variables:
 
 - `FGameplayTag`, `FName`, `FText` — pure data identifiers
 - `int32`, `float`, `bool` — threshold values configured in the asset
 - `TSoftObjectPtr`, `TSoftClassPtr` — soft references to assets, loaded on demand
-
----
-
-# Adding a New Requirement Type — Checklist
-
-1. Subclass `URequirement` inside the module that owns the data being queried.
-2. Add `DisplayName = "..."` and `Blueprintable` to the `UCLASS` macro.
-3. Add `"Requirements"` to `PublicDependencyModuleNames` in the module's `Build.cs`.
-4. Declare configuration properties as `EditDefaultsOnly BlueprintReadOnly UPROPERTY`.
-5. Override `GetDataAuthority()` to return `ClientOnly`, `ServerOnly`, or `Both`. This is mandatory — `Both` is only correct if the requirement genuinely evaluates correctly on both sides from replicated data.
-6. Override `Evaluate` (sync) or `IsAsync` + `EvaluateAsync` (async). For async, wrap `OnComplete` with `MakeGuardedCallback`.
-7. Override `GetWatchedEvents_Implementation` to declare which `RequirementEvent.*` tags invalidate this requirement. Return empty if on-demand only.
-8. Set `bIsMonotonic = true` in the class CDO constructor if the condition can never revert once passed.
-9. Override `GetDescription()` inside `#if WITH_EDITOR`.
-10. Done — UE's reflection system discovers the subclass automatically when its module is loaded.
-
-**No central registry. No factory. No modification to `URequirement` itself.**
