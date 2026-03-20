@@ -22,7 +22,7 @@ The Requirement System is a data-driven, polymorphic condition evaluation layer.
 - **Requirements are definitions, not instances.** `URequirement` objects are authored inside Data Assets and loaded once. They carry no per-player state. The same object is evaluated against many players using only data passed in via `FRequirementContext`.
 - **Synchronous by default, async by exception.** `Evaluate` must return immediately for the vast majority of requirements. `EvaluateAsync` exists only for conditions whose data is genuinely not resident in memory at evaluation time.
 - **Authority lives on the server.** Systems that gate gameplay actions must evaluate requirements server-side. Client-side evaluation is permitted only for display and UI gating — it is never the authoritative decision.
-- **No cross-system imports at the base layer.** `URequirement` and `URequirementLibrary` in `Requirements/` have zero dependencies on other GameCore modules. Each module that provides requirement types owns those types inside its own folder.
+- **No cross-system imports at the base layer.** `URequirement` and `URequirementLibrary` in `Requirements/` have zero dependencies on other GameCore modules. `FRequirementContext` must never include a typed pointer to any class outside `Requirements/`. Each module that provides requirement types owns those types inside its own folder.
 - **Events are GameplayTags, not enums.** Each module registers its own invalidation event tags under `RequirementEvent.*`. The watcher system uses these tags as keys — zero coupling between modules.
 - **Composites replace hardcoded logic.** Complex AND/OR/NOT conditions are expressed as `URequirement_Composite` trees — not as custom C++ evaluators with baked-in boolean logic.
 - **Watcher evaluation is push-invalidated, pull-evaluated.** Requirements never poll. When a relevant event fires, the affected requirement set is marked dirty. Evaluation runs on the next throttled flush, not on every event.
@@ -93,7 +93,7 @@ struct GAMECORE_API FRequirementPayload
 
 **File:** `Requirements/RequirementContext.h`
 
-A plain USTRUCT passed by const reference to every `Evaluate` call.
+A plain USTRUCT passed by const reference to every `Evaluate` call. This struct lives in `Requirements/` and must have **zero typed dependencies on other GameCore modules or game modules**. Never add a field whose type is defined outside `Requirements/`, `Engine`, or `GameplayTags` — use `PlayerState->FindComponentByClass<T>()` inside the requirement subclass instead.
 
 ```cpp
 USTRUCT(BlueprintType)
@@ -117,24 +117,13 @@ struct GAMECORE_API FRequirementContext
     // Empty for contexts not built by a system that uses payload injection.
     UPROPERTY()
     TMap<FGameplayTag, FRequirementPayload> PersistedData;
-
-    // Cached pointer to the owning player's UQuestComponent.
-    // Set by UQuestComponent::BuildRequirementContext.
-    // Allows quest requirements (URequirement_QuestCompleted,
-    // URequirement_ActiveQuestCount, URequirement_QuestCooldown) to access
-    // quest state directly without calling FindComponentByClass on every evaluation.
-    // Null when the context is not built by UQuestComponent — requirements
-    // must null-check and fall back to FindComponentByClass when null.
-    UPROPERTY()
-    TObjectPtr<UQuestComponent> QuestComponent = nullptr;
 };
 ```
 
 **Rules for adding fields:**
-- Only add a field when at least two shipped requirement types require it.
-- A field needed by only one subclass belongs in that subclass via subsystem or component lookup.
-- Never add game-specific types here that would create a dependency from `Requirements/` on a game module.
-- The `QuestComponent` field is acceptable because `UQuestComponent` is part of GameCore. Game-module-specific component types must not be added here.
+- Only add a field when at least two shipped requirement types require it AND the type is defined in `Engine`, `GameplayTags`, or `Requirements/` itself.
+- A requirement that needs a specific component (e.g. `UQuestComponent`, `UInventoryComponent`) must retrieve it via `Context.PlayerState->FindComponentByClass<T>()` inside its own `Evaluate` override. That lookup cost is acceptable — evaluations are not per-frame.
+- Never add a typed pointer to any module-specific class here. `FRequirementContext` must compile with no includes beyond Engine and GameplayTags.
 
 ---
 
@@ -236,9 +225,9 @@ Full specification: see sub-page **Watcher System**.
 | `URequirement_Composite` | Composite (AND / OR / NOT) | `Requirements/` | Boolean logic tree |
 | `URequirement_Persisted` | *(abstract)* | `Requirements/` | Base for payload-reading requirements |
 | `URequirement_HasTag` | Has Gameplay Tag | `Tags/` | Reads replicated tag state |
-| `URequirement_QuestCompleted` | Quest Completed | `Quest/Requirements/` | Reads `CompletedQuestTags` |
-| `URequirement_QuestCooldown` | Quest Cooldown | `Quest/Requirements/` | Reads `LastCompletedTimestamp` via context |
-| `URequirement_ActiveQuestCount` | Active Quest Capacity | `Quest/Requirements/` | Reads `ActiveQuests` count |
+| `URequirement_QuestCompleted` | Quest Completed | `Quest/Requirements/` | Reads `CompletedQuestTags` from `UQuestComponent` via `FindComponentByClass` |
+| `URequirement_QuestCooldown` | Quest Cooldown | `Quest/Requirements/` | Reads `LastCompletedTimestamp` from `UQuestComponent` via `FindComponentByClass` |
+| `URequirement_ActiveQuestCount` | Active Quest Capacity | `Quest/Requirements/` | Reads `ActiveQuests` count from `UQuestComponent` via `FindComponentByClass` |
 
 ---
 
@@ -279,8 +268,8 @@ GameCore/
     ├── Requirements/                               ← Core. Zero outgoing dependencies.
     │   ├── Requirement.h / .cpp                    ← URequirement base
     │   ├── RequirementContext.h                    ← FRequirementContext, FRequirementResult
-    │   ├── RequirementPayload.h                    ← FRequirementPayload (NEW)
-    │   ├── RequirementPersisted.h / .cpp           ← URequirement_Persisted (NEW)
+    │   ├── RequirementPayload.h                    ← FRequirementPayload
+    │   ├── RequirementPersisted.h / .cpp           ← URequirement_Persisted
     │   ├── RequirementComposite.h / .cpp           ← URequirement_Composite
     │   ├── RequirementLibrary.h / .cpp             ← URequirementLibrary
     │   ├── RequirementSet.h / .cpp                 ← URequirementSet, URequirementList
@@ -300,7 +289,7 @@ GameCore/
 
 # Known Limitations
 
-- **`FRequirementContext` field growth.** Resist adding fields. If a requirement needs a reference not in the context, prefer subsystem or component lookup.
+- **`FRequirementContext` field growth.** Resist adding fields. If a requirement needs a reference not in the context, retrieve it via `PlayerState->FindComponentByClass<T>()` inside the requirement subclass. That is the correct and only acceptable pattern.
 - **Async timeout is implementor's responsibility.** The library has no global async timeout. Each async requirement must guard against backend non-response.
 - **`EvaluateAllAsync` has no cancellation token.** Guard with `TWeakObjectPtr` capture in the lambda.
 - **Blueprint subclassing is unvalidated at edit time.** Blueprint requirements on hot evaluation paths should be moved to C++ before shipping.
