@@ -1,14 +1,13 @@
 # JournalTypes
 
-**File:** `GameCore/Source/GameCore/Journal/JournalTypes.h`
-
-All shared structs, message structs, and delegate declarations for the Journal System. No `.cpp` needed — header-only.
+**File:** `GameCore/Source/GameCore/Journal/JournalTypes.h`  
+**Purpose:** All plain data types, message structs, and delegate declarations used by the Journal System.
 
 ---
 
 ## `FJournalEntryHandle`
 
-The atomic unit of the journal. Stored in the persisted array and sent to the client. Contains no content — only identity and acquisition time.
+The atomic unit of the journal. Stored in `ServerPersistenceBuffer` (server) and `Entries` (client). Contains **no content** — only identity and acquisition time.
 
 ```cpp
 // JournalTypes.h
@@ -18,30 +17,32 @@ struct GAMECORE_API FJournalEntryHandle
     GENERATED_BODY()
 
     // Unique identity of this entry type. Maps to a UJournalEntryDataAsset
-    // via UJournalRegistrySubsystem. Replicates as a network index — never a string.
+    // via UJournalRegistrySubsystem::GetEntryAsset(). Replicates as a
+    // network index — never a string.
     UPROPERTY(BlueprintReadOnly)
     FGameplayTag EntryTag;
 
-    // Top-level track. Used for tab filtering on the client.
+    // Top-level track this entry belongs to. Used for tab filtering on the client.
     // e.g. Journal.Track.Books | Journal.Track.Adventure
     UPROPERTY(BlueprintReadOnly)
     FGameplayTag TrackTag;
 
-    // Server UTC unix epoch at time of acquisition.
+    // Server UTC unix epoch (seconds) at time of acquisition.
+    // Used for descending sort in GetPage().
     UPROPERTY(BlueprintReadOnly)
     int64 AcquiredTimestamp = 0;
 };
 ```
 
-> **No `FGuid` per handle.** Identity is `EntryTag`. For repeating entries (daily quests), the same `EntryTag` appears multiple times with different `AcquiredTimestamp` values. Timestamp is sufficient for sort and display.
+> **No `FGuid` per handle.** Identity is `EntryTag`. For repeating entries the same `EntryTag` appears multiple times with different timestamps. Per-acquisition uniqueness is not required.
 
-> **No asset reference in the handle.** `EntryTag` → asset is resolved via `UJournalRegistrySubsystem::GetEntryAsset()` on demand. Keeps the handle small and avoids string paths in replication.
+> **No asset reference in the handle.** `EntryTag` → asset is resolved on demand via `UJournalRegistrySubsystem::GetEntryAsset()`. Keeps the handle small and avoids string paths in replication.
 
 ---
 
 ## `FJournalRenderedDetails`
 
-Output of `IJournalEntry::BuildDetails()`. Contains everything the UI needs to render one entry's content panel.
+Output of `IJournalEntry::BuildDetails()`. Contains everything the UI needs to render one entry's content panel. Heavy assets (textures) are already loaded when this struct is constructed.
 
 ```cpp
 USTRUCT(BlueprintType)
@@ -49,16 +50,16 @@ struct GAMECORE_API FJournalRenderedDetails
 {
     GENERATED_BODY()
 
-    // UE Rich Text markup string. Supports inline images, font styles,
-    // color runs, and custom decorators via URichTextBlock + UDataTable.
+    // UE Rich Text markup string. Compatible with URichTextBlock + UDataTable decorators.
     UPROPERTY(BlueprintReadOnly)
     FText RichBodyText;
 
     // Optional header image displayed above body text.
+    // Loaded by the time BuildDetails calls OnReady.
     UPROPERTY(BlueprintReadOnly)
     TSoftObjectPtr<UTexture2D> HeaderImage;
 
-    // Extend here as needed: voice line cue, ambient audio, etc.
+    // Extend here as needed: audio cue, ambient FX tag, etc.
 };
 ```
 
@@ -66,7 +67,7 @@ struct GAMECORE_API FJournalRenderedDetails
 
 ## `FJournalCollectionProgress`
 
-Result of `UJournalRegistrySubsystem::GetCollectionProgress()`. Always derived at runtime — never stored per player.
+Result of `UJournalRegistrySubsystem::GetCollectionProgress()`. Always derived at runtime — never persisted per player.
 
 ```cpp
 USTRUCT(BlueprintType)
@@ -82,10 +83,10 @@ struct GAMECORE_API FJournalCollectionProgress
 
     float Ratio() const
     {
-        return Total > 0 ? static_cast<float>(Found) / Total : 0.f;
+        return Total > 0 ? static_cast<float>(Found) / static_cast<float>(Total) : 0.f;
     }
 
-    bool IsComplete() const { return Found >= Total && Total > 0; }
+    bool IsComplete() const { return Total > 0 && Found >= Total; }
 };
 ```
 
@@ -96,8 +97,6 @@ struct GAMECORE_API FJournalCollectionProgress
 Event Bus message broadcast by `UJournalComponent::AddEntry()` on the server.
 
 ```cpp
-// Broadcast channel: GameCoreEvent.Journal.EntryAdded
-// Scope: EGameCoreEventScope::ServerOnly
 USTRUCT(BlueprintType)
 struct GAMECORE_API FJournalEntryAddedMessage
 {
@@ -105,7 +104,7 @@ struct GAMECORE_API FJournalEntryAddedMessage
 
     // The PlayerState that received the entry.
     UPROPERTY(BlueprintReadOnly)
-    TObjectPtr<APlayerState> PlayerState;
+    TObjectPtr<APlayerState> PlayerState = nullptr;
 
     // The handle that was added.
     UPROPERTY(BlueprintReadOnly)
@@ -113,10 +112,9 @@ struct GAMECORE_API FJournalEntryAddedMessage
 };
 ```
 
-**Typical consumers (external systems — not Journal System itself):**
-- Achievement system: checks if a collection is now complete
-- Notification system: shows a toast on the client (via `OnEntryAdded` delegate instead)
-- Audio system: plays a discovery sound
+**Channel tag:** `GameCoreEvent.Journal.EntryAdded`  
+**Scope:** `EGameCoreEventScope::ServerOnly`  
+**Broadcast site:** `UJournalComponent::AddEntry()` after `Client_AddEntry` is dispatched.
 
 ---
 
@@ -126,7 +124,7 @@ struct GAMECORE_API FJournalEntryAddedMessage
 // Fired on the client after Client_InitialJournalSync completes.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnJournalSynced);
 
-// Fired on the client when a new entry arrives during the session.
+// Fired on the client when a new entry arrives via Client_AddEntry RPC.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
     FOnJournalEntryAdded, FJournalEntryHandle, NewHandle);
 ```

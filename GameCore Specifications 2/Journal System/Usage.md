@@ -7,37 +7,36 @@
 ```
 ☐ GameCore plugin enabled in .uproject
 ☐ UJournalComponent added to APlayerState constructor
-☐ UPersistenceRegistrationComponent present on APlayerState (shared with other components)
-☐ DefaultGame.ini: JournalEntry and JournalCollection primary asset types registered
-☐ DefaultGameplayTags.ini: tags from Architecture.md copied to plugin and game module ini files
+☐ UPersistenceRegistrationComponent already present on APlayerState (shared)
+☐ JournalEntry and JournalCollection primary asset types registered in DefaultGame.ini
+☐ Gameplay tags copied to DefaultGameplayTags.ini (see Architecture.md)
 ☐ At least one UJournalEntryDataAsset subclass created in game module
-☐ UJournalEntryDataAsset subclasses placed in scanned directory (/Game/Journal/Entries)
-☐ UJournalCollectionDefinition assets created in /Game/Journal/Collections
-☐ A bridge component (or equivalent) on APlayerState subscribes to events and calls AddEntry
+☐ Entry assets placed in Asset Manager scanned directory (/Game/Journal/Entries)
+☐ UJournalCollectionDefinition assets created (/Game/Journal/Collections)
+☐ Bridge component (or equivalent) subscribes to relevant events and calls AddEntry
 ☐ UI binds to OnJournalSynced and OnEntryAdded delegates
 ```
 
 ---
 
-## 1 — APlayerState Setup
+## 1. Setup — APlayerState
 
 ```cpp
 // YourPlayerState.h
 UPROPERTY()
 TObjectPtr<UJournalComponent> JournalComponent;
 
-// YourPlayerState.cpp constructor
+// YourPlayerState.cpp — constructor
 JournalComponent = CreateDefaultSubobject<UJournalComponent>(TEXT("JournalComponent"));
-// UPersistenceRegistrationComponent is shared — already present for other persistable components.
-// JournalComponent registers itself through GetPersistenceKey() automatically.
+// UPersistenceRegistrationComponent is already present from other systems.
+// JournalComponent auto-registers via GetPersistenceKey() on BeginPlay.
 ```
 
 ---
 
-## 2 — Asset Manager Configuration
+## 2. Asset Manager Configuration (DefaultGame.ini)
 
 ```ini
-; DefaultGame.ini
 [/Script/Engine.AssetManagerSettings]
 +PrimaryAssetTypesToScan=(
     PrimaryAssetType="JournalEntry",
@@ -57,24 +56,24 @@ JournalComponent = CreateDefaultSubobject<UJournalComponent>(TEXT("JournalCompon
 
 ---
 
-## 3 — Create Entry Asset Subclasses (Game Module)
+## 3. Create Entry Asset Subclasses (Game Module)
 
-Subclass `UJournalEntryDataAsset` for each entry type:
+Subclass `UJournalEntryDataAsset` for each content type. Lives in the game module, **not** in GameCore.
 
 ```cpp
-// Game module: BookJournalEntryDataAsset.h
+// BookJournalEntryDataAsset.h  (game module)
 UCLASS(BlueprintType)
 class UBookJournalEntryDataAsset : public UJournalEntryDataAsset
 {
     GENERATED_BODY()
 public:
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Book")
+    UPROPERTY(EditDefaultsOnly, Category="Book")
     FText Title;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Book")
-    FText RichText;
+    UPROPERTY(EditDefaultsOnly, Category="Book", meta=(MultiLine=true))
+    FText RichText;  // Authored with UE Rich Text markup
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Book")
+    UPROPERTY(EditDefaultsOnly, Category="Book")
     TSoftObjectPtr<UTexture2D> CoverImage;
 
     // IJournalEntry
@@ -82,7 +81,7 @@ public:
     virtual FGameplayTag GetTrackTag_Implementation() const override { return TrackTag; }
     virtual void BuildDetails(TFunction<void(FJournalRenderedDetails)> OnReady) const override
     {
-        // Books are fully authored — asset is already loaded. No async needed.
+        // Book content is fully inline — no async load required.
         FJournalRenderedDetails Out;
         Out.RichBodyText = RichText;
         Out.HeaderImage  = CoverImage;
@@ -91,117 +90,132 @@ public:
 };
 ```
 
-Set on each asset in the editor:
-- `EntryTag` — unique `Journal.Entry.*` tag
-- `TrackTag` — e.g. `Journal.Track.Books`
+### Quest Entry with Async Load
+
+```cpp
+// QuestJournalEntryDataAsset.h  (game module)
+UCLASS(BlueprintType)
+class UQuestJournalEntryDataAsset : public UJournalEntryDataAsset
+{
+    GENERATED_BODY()
+public:
+    // Soft ref — loaded async on demand only.
+    UPROPERTY(EditDefaultsOnly, Category="Quest")
+    TSoftObjectPtr<UQuestDefinition> QuestDefinition;
+
+    virtual void BuildDetails(TFunction<void(FJournalRenderedDetails)> OnReady) const override
+    {
+        UAssetManager::Get().GetStreamableManager().RequestAsyncLoad(
+            QuestDefinition.ToSoftObjectPath(),
+            [this, OnReady]()
+            {
+                const UQuestDefinition* Def = QuestDefinition.Get();
+                FJournalRenderedDetails Out;
+                Out.RichBodyText = Def ? Def->SummaryText : FText::GetEmpty();
+                Out.HeaderImage  = Def ? Def->QuestImage  : nullptr;
+                OnReady(Out);
+            });
+    }
+};
+```
 
 ---
 
-## 4 — Create Collection Assets (Game Module)
+## 4. Create Collection Assets (Game Module)
 
-In the Content Browser at `/Game/Journal/Collections/`:
-
+In the Content Browser:
 ```
-JC_BooksOfDarkness    CollectionTag=Journal.Collection.BooksOfDarkness
-  TrackTag=Journal.Track.Books
-  Members: [BP_BookEntry_Page1, BP_BookEntry_Page2, BP_BookEntry_Page3]
+/Game/Journal/Collections/
+  DA_Collection_BooksOfDarkness
+    CollectionTag = Journal.Collection.BooksOfDarkness
+    TrackTag      = Journal.Track.Books
+    Members       = [Page1, Page2, Page3, Page4]
 
-JC_AllLore            CollectionTag=Journal.Collection.AllLore
-  TrackTag=Journal.Track.Books
-  SubCollections: [JC_BooksOfDarkness, JC_ScrollsOfFire]
-  Members: [BP_BookEntry_StandaloneEntry]
+  DA_Collection_AllLore
+    CollectionTag   = Journal.Collection.AllLore
+    TrackTag        = Journal.Track.Books
+    Members         = [StandaloneEntry]
+    SubCollections  = [DA_Collection_BooksOfDarkness, DA_Collection_ScrollsOfFire]
 ```
 
 ---
 
-## 5 — Wire the Bridge (Game Module)
+## 5. Wire the Bridge (Game Module)
 
 Create a bridge component on `APlayerState` that subscribes to `UGameCoreEventBus` events and calls `AddEntry`:
 
 ```cpp
-// UJournalTrackerBridge : public UActorComponent (game module)
+// UJournalTrackerBridge : public UActorComponent  (game module)
 void UJournalTrackerBridge::BeginPlay()
 {
     Super::BeginPlay();
     if (!GetOwner()->HasAuthority()) return;
 
-    auto* EventBus = UGameCoreEventBus::Get(this);
-    auto* Journal  = GetOwner()->FindComponentByClass<UJournalComponent>();
-    if (!EventBus || !Journal) return;
+    auto* Bus     = UGameCoreEventBus::Get(this);
+    auto* Journal = GetOwner()->FindComponentByClass<UJournalComponent>();
+    if (!Bus || !Journal) return;
 
     // Quest completed → journal entry
-    QuestHandle = EventBus->StartListening<FQuestCompletedMessage>(
+    QuestHandle = Bus->StartListening<FQuestCompletedMessage>(
         TAG_GameCoreEvent_Quest_Completed,
         [Journal](FGameplayTag, const FQuestCompletedMessage& Msg)
         {
-            // Only react to quests for this player.
-            if (Journal->GetOwner() == Msg.PlayerState)
-            {
-                Journal->AddEntry(
-                    Msg.QuestCompletedTag,
-                    TAG_Journal_Track_Adventure,
-                    true); // repeatable quests allowed
-            }
+            Journal->AddEntry(
+                Msg.QuestCompletedTag,
+                TAG_Journal_Track_Adventure,
+                /*bAllowDuplicates=*/ true);  // repeatable quests allowed
         });
 
-    // Place discovered → non-repeatable journal entry
-    PlaceHandle = EventBus->StartListening<FPlaceDiscoveredMessage>(
+    // Place discovered → non-repeating entry
+    PlaceHandle = Bus->StartListening<FPlaceDiscoveredMessage>(
         TAG_GameCoreEvent_World_PlaceDiscovered,
         [Journal](FGameplayTag, const FPlaceDiscoveredMessage& Msg)
         {
-            if (Journal->GetOwner() == Msg.PlayerState)
-            {
-                Journal->AddEntry(
-                    Msg.PlaceTag,
-                    TAG_Journal_Track_Adventure,
-                    false); // places are non-repeatable
-            }
+            Journal->AddEntry(
+                Msg.PlaceTag,
+                TAG_Journal_Track_Adventure,
+                /*bAllowDuplicates=*/ false);
         });
 }
 
 void UJournalTrackerBridge::EndPlay(const EEndPlayReason::Type Reason)
 {
-    // Always unregister to avoid dangling lambda in the event bus.
-    if (auto* EventBus = UGameCoreEventBus::Get(this))
+    if (auto* Bus = UGameCoreEventBus::Get(this))
     {
-        EventBus->StopListening(QuestHandle);
-        EventBus->StopListening(PlaceHandle);
+        Bus->StopListening(QuestHandle);
+        Bus->StopListening(PlaceHandle);
     }
     Super::EndPlay(Reason);
 }
 ```
 
-> **Do not call `AddEntry` directly from external game code** — route all journal mutations through an event-driven bridge. This keeps the journal decoupled from game-specific systems.
-
 ---
 
-## 6 — Calling AddEntry Directly (Server Authority)
+## 6. Server — Direct AddEntry Call
 
-For simple cases where an event-bus bridge is overkill:
+For systems that don't use the event bus bridge pattern:
 
 ```cpp
-// Server-side only. APlayerState must have authority.
-void AGiveLootInteraction::Execute(APlayerState* Target)
+// Server only — e.g. from an interaction handler
+void AMyInteractable::OnBookRead(APlayerState* PlayerState)
 {
-    // Give item...
-
-    // Record loot discovery in journal.
-    if (UJournalComponent* Journal = Target->FindComponentByClass<UJournalComponent>())
+    if (UJournalComponent* Journal = PlayerState->FindComponentByClass<UJournalComponent>())
     {
+        // Books are non-repeating
         Journal->AddEntry(
-            TAG_Journal_Entry_Loot_GoldenAnchor,  // unique entry tag
-            TAG_Journal_Track_Adventure,
-            false);  // non-repeatable: only record first discovery
+            TAG_Journal_Entry_BookOfShadowsPage1,
+            TAG_Journal_Track_Books,
+            /*bAllowDuplicates=*/ false);
     }
 }
 ```
 
 ---
 
-## 7 — UI: Open Journal Tab and Load First Page
+## 7. UI — Open Journal Tab and Paginate
 
 ```cpp
-// In your journal UI widget (owning client only):
+// In your journal UI widget (client only)
 void UJournalWidget::OpenTab(FGameplayTag TrackTag)
 {
     CurrentTrack      = TrackTag;
@@ -216,10 +230,10 @@ void UJournalWidget::RefreshPage()
         CurrentTrack,
         CurrentCollection,
         CurrentPage,
-        PageSize);
+        /*PageSize=*/ 20);
 
-    int32 TotalCount = JournalComponent->GetFilteredCount(CurrentTrack, CurrentCollection);
-    int32 TotalPages = FMath::CeilToInt((float)TotalCount / PageSize);
+    int32 Total      = JournalComponent->GetFilteredCount(CurrentTrack, CurrentCollection);
+    int32 TotalPages = FMath::DivideAndRoundUp(Total, 20);
 
     PopulateListWithHandles(Handles, TotalPages);
 }
@@ -227,18 +241,21 @@ void UJournalWidget::RefreshPage()
 
 ---
 
-## 8 — UI: Render One Entry's Content
+## 8. UI — Render One Entry's Content
 
 ```cpp
-void UJournalEntryWidget::ShowEntry(FJournalEntryHandle Handle)
+void UJournalEntryWidget::ShowEntry(const FJournalEntryHandle& Handle)
 {
-    // Show loading state immediately — async path may fire next frame.
     SetLoadingState();
 
     auto* Registry = GetGameInstance()->GetSubsystem<UJournalRegistrySubsystem>();
-    TSoftObjectPtr<UJournalEntryDataAsset> AssetRef = Registry->GetEntryAsset(Handle.EntryTag);
+    if (!Registry) return;
 
-    // Asset is likely already in memory (loaded at registry init) — callback fires immediately.
+    TSoftObjectPtr<UJournalEntryDataAsset> AssetRef = Registry->GetEntryAsset(Handle.EntryTag);
+    if (AssetRef.IsNull()) return;
+
+    // Entry asset is likely already in memory (loaded sync at subsystem init).
+    // RequestAsyncLoad is safe even if already loaded — callback fires immediately.
     UAssetManager::Get().GetStreamableManager().RequestAsyncLoad(
         AssetRef.ToSoftObjectPath(),
         [this, AssetRef]()
@@ -246,25 +263,21 @@ void UJournalEntryWidget::ShowEntry(FJournalEntryHandle Handle)
             UJournalEntryDataAsset* Asset = AssetRef.Get();
             if (!Asset) return;
 
-            // Guard: widget may have been destroyed before async load completed.
-            TWeakObjectPtr<UJournalEntryWidget> WeakThis(this);
-            Asset->BuildDetails([WeakThis](FJournalRenderedDetails Details)
+            // BuildDetails loads any referenced heavy assets (textures, quest defs)
+            Asset->BuildDetails([this](FJournalRenderedDetails Details)
             {
-                if (!WeakThis.IsValid()) return;
-                WeakThis->RichTextBlock->SetText(Details.RichBodyText);
+                RichTextBlock->SetText(Details.RichBodyText);
                 if (!Details.HeaderImage.IsNull())
-                    WeakThis->HeaderImage->SetBrushFromSoftTexture(Details.HeaderImage);
-                WeakThis->ClearLoadingState();
+                    HeaderImage->SetBrushFromSoftTexture(Details.HeaderImage);
+                ClearLoadingState();
             });
         });
 }
 ```
 
-> **Always guard `BuildDetails` callbacks with `TWeakObjectPtr`.** The async load may complete after the widget is destroyed.
-
 ---
 
-## 9 — UI: Display Collection Progress
+## 9. UI — Collection Progress Bar
 
 ```cpp
 void UCollectionProgressWidget::Refresh(FGameplayTag CollectionTag)
@@ -279,47 +292,57 @@ void UCollectionProgressWidget::Refresh(FGameplayTag CollectionTag)
     ProgressBar->SetPercent(Progress.Ratio());
     CountLabel->SetText(FText::Format(
         LOCTEXT("CollectionCount", "{0} / {1}"),
-        Progress.Found, Progress.Total));
+        FText::AsNumber(Progress.Found),
+        FText::AsNumber(Progress.Total)));
 }
 ```
 
 ---
 
-## 10 — UI: Listen for New Entries (Notification Toast)
+## 10. UI — Listen for New Entries (Notification Toast)
 
 ```cpp
-// In your HUD or notification manager (owning client only):
+// In your HUD or notification manager — bind after login sync
 void UGameHUD::BindJournalListeners()
 {
-    UJournalComponent* Journal = PlayerState->FindComponentByClass<UJournalComponent>();
-    if (!Journal) return;
-
-    Journal->OnJournalSynced.AddDynamic(this, &UGameHUD::HandleJournalSynced);
-    Journal->OnEntryAdded.AddDynamic(this, &UGameHUD::HandleJournalEntryAdded);
+    if (UJournalComponent* Journal = PlayerState->FindComponentByClass<UJournalComponent>())
+    {
+        Journal->OnJournalSynced.AddDynamic(this, &UGameHUD::HandleJournalSynced);
+        Journal->OnEntryAdded.AddDynamic(this, &UGameHUD::HandleJournalEntryAdded);
+    }
 }
 
 void UGameHUD::HandleJournalEntryAdded(FJournalEntryHandle NewHandle)
 {
-    // Load the entry asset to get the title (already in memory from registry init).
     auto* Registry = GetGameInstance()->GetSubsystem<UJournalRegistrySubsystem>();
     if (!Registry) return;
 
-    TSoftObjectPtr<UJournalEntryDataAsset> AssetRef = Registry->GetEntryAsset(NewHandle.EntryTag);
-    if (UJournalEntryDataAsset* Asset = AssetRef.Get())
-    {
+    // Entry asset is already in memory — Get() is safe.
+    if (UJournalEntryDataAsset* Asset = Registry->GetEntryAsset(NewHandle.EntryTag).Get())
         ShowToast(Asset->GetEntryTitle());
-    }
 }
 ```
 
 ---
 
-## 11 — Checking Entry Acquisition
+## 11. Subscribing to the Server-Side Event Bus Event
+
+For systems that react to journal entries on the **server** (e.g. achievement system):
 
 ```cpp
-// Server-side: O(1) authoritative check
-bool bAlreadyRead = JournalComponent->HasEntry(TAG_Journal_Entry_Book_PageOfShadows);
+// Server-side — e.g. in an achievement subsystem
+void UAchievementSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
 
-// Client-side: O(1) via ClientAcquiredSet (built on login sync)
-bool bAlreadyRead = JournalComponent->Client_HasEntry(TAG_Journal_Entry_Book_PageOfShadows);
+    if (auto* Bus = UGameCoreEventBus::Get(this))
+    {
+        JournalHandle = Bus->StartListening<FJournalEntryAddedMessage>(
+            TAG_GameCoreEvent_Journal_EntryAdded,
+            [this](FGameplayTag, const FJournalEntryAddedMessage& Msg)
+            {
+                CheckCollectionCompletion(Msg.PlayerState, Msg.Handle);
+            });
+    }
+}
 ```

@@ -2,20 +2,19 @@
 
 **Files:** `GameCore/Source/GameCore/Journal/JournalRegistrySubsystem.h` / `.cpp`  
 **Type:** `UGameInstanceSubsystem`  
-**Lives on:** Server and owning client  
-
-Asset registry for entry tags → assets and collection definitions. Loaded once at game instance startup. Never holds per-player state.
+**Lives on:** Both server and client (game instance lifetime).  
+**Survives seamless travel:** Yes — `UGameInstanceSubsystem` persists across level transitions.
 
 ---
 
 ## Responsibilities
 
-- Load all `UJournalEntryDataAsset` and `UJournalCollectionDefinition` assets at startup via Asset Manager
-- Maintain O(1) tag → asset resolution map
-- Provide `GetCollectionProgress()` for UI progress bars (derived, never stored)
+- Load all `UJournalEntryDataAsset` and `UJournalCollectionDefinition` assets at game instance initialization via Asset Manager
+- Maintain `TMap<FGameplayTag, TSoftObjectPtr<UJournalEntryDataAsset>>` for O(1) tag → asset resolution
+- Maintain `TMap<FGameplayTag, TObjectPtr<UJournalCollectionDefinition>>` for collection access
+- Provide `GetCollectionProgress()` for UI progress bars
 - Provide `GetCollectionMemberTags()` for `UJournalComponent::GetPage()` collection filtering
 - Provide `GetEntryAsset()` for on-demand content loading by UI
-- Provide `GetCollectionsForTrack()` for UI collection tab listing
 
 ---
 
@@ -23,6 +22,18 @@ Asset registry for entry tags → assets and collection definitions. Loaded once
 
 ```cpp
 // JournalRegistrySubsystem.h
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Subsystems/GameInstanceSubsystem.h"
+#include "GameplayTagContainer.h"
+#include "Engine/StreamableManager.h"
+#include "Journal/JournalTypes.h"
+#include "JournalRegistrySubsystem.generated.h"
+
+class UJournalEntryDataAsset;
+class UJournalCollectionDefinition;
+
 UCLASS()
 class GAMECORE_API UJournalRegistrySubsystem : public UGameInstanceSubsystem
 {
@@ -32,24 +43,33 @@ public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
 
-    // Returns the soft asset reference for a given EntryTag.
-    // Returns a null TSoftObjectPtr if the tag is not registered.
-    TSoftObjectPtr<UJournalEntryDataAsset> GetEntryAsset(
-        FGameplayTag EntryTag) const;
+    /**
+     * Returns the soft asset reference for the given EntryTag.
+     * Returns a null TSoftObjectPtr if not registered.
+     * The returned asset is already loaded (sync load at init) — calling .Get() is safe.
+     */
+    TSoftObjectPtr<UJournalEntryDataAsset> GetEntryAsset(FGameplayTag EntryTag) const;
 
-    // Returns collection progress: found entries vs total members (recursive).
-    // AcquiredSet is UJournalComponent::GetClientAcquiredSet() on the client.
+    /**
+     * Computes collection progress recursively.
+     * AcquiredSet should be UJournalComponent::GetClientAcquiredSet().
+     * Returns a zero-progress struct if the collection is not found.
+     */
     FJournalCollectionProgress GetCollectionProgress(
         FGameplayTag CollectionTag,
         const TSet<FGameplayTag>& AcquiredSet) const;
 
-    // Returns the flat set of all EntryTags in a collection (recursive).
-    // Used by UJournalComponent::GetPage() for collection filtering.
-    TSet<FGameplayTag> GetCollectionMemberTags(
-        FGameplayTag CollectionTag) const;
+    /**
+     * Returns the flat set of all EntryTags in a collection (recursive).
+     * Used by UJournalComponent::GetFiltered() for collection filtering.
+     * Includes members of all nested sub-collections.
+     */
+    TSet<FGameplayTag> GetCollectionMemberTags(FGameplayTag CollectionTag) const;
 
-    // Returns all loaded collection definitions for a given track.
-    // Used by UI to list collections per tab.
+    /**
+     * Returns all loaded collection definitions for a given track.
+     * Used by UI to list collections per tab.
+     */
     TArray<const UJournalCollectionDefinition*> GetCollectionsForTrack(
         FGameplayTag TrackTag) const;
 
@@ -57,25 +77,27 @@ private:
     void LoadAllEntryAssets();
     void LoadAllCollections();
 
-    // Recursive helpers — use Visited guard to prevent infinite loops on malformed data.
+    // Recursive depth-first accumulation of member tags.
+    // VisitedCollections guards against circular references at runtime
+    // (as a safety net — IsDataValid should catch them at author time).
     void CollectMemberTags(
         const UJournalCollectionDefinition* Collection,
         TSet<FGameplayTag>& OutTags,
-        TSet<FGameplayTag>& Visited) const;
+        TSet<FGameplayTag>& VisitedCollections) const;
 
+    // Recursive depth-first progress computation.
     FJournalCollectionProgress ComputeProgress(
         const UJournalCollectionDefinition* Collection,
         const TSet<FGameplayTag>& AcquiredSet,
-        TSet<FGameplayTag>& Visited) const;
+        TSet<FGameplayTag>& VisitedCollections) const;
 
     // Tag → soft asset ref. Populated at Initialize().
     TMap<FGameplayTag, TSoftObjectPtr<UJournalEntryDataAsset>> EntryRegistry;
 
-    // CollectionTag → loaded definition. Populated at Initialize().
-    // Collections are small and fully loaded — no async needed.
+    // CollectionTag → loaded definition. Collections are fully loaded — no async needed.
     TMap<FGameplayTag, TObjectPtr<UJournalCollectionDefinition>> CollectionRegistry;
 
-    // Streamable handles — kept alive to prevent GC of loaded assets.
+    // Keeps the entry and collection assets alive in memory.
     TSharedPtr<FStreamableHandle> EntryLoadHandle;
     TSharedPtr<FStreamableHandle> CollectionLoadHandle;
 };
@@ -83,7 +105,7 @@ private:
 
 ---
 
-## Method Implementations
+## Key Method Implementations
 
 ### `Initialize`
 
@@ -123,22 +145,29 @@ void UJournalRegistrySubsystem::LoadAllEntryAssets()
             Paths.Add(Path);
     }
 
-    // Sync load: entry assets are lightweight (FText + soft refs — no textures).
-    // Bounded by content, not player count — safe at startup.
-    EntryLoadHandle = UAssetManager::Get().GetStreamableManager()
-        .RequestSyncLoad(Paths);
+    // Sync load: entry assets are lightweight (tags + FText + soft refs only).
+    // Heavy assets (textures, quest definitions) remain unloaded until BuildDetails.
+    EntryLoadHandle = MakeShareable(
+        UAssetManager::Get().GetStreamableManager()
+            .RequestSyncLoad(Paths).Get());
 
+    EntryRegistry.Reserve(Paths.Num());
     for (const FSoftObjectPath& Path : Paths)
     {
         if (UJournalEntryDataAsset* Asset =
             Cast<UJournalEntryDataAsset>(Path.ResolveObject()))
         {
-            EntryRegistry.Add(Asset->EntryTag,
-                TSoftObjectPtr<UJournalEntryDataAsset>(Path));
+            if (Asset->EntryTag.IsValid())
+                EntryRegistry.Add(Asset->EntryTag,
+                    TSoftObjectPtr<UJournalEntryDataAsset>(Path));
+            else
+                UE_LOG(LogJournal, Warning,
+                    TEXT("LoadAllEntryAssets: asset '%s' has no EntryTag — skipped."),
+                    *Asset->GetName());
         }
     }
 
-    UE_LOG(LogJournal, Log, TEXT("UJournalRegistrySubsystem: loaded %d entry assets."),
+    UE_LOG(LogJournal, Log, TEXT("Journal: loaded %d entry assets."),
         EntryRegistry.Num());
 }
 ```
@@ -161,19 +190,22 @@ void UJournalRegistrySubsystem::LoadAllCollections()
             Paths.Add(Path);
     }
 
-    CollectionLoadHandle = UAssetManager::Get().GetStreamableManager()
-        .RequestSyncLoad(Paths);
+    CollectionLoadHandle = MakeShareable(
+        UAssetManager::Get().GetStreamableManager()
+            .RequestSyncLoad(Paths).Get());
 
+    CollectionRegistry.Reserve(Paths.Num());
     for (const FSoftObjectPath& Path : Paths)
     {
         if (UJournalCollectionDefinition* Def =
             Cast<UJournalCollectionDefinition>(Path.ResolveObject()))
         {
-            CollectionRegistry.Add(Def->CollectionTag, Def);
+            if (Def->CollectionTag.IsValid())
+                CollectionRegistry.Add(Def->CollectionTag, Def);
         }
     }
 
-    UE_LOG(LogJournal, Log, TEXT("UJournalRegistrySubsystem: loaded %d collection definitions."),
+    UE_LOG(LogJournal, Log, TEXT("Journal: loaded %d collection definitions."),
         CollectionRegistry.Num());
 }
 ```
@@ -210,8 +242,7 @@ FJournalCollectionProgress UJournalRegistrySubsystem::ComputeProgress(
     const TSet<FGameplayTag>& AcquiredSet,
     TSet<FGameplayTag>& Visited) const
 {
-    // Guard against circular refs (malformed data — should be caught by IsDataValid).
-    if (Visited.Contains(Collection->CollectionTag)) return {};
+    if (!Collection || Visited.Contains(Collection->CollectionTag)) return {};
     Visited.Add(Collection->CollectionTag);
 
     FJournalCollectionProgress Result;
@@ -224,15 +255,18 @@ FJournalCollectionProgress UJournalRegistrySubsystem::ComputeProgress(
                 ++Result.Found;
         }
     }
-    for (const TSoftObjectPtr<UJournalCollectionDefinition>& SubRef : Collection->SubCollections)
+
+    for (const TSoftObjectPtr<UJournalCollectionDefinition>& SubRef
+         : Collection->SubCollections)
     {
         if (const UJournalCollectionDefinition* Sub = SubRef.Get())
         {
-            FJournalCollectionProgress SubProgress = ComputeProgress(Sub, AcquiredSet, Visited);
-            Result.Found += SubProgress.Found;
-            Result.Total += SubProgress.Total;
+            FJournalCollectionProgress SubProg = ComputeProgress(Sub, AcquiredSet, Visited);
+            Result.Found += SubProg.Found;
+            Result.Total += SubProg.Total;
         }
     }
+
     return Result;
 }
 ```
@@ -257,41 +291,41 @@ TSet<FGameplayTag> UJournalRegistrySubsystem::GetCollectionMemberTags(
 void UJournalRegistrySubsystem::CollectMemberTags(
     const UJournalCollectionDefinition* Collection,
     TSet<FGameplayTag>& OutTags,
-    TSet<FGameplayTag>& Visited) const
+    TSet<FGameplayTag>& VisitedCollections) const
 {
-    if (Visited.Contains(Collection->CollectionTag)) return;
-    Visited.Add(Collection->CollectionTag);
+    if (!Collection || VisitedCollections.Contains(Collection->CollectionTag)) return;
+    VisitedCollections.Add(Collection->CollectionTag);
 
     for (const TSoftObjectPtr<UJournalEntryDataAsset>& MemberRef : Collection->Members)
         if (const UJournalEntryDataAsset* Asset = MemberRef.Get())
             OutTags.Add(Asset->EntryTag);
 
-    for (const TSoftObjectPtr<UJournalCollectionDefinition>& SubRef : Collection->SubCollections)
+    for (const TSoftObjectPtr<UJournalCollectionDefinition>& SubRef
+         : Collection->SubCollections)
         if (const UJournalCollectionDefinition* Sub = SubRef.Get())
-            CollectMemberTags(Sub, OutTags, Visited);
+            CollectMemberTags(Sub, OutTags, VisitedCollections);
 }
 ```
 
 ### `GetCollectionsForTrack`
 
 ```cpp
-TArray<const UJournalCollectionDefinition*> UJournalRegistrySubsystem::GetCollectionsForTrack(
-    FGameplayTag TrackTag) const
+TArray<const UJournalCollectionDefinition*>
+UJournalRegistrySubsystem::GetCollectionsForTrack(FGameplayTag TrackTag) const
 {
     TArray<const UJournalCollectionDefinition*> Out;
     for (const auto& Pair : CollectionRegistry)
         if (Pair.Value && Pair.Value->TrackTag == TrackTag)
-            Out.Add(Pair.Value);
+            Out.Add(Pair.Value.Get());
     return Out;
 }
 ```
 
 ---
 
-## Asset Manager Configuration
+## Asset Manager Configuration (DefaultGame.ini)
 
 ```ini
-; DefaultGame.ini
 [/Script/Engine.AssetManagerSettings]
 +PrimaryAssetTypesToScan=(
     PrimaryAssetType="JournalEntry",
@@ -309,10 +343,4 @@ TArray<const UJournalCollectionDefinition*> UJournalRegistrySubsystem::GetCollec
 )
 ```
 
----
-
-## Notes
-
-- `FStreamableHandle` references are kept as `TSharedPtr` to prevent GC of loaded entry assets. Without this, UE may collect the assets after the sync load handle goes out of scope.
-- Entry assets are sync-loaded at startup because they are content-count-bounded (not player-count-bounded) and are lightweight (no textures — textures remain soft refs inside the asset).
-- The registry has no per-player state. It is safe to share across all player connections.
+> **Why `UGameInstanceSubsystem` and not `UWorldSubsystem`?** Entry and collection assets are game-instance-level data — they don't change per world. A `UGameInstanceSubsystem` avoids redundant reloading across seamless travel and keeps the registry alive for the entire session.
