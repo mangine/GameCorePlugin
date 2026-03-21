@@ -21,7 +21,7 @@ The system is split into a **base solo layer** and an **optional shared quest ex
 | System | Usage |
 |---|---|
 | **Requirement System** | `URequirementList` for unlock, completion, and transition rules. `URequirementList::RegisterWatch` for reactive unlock detection. |
-| **State Machine System** | `UStateMachineAsset` as the stage graph. `UQuestTransitionRule` + `UQuestStateNode` extensions. `FindFirstPassingTransition` evaluated directly by `UQuestComponent` — no `UStateMachineComponent` on `APlayerState`. |
+| **State Machine System** | `UStateMachineAsset` as the stage graph. `UQuestTransitionRule` + `UQuestStateNode` + `UQuestTransitionContext` extensions. `FindFirstPassingTransition` evaluated directly by `UQuestComponent` — no `UStateMachineComponent` on `APlayerState`. |
 | **Serialization System** | `IPersistableComponent` implemented by `UQuestComponent`. `NotifyDirty` triggers saves. |
 | **Event Bus System** | `UGameCoreEventBus` for all outbound GMS broadcasts. Zero inbound subscriptions. |
 | **GameCore Core** | `IGroupProvider` interface for shared quest group data reads. |
@@ -85,9 +85,9 @@ The v2 `FRequirementContext` uses `FInstancedStruct Data` — no typed fields. Q
 
 ### State Machine Asset as Stage Graph
 
-`UQuestDefinition::StageGraph` is a `UStateMachineAsset`. `UStateMachineComponent` is **not** added to `APlayerState` — it would fire unwanted side-effect events. Instead, `UQuestComponent` calls `StageGraph->FindFirstPassingTransition(CurrentStageTag, &Ctx)` directly. Stage state is `FQuestRuntime::CurrentStageTag`.
+`UQuestDefinition::StageGraph` is a `UStateMachineAsset`. `UStateMachineComponent` is **not** added to `APlayerState` — it would fire unwanted side-effect events. Instead, `UQuestComponent` calls `StageGraph->FindFirstPassingTransition(CurrentStageTag, CtxWrapper)` directly. Stage state is `FQuestRuntime::CurrentStageTag`.
 
-`UQuestStateNode` extends `UStateNodeBase` with `bIsCompletionState` / `bIsFailureState`. `UQuestTransitionRule` extends `UTransitionRule` to evaluate a `URequirementList` against a `FRequirementContext*` ContextObject.
+`UQuestStateNode` extends `UStateNodeBase` with `bIsCompletionState` / `bIsFailureState`. `UQuestTransitionRule` extends `UTransitionRule` to evaluate a `URequirementList` against the context. Because `UTransitionRule::Evaluate` takes a `UObject*`, `FRequirementContext` (a plain struct) is wrapped in `UQuestTransitionContext` — a thin `UObject` that `UQuestTransitionRule` casts back to retrieve the context. See `UQuestTransitionRule.md`.
 
 ### Completion Evaluated Imperatively, Not Reactively
 
@@ -132,9 +132,9 @@ BeginPlay (server)
         └─ Remove if bEnabled == false (non-destructive)
         └─ When all loads complete:
              RegisterUnlockWatchers()
-               ├─ Iterate all known quest asset IDs from registry
-               ├─ ShouldWatchUnlock() gate (not active, not closed, bEnabled)
-               ├─ Def->UnlockRequirements->RegisterWatch(this, closure)
+               ├─ IterateAllDefinitions (all known asset IDs)
+               ├─ ShouldWatchUnlock() gate
+               ├─ RegisterUnlockWatcherForQuest()
                └─ Immediate baseline Evaluate() → ClientRPC_NotifyQuestEvent
 ```
 
@@ -163,20 +163,25 @@ Server_IncrementTracker(QuestId, TrackerKey, Delta)
        EvaluateCompletionRequirementsNow(QuestId)  ← imperative, immediate
 ```
 
-### Completion / Stage Advance
+### Stage Transition Flow
 
 ```
 EvaluateCompletionRequirementsNow(QuestId)
-  ├─ Load definition from registry (must be resident)
-  ├─ Find current UQuestStageDefinition
+  ├─ GetDefinition from registry (must be resident)
+  ├─ Find UQuestStageDefinition for CurrentStageTag
   ├─ Stage.CompletionRequirements.Evaluate(BuildRequirementContext())
   └─ On pass:
        if bIsCompletionState → Internal_CompleteQuest
        if bIsFailureState    → Internal_FailQuest
        else ResolveNextStage → Internal_AdvanceStage
 
+ResolveNextStage
+  1. Wrap FRequirementContext in UQuestTransitionContext (UObject wrapper)
+  2. StageGraph.FindFirstPassingTransition(CurrentStageTag, CtxWrapper)
+  3. UQuestTransitionRule::Evaluate casts CtxWrapper, calls Requirements.Evaluate
+  4. Returns first passing ToState tag
+
 Internal_AdvanceStage
-  ├─ ResolveNextStage: StageGraph.FindFirstPassingTransition(CurrentStageTag, Ctx)
   ├─ Internal_InitTrackers for new stage
   ├─ MarkItemDirty, NotifyDirty
   └─ Broadcast Quest.StageCompleted + Quest.StageStarted
@@ -204,7 +209,7 @@ BeginPlay (server)
      a. Load each active quest definition
      b. Remove disabled quests (non-destructive)
      c. When all resolved → RegisterUnlockWatchers
-        i.  RegisterWatch for all candidates (reactive)
+        i.  RegisterUnlockWatcherForQuest for all candidates (reactive)
         ii. Immediate Evaluate → ClientRPC baseline
 
 BeginPlay (owning client)
@@ -239,11 +244,11 @@ EQuestCheckAuthority::ClientValidated
 
 | # | Issue | Severity | Notes |
 |---|---|---|---|
-| KI-1 | `IterateAllDefinitions` on `UQuestRegistrySubsystem` is not yet fully specified — the sync iteration only covers resident definitions; quests whose assets are not yet loaded are silently skipped during watcher registration at login. For large quest counts this means newly-eligible quests may not fire `BecameAvailable` until the next event. | Medium | Mitigated by the immediate baseline check. Full fix requires pre-enumerating all asset IDs at initialize time. |
-| KI-2 | `USharedQuestComponent::Server_IncrementTracker` routes through the coordinator but the spec does not define behaviour when the coordinator has been GC'd while the member is still active (e.g. group actor destroyed mid-quest). | Medium | Coordinator should hold a weak pointer guard; component should fall back to base solo increment. |
-| KI-3 | Client-side completion watchers registered in `RegisterClientValidatedCompletionWatchers` are not re-registered when `ActiveQuests` replicates a new quest after login (i.e. a quest accepted after `BeginPlay`). | Medium | `OnRep_ActiveQuests` (via `PostReplicatedAdd`) should trigger registration for newly added quests. |
-| KI-4 | The de-scale formula in `USharedQuestCoordinator::BuildDeScaledSnapshot` uses integer `Floor` which can over-reward a leaving member in edge cases with very high `ScalingMultiplier` values. | Low | Cap at `SoloTarget` is applied but the intermediate floor may still produce values slightly above solo intent. |
-| KI-5 | `UQuestRegistrySubsystem::ResolveQuestPath` uses a string-based leaf-name match which is O(n) over `AllQuestAssetIds`. For games with 1000+ quests this is mildly expensive at first load. | Low | Can be replaced with a pre-built `TMap<FName, FPrimaryAssetId>` at `Initialize` time. |
+| KI-1 | `IterateAllDefinitions` only iterates resident (already-loaded) definitions. Quests whose assets haven't been loaded yet are skipped at login. | Medium | Mitigated: `AllQuestAssetIds` is pre-built at Initialize. Full fix: iterate all IDs and load async in `RegisterUnlockWatchers`, registering each watcher in the callback. |
+| KI-2 | No guard against coordinator GC while shared quest members are still active (group actor destroyed mid-quest). | Medium | `USharedQuestCoordinator::Deinitialize` should call `RemoveMember` for all active members. Component should cache `TWeakObjectPtr<USharedQuestCoordinator>`. |
+| KI-3 | Fixed: `FQuestRuntime::PostReplicatedAdd` triggers `RegisterClientValidatedCompletionWatcher` for quests accepted after `BeginPlay`. | Resolved | See `QuestRuntime.md`. |
+| KI-4 | De-scale formula uses `FMath::Floor` which can produce edge-case values with high `ScalingMultiplier`. | Low | Always apply `Min(SnapshotValue, SoloTarget)` regardless of ScalingMultiplier. |
+| KI-5 | Fixed: O(n) `ResolveQuestPath` replaced with O(1) `TMap<FName, FPrimaryAssetId>` at Initialize. | Resolved | See `UQuestRegistrySubsystem.md`. |
 
 ---
 
@@ -274,16 +279,20 @@ Source/PirateGame/Quest/
 │   ├── Requirement_QuestCompleted.h / .cpp
 │   ├── Requirement_QuestCooldown.h / .cpp
 │   └── Requirement_ActiveQuestCount.h
+├── StateMachine/
+│   ├── QuestStateNode.h / .cpp          ← UQuestStateNode : UStateNodeBase
+│   ├── QuestTransitionRule.h / .cpp     ← UQuestTransitionRule : UTransitionRule
+│   └── QuestTransitionContext.h         ← UQuestTransitionContext (UObject wrapper for context passing)
 └── Events/
     └── QuestEventPayloads.h
 
-GameCore Plugin Additions (no quest-specific code):
+GameCore Plugin Additions (generic, no quest-specific knowledge):
 Source/GameCore/
-├── Interfaces/
-│   └── GroupProvider.h                   ← IGroupProvider, UGroupProviderDelegates
-└── StateMachine/
-    ├── QuestStateNode.h / .cpp           ← UQuestStateNode : UStateNodeBase
-    └── QuestTransitionRule.h / .cpp      ← UQuestTransitionRule : UTransitionRule
+└── Interfaces/
+    └── GroupProvider.h                  ← IGroupProvider, UGroupProviderDelegates
+
+    (UQuestStateNode, UQuestTransitionRule, UQuestTransitionContext are
+     in the Quest game module, not the GameCore plugin.)
 ```
 
 ### Asset Manager Configuration
@@ -292,7 +301,7 @@ Source/GameCore/
 [/Script/Engine.AssetManagerSettings]
 +PrimaryAssetTypesToScan=(
     PrimaryAssetType="QuestDefinition",
-    AssetBaseClass=/Script/GameCore.QuestDefinition,
+    AssetBaseClass=/Script/YourGame.QuestDefinition,
     bHasBlueprintClasses=False,
     bIsEditorOnly=False,
     Directories=((Path="/Game/Quests"))
@@ -300,3 +309,23 @@ Source/GameCore/
 ```
 
 **Convention:** Asset file name must match the leaf node of `QuestDefinition::QuestId`. e.g. `Quest.Id.TreasureHunt` → asset named `TreasureHunt`. Validated by `UQuestDefinition::IsDataValid`.
+
+---
+
+## Spec Files Index
+
+| File | Contents |
+|---|---|
+| `Architecture.md` | This file. Dependencies, requirements, flow, authority model, known issues, file structure. |
+| `Usage.md` | Setup checklist, quest creation walkthrough, bridge pattern, event subscription. |
+| `QuestEnums.md` | All enums: `EQuestLifecycle`, `EQuestCheckAuthority`, `EQuestResetCadence`, `EQuestMemberRole`, `EQuestEventType`, `EQuestRejectionReason`. |
+| `QuestDefinitions.md` | `FQuestDisplayData`, `FQuestProgressTrackerDef`, `UQuestStageDefinition`, `UQuestDefinition`, `USharedQuestDefinition`, `UQuestConfigDataAsset`, `UQuestMarkerDataAsset`. |
+| `QuestRuntime.md` | `FQuestEvaluationContext`, `FQuestTrackerEntry`, `FQuestRuntime`, `FQuestRuntimeArray`, persistence serialization. |
+| `UQuestComponent.md` | Per-player solo component: BeginPlay, accept, tracker increment, complete/fail, validation, `USharedQuestComponent`. |
+| `UQuestRegistrySubsystem.md` | Definition loading, ref-counting, cadence clock, O(1) path resolution. |
+| `USharedQuestCoordinator.md` | Shared tracker authority, enrollment delegate, de-scale formula, member leave. |
+| `UQuestStateNode.md` | `UQuestStateNode` — `UStateNodeBase` extension with completion/failure flags. |
+| `UQuestTransitionRule.md` | `UQuestTransitionRule` + `UQuestTransitionContext` — bridges `UTransitionRule` with `URequirementList`. |
+| `QuestRequirements.md` | `URequirement_QuestCompleted`, `URequirement_QuestCooldown`, `URequirement_ActiveQuestCount`. |
+| `QuestEventPayloads.md` | All GMS payload structs and gameplay tag definitions. |
+| `Code Review.md` | Design flaws, fixes applied, open issues, recommendations. |

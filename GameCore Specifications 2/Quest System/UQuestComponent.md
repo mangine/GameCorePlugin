@@ -138,7 +138,8 @@ protected:
     // Builds FRequirementContext with FQuestEvaluationContext in Data.
     FRequirementContext BuildRequirementContext() const;
 
-    // Resolves the next stage tag using StageGraph::FindFirstPassingTransition.
+    // Resolves the next stage tag via StageGraph::FindFirstPassingTransition.
+    // Wraps FRequirementContext in UQuestTransitionContext for UTransitionRule compatibility.
     FGameplayTag ResolveNextStage(const FQuestRuntime& Runtime,
                                   const UQuestDefinition* Def) const;
 
@@ -149,6 +150,12 @@ protected:
     // Step 2 of server BeginPlay: register unlock watchers for all
     // candidate quests + immediate baseline evaluation.
     void RegisterUnlockWatchers();
+
+    // Registers a single unlock watcher for a known-resident definition.
+    // Used by RegisterUnlockWatchers and by Internal_CompleteQuest /
+    // Internal_FailQuest when re-registering after a non-permanent close.
+    void RegisterUnlockWatcherForQuest(const FGameplayTag& QuestId,
+                                        const UQuestDefinition* Def);
 
     // Called on owning client in BeginPlay. Registers ClientValidated
     // completion watchers for currently active quests.
@@ -286,33 +293,38 @@ void UQuestComponent::RegisterUnlockWatchers()
         {
             if (!ShouldWatchUnlock(QuestId, Def)) return;
             if (!Def->UnlockRequirements) return;
-
-            TWeakObjectPtr<UQuestComponent> WeakThis = this;
-
-            FEventWatchHandle Handle = Def->UnlockRequirements->RegisterWatch(
-                this,
-                [WeakThis, QuestId](bool bPassed)
-                {
-                    if (UQuestComponent* QC = WeakThis.Get())
-                    {
-                        QC->ClientRPC_NotifyQuestEvent(QuestId,
-                            bPassed
-                                ? EQuestEventType::BecameAvailable
-                                : EQuestEventType::BecameUnavailable);
-                    }
-                });
-
-            UnlockWatcherHandles.Add(QuestId, Handle);
-
-            // Immediate baseline check — establishes current availability
-            // without waiting for an event (covers offline-progression case).
-            FRequirementContext Ctx = BuildRequirementContext();
-            FRequirementResult Result = Def->UnlockRequirements->Evaluate(Ctx);
-            ClientRPC_NotifyQuestEvent(QuestId,
-                Result.bPassed
-                    ? EQuestEventType::BecameAvailable
-                    : EQuestEventType::BecameUnavailable);
+            RegisterUnlockWatcherForQuest(QuestId, Def);
         });
+}
+
+void UQuestComponent::RegisterUnlockWatcherForQuest(
+    const FGameplayTag& QuestId, const UQuestDefinition* Def)
+{
+    TWeakObjectPtr<UQuestComponent> WeakThis = this;
+
+    FEventWatchHandle Handle = Def->UnlockRequirements->RegisterWatch(
+        this,
+        [WeakThis, QuestId](bool bPassed)
+        {
+            if (UQuestComponent* QC = WeakThis.Get())
+            {
+                QC->ClientRPC_NotifyQuestEvent(QuestId,
+                    bPassed
+                        ? EQuestEventType::BecameAvailable
+                        : EQuestEventType::BecameUnavailable);
+            }
+        });
+
+    UnlockWatcherHandles.Add(QuestId, Handle);
+
+    // Immediate baseline check — establishes current availability
+    // without waiting for an event (covers offline-progression case).
+    FRequirementContext Ctx = BuildRequirementContext();
+    FRequirementResult Result = Def->UnlockRequirements->Evaluate(Ctx);
+    ClientRPC_NotifyQuestEvent(QuestId,
+        Result.bPassed
+            ? EQuestEventType::BecameAvailable
+            : EQuestEventType::BecameUnavailable);
 }
 ```
 
@@ -420,6 +432,36 @@ void UQuestComponent::EvaluateCompletionRequirementsNow(const FGameplayTag& Ques
 
 ---
 
+## `ResolveNextStage`
+
+`UTransitionRule::Evaluate` takes a `UObject*` ContextObject. `FRequirementContext` is a plain struct. We wrap it in `UQuestTransitionContext` (a thin `UObject` wrapper) so `UQuestTransitionRule` can cast it back safely. See `UQuestTransitionRule.md` for details.
+
+```cpp
+FGameplayTag UQuestComponent::ResolveNextStage(
+    const FQuestRuntime& Runtime,
+    const UQuestDefinition* Def) const
+{
+    if (!Def || !Def->StageGraph) return FGameplayTag();
+
+    // Wrap FRequirementContext in a UObject so UQuestTransitionRule can
+    // receive it through UTransitionRule::Evaluate(Component, ContextObject).
+    // GetTransientPackage() avoids any actor-world lifetime concerns —
+    // the wrapper is GC'd immediately after FindFirstPassingTransition returns.
+    UQuestTransitionContext* CtxWrapper =
+        NewObject<UQuestTransitionContext>(GetTransientPackage());
+    CtxWrapper->Context = BuildRequirementContext();
+
+    return Def->StageGraph->FindFirstPassingTransition(
+        Runtime.CurrentStageTag,
+        CtxWrapper);
+    // CtxWrapper is short-lived; no manual cleanup required.
+}
+```
+
+> **Why not pass `FRequirementContext*` directly?** `FindFirstPassingTransition` takes `UObject*`. `FRequirementContext` is not a `UObject` — casting a struct pointer through `UObject*` is undefined behaviour. `UQuestTransitionContext` is the correct solution. See `UQuestTransitionRule.md`.
+
+---
+
 ## Complete / Fail Flows
 
 ```cpp
@@ -508,8 +550,8 @@ void UQuestComponent::Internal_FailQuest(
     NotifyDirty(this);
 
     FQuestFailedPayload Payload;
-    Payload.QuestId           = QuestId;
-    Payload.PlayerState       = GetOwner<APlayerState>();
+    Payload.QuestId            = QuestId;
+    Payload.PlayerState        = GetOwner<APlayerState>();
     Payload.bPermanentlyClosed = bPermanent;
     UGameCoreEventBus::Get(this).Broadcast(
         TAG_GameCoreEvent_Quest_Failed, Payload);
