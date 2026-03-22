@@ -1,0 +1,29 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "GameCore",
+	"Description": "A generic, game-agnostic plugin providing reusable gameplay systems for MMO-scale Unreal Engine 5 projects. Includes event bus, serialization, requirements, alignment, currency, dialogue, faction, group, HISM proxy, interaction, inventory, journal, loot tables, notifications, and progression systems.",
+	"Category": "Gameplay",
+	"CreatedBy": "GameCore",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "GameCore",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "GameCoreEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
